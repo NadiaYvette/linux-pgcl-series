@@ -1,0 +1,302 @@
+From a21a457def132ebdee9e81c1fce40f3934393beb Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 10 Mar 2026 20:42:22 +0100
+Subject: [PATCH 008/174] PGCL: fix EFI boot, efifb, simpledrm, and i915 deep
+ audit leftovers
+
+Critical EFI boot fixes:
+- x86-stub.c: e820 entry sizes used PAGE_SHIFT instead of EFI_PAGE_SHIFT,
+  inflating memory map by 16x (1GB VM reported as 14GB).
+- efi_64.c __map_region: PFN truncation lost sub-page offset for EFI
+  regions not aligned to PAGE_SIZE (64KB). Map from kernel-page-aligned
+  base with adjusted virtual address so va correctly maps to md->phys_addr.
+- efi_64.c efi_update_mappings: same PFN alignment fix for permission
+  updates after SetVirtualAddressMap.
+- efi_64.c efi_map_region: size calculation used PAGE_SHIFT, should be
+  EFI_PAGE_SHIFT since md->num_pages counts 4KB EFI pages.
+- quirks.c efi_free_boot_services: unmap used md->num_pages (EFI pages)
+  as kernel page count, causing 16x over-unmap and page table faults.
+- efi_32.c: same size/set_memory_uc num_pages fixes.
+- unaccepted_memory.c: PAGE_SIZE -> EFI_PAGE_SIZE for EFI page count.
+
+Framebuffer fixes:
+- efifb.c: ioremap alignment used PAGE_SIZE, should be MMUPAGE_SIZE.
+- ofdrm.c: same ioremap alignment fix for OpenFirmware DRM.
+
+i915 deep audit fixes:
+- i915_gem_stolen.c dbg_poison: io_mapping/memset/clear_range used
+  PAGE_SIZE for 4KB GPU pages. Changed to I915_GTT_PAGE_SIZE (7 instances).
+- i915_gem_stolen.c: stolen SMEM min_page_size PAGE_SIZE -> MMUPAGE_SIZE.
+- i915_gem_execbuffer.c: GGTT reloc node size PAGE_SIZE -> I915_GTT_PAGE_SIZE.
+- i915_gem_internal.c: alignment check PAGE_SIZE -> MMUPAGE_SIZE.
+
+Boot-tested with PAGE_MMUSHIFT=4 on both legacy BIOS and UEFI (OVMF),
+SMP=4, all tests passing.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/x86/platform/efi/efi_32.c                |  5 ++-
+ arch/x86/platform/efi/efi_64.c                | 43 +++++++++++++------
+ arch/x86/platform/efi/quirks.c                | 15 +++++--
+ .../firmware/efi/libstub/unaccepted_memory.c  |  2 +-
+ drivers/firmware/efi/libstub/x86-stub.c       |  4 +-
+ .../gpu/drm/i915/gem/i915_gem_execbuffer.c    |  2 +-
+ drivers/gpu/drm/i915/gem/i915_gem_internal.c  |  2 +-
+ drivers/gpu/drm/i915/gem/i915_gem_stolen.c    | 14 +++---
+ drivers/gpu/drm/sysfb/ofdrm.c                 |  4 +-
+ drivers/video/fbdev/efifb.c                   |  4 +-
+ 10 files changed, 61 insertions(+), 34 deletions(-)
+
+diff --git a/arch/x86/platform/efi/efi_32.c b/arch/x86/platform/efi/efi_32.c
+index b2cc7b4552a1..b30a16f07a34 100644
+--- a/arch/x86/platform/efi/efi_32.c
++++ b/arch/x86/platform/efi/efi_32.c
+@@ -40,7 +40,7 @@ void __init efi_map_region(efi_memory_desc_t *md)
+ 	void *va;
+ 
+ 	start_pfn	= PFN_DOWN(md->phys_addr);
+-	size		= md->num_pages << PAGE_SHIFT;
++	size		= md->num_pages << EFI_PAGE_SHIFT;
+ 	end		= md->phys_addr + size;
+ 	end_pfn 	= PFN_UP(end);
+ 
+@@ -48,7 +48,8 @@ void __init efi_map_region(efi_memory_desc_t *md)
+ 		va = __va(md->phys_addr);
+ 
+ 		if (!(md->attribute & EFI_MEMORY_WB))
+-			set_memory_uc((unsigned long)va, md->num_pages);
++			set_memory_uc((unsigned long)va,
++			      DIV_ROUND_UP(md->num_pages, PAGE_MMUCOUNT));
+ 	} else {
+ 		va = ioremap_cache(md->phys_addr, size);
+ 	}
+diff --git a/arch/x86/platform/efi/efi_64.c b/arch/x86/platform/efi/efi_64.c
+index 5861008eab22..dbef3af8f8b6 100644
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@ -298,15 +298,23 @@ static void __init __map_region(efi_memory_desc_t *md, u64 va)
+ 	    md->type != EFI_MEMORY_MAPPED_IO)
+ 		flags |= _PAGE_ENC;
+ 
+-	pfn = md->phys_addr >> PAGE_SHIFT;
+-	if (kernel_map_pages_in_pgd(pgd, pfn, va, md->num_pages, flags))
+-		pr_warn("Error mapping PA 0x%llx -> VA 0x%llx!\n",
+-			   md->phys_addr, va);
++	{
++		unsigned long phys_offset = md->phys_addr & ~PAGE_MASK;
++		unsigned long total_size = phys_offset +
++					  (md->num_pages << EFI_PAGE_SHIFT);
++
++		pfn = md->phys_addr >> PAGE_SHIFT;
++		if (kernel_map_pages_in_pgd(pgd, pfn, va - phys_offset,
++					    DIV_ROUND_UP(total_size, PAGE_SIZE),
++					    flags))
++			pr_warn("Error mapping PA 0x%llx -> VA 0x%llx!\n",
++				   md->phys_addr, va);
++	}
+ }
+ 
+ void __init efi_map_region(efi_memory_desc_t *md)
+ {
+-	unsigned long size = md->num_pages << PAGE_SHIFT;
++	unsigned long size = md->num_pages << EFI_PAGE_SHIFT;
+ 	u64 pa = md->phys_addr;
+ 
+ 	/*
+@@ -375,14 +383,25 @@ static int __init efi_update_mappings(efi_memory_desc_t *md, unsigned long pf)
+ 	int err1, err2;
+ 
+ 	/* Update the 1:1 mapping */
+-	pfn = md->phys_addr >> PAGE_SHIFT;
+-	err1 = kernel_map_pages_in_pgd(pgd, pfn, md->phys_addr, md->num_pages, pf);
+-	if (err1) {
+-		pr_err("Error while updating 1:1 mapping PA 0x%llx -> VA 0x%llx!\n",
+-			   md->phys_addr, md->virt_addr);
++	{
++		unsigned long phys_offset = md->phys_addr & ~PAGE_MASK;
++		unsigned long total_size = phys_offset +
++					  (md->num_pages << EFI_PAGE_SHIFT);
++		unsigned long nkpages = DIV_ROUND_UP(total_size, PAGE_SIZE);
++
++		pfn = md->phys_addr >> PAGE_SHIFT;
++		err1 = kernel_map_pages_in_pgd(pgd, pfn,
++					       md->phys_addr - phys_offset,
++					       nkpages, pf);
++		if (err1) {
++			pr_err("Error while updating 1:1 mapping PA 0x%llx -> VA 0x%llx!\n",
++				   md->phys_addr, md->virt_addr);
++		}
++
++		err2 = kernel_map_pages_in_pgd(pgd, pfn,
++					       md->virt_addr - phys_offset,
++					       nkpages, pf);
+ 	}
+-
+-	err2 = kernel_map_pages_in_pgd(pgd, pfn, md->virt_addr, md->num_pages, pf);
+ 	if (err2) {
+ 		pr_err("Error while updating VA mapping PA 0x%llx -> VA 0x%llx!\n",
+ 			   md->phys_addr, md->virt_addr);
+diff --git a/arch/x86/platform/efi/quirks.c b/arch/x86/platform/efi/quirks.c
+index 90a065fcb1fa..fb35cc316abc 100644
+--- a/arch/x86/platform/efi/quirks.c
++++ b/arch/x86/platform/efi/quirks.c
+@@ -397,11 +397,18 @@ static void __init efi_unmap_pages(efi_memory_desc_t *md)
+ 	if (efi_is_mixed())
+ 		return;
+ 
+-	if (kernel_unmap_pages_in_pgd(pgd, pa, md->num_pages))
+-		pr_err("Failed to unmap 1:1 mapping for 0x%llx\n", pa);
++	{
++		unsigned long phys_offset = pa & ~PAGE_MASK;
++		unsigned long total_size = phys_offset +
++					  (md->num_pages << EFI_PAGE_SHIFT);
++		unsigned long nkpages = DIV_ROUND_UP(total_size, PAGE_SIZE);
+ 
+-	if (kernel_unmap_pages_in_pgd(pgd, va, md->num_pages))
+-		pr_err("Failed to unmap VA mapping for 0x%llx\n", va);
++		if (kernel_unmap_pages_in_pgd(pgd, pa - phys_offset, nkpages))
++			pr_err("Failed to unmap 1:1 mapping for 0x%llx\n", pa);
++
++		if (kernel_unmap_pages_in_pgd(pgd, va - phys_offset, nkpages))
++			pr_err("Failed to unmap VA mapping for 0x%llx\n", va);
++	}
+ }
+ 
+ struct efi_freeable_range {
+diff --git a/drivers/firmware/efi/libstub/unaccepted_memory.c b/drivers/firmware/efi/libstub/unaccepted_memory.c
+index 757dbe734a47..0afed7caeeee 100644
+--- a/drivers/firmware/efi/libstub/unaccepted_memory.c
++++ b/drivers/firmware/efi/libstub/unaccepted_memory.c
+@@ -35,7 +35,7 @@ efi_status_t allocate_unaccepted_bitmap(__u32 nr_desc,
+ 
+ 		unaccepted_start = min(unaccepted_start, d->phys_addr);
+ 		unaccepted_end = max(unaccepted_end,
+-				     d->phys_addr + d->num_pages * PAGE_SIZE);
++				     d->phys_addr + d->num_pages * EFI_PAGE_SIZE);
+ 	}
+ 
+ 	if (unaccepted_start == ULLONG_MAX)
+diff --git a/drivers/firmware/efi/libstub/x86-stub.c b/drivers/firmware/efi/libstub/x86-stub.c
+index cef32e2c82d8..ace586464bd6 100644
+--- a/drivers/firmware/efi/libstub/x86-stub.c
++++ b/drivers/firmware/efi/libstub/x86-stub.c
+@@ -634,7 +634,7 @@ setup_e820(struct boot_params *params, struct setup_data *e820ext, u32 e820ext_s
+ 				continue;
+ 			e820_type = E820_TYPE_RAM;
+ 			process_unaccepted_memory(d->phys_addr,
+-						  d->phys_addr + PAGE_SIZE * d->num_pages);
++						  d->phys_addr + EFI_PAGE_SIZE * d->num_pages);
+ 			break;
+ 		default:
+ 			continue;
+@@ -659,7 +659,7 @@ setup_e820(struct boot_params *params, struct setup_data *e820ext, u32 e820ext_s
+ 		}
+ 
+ 		entry->addr = d->phys_addr;
+-		entry->size = d->num_pages << PAGE_SHIFT;
++		entry->size = d->num_pages << EFI_PAGE_SHIFT;
+ 		entry->type = e820_type;
+ 		prev = entry++;
+ 		nr_entries++;
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index dac99bc9743a..138321eb8b66 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -1301,7 +1301,7 @@ static void *reloc_iomap(struct i915_vma *batch,
+ 			mutex_lock(&ggtt->vm.mutex);
+ 			err = drm_mm_insert_node_in_range
+ 				(&ggtt->vm.mm, &cache->node,
+-				 PAGE_SIZE, 0, I915_COLOR_UNEVICTABLE,
++				 I915_GTT_PAGE_SIZE, 0, I915_COLOR_UNEVICTABLE,
+ 				 0, ggtt->mappable_end,
+ 				 DRM_MM_INSERT_LOW);
+ 			mutex_unlock(&ggtt->vm.mutex);
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_internal.c b/drivers/gpu/drm/i915/gem/i915_gem_internal.c
+index 37d286ecb99b..16351ff55731 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_internal.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_internal.c
+@@ -144,7 +144,7 @@ __i915_gem_object_create_internal(struct drm_i915_private *i915,
+ 	unsigned int cache_level;
+ 
+ 	GEM_BUG_ON(!size);
+-	GEM_BUG_ON(!IS_ALIGNED(size, PAGE_SIZE));
++	GEM_BUG_ON(!IS_ALIGNED(size, MMUPAGE_SIZE));
+ 
+ 	if (overflows_type(size, obj->base.size))
+ 		return ERR_PTR(-E2BIG);
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_stolen.c b/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
+index 77f85359f279..c8389f811769 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_stolen.c
+@@ -605,7 +605,7 @@ static void dbg_poison(struct i915_ggtt *ggtt,
+ 	if (ggtt->vm.bind_async_flags & I915_VMA_GLOBAL_BIND)
+ 		return; /* beware stop_machine() inversion */
+ 
+-	GEM_BUG_ON(!IS_ALIGNED(size, PAGE_SIZE));
++	GEM_BUG_ON(!IS_ALIGNED(size, I915_GTT_PAGE_SIZE));
+ 
+ 	mutex_lock(&ggtt->error_mutex);
+ 	while (size) {
+@@ -620,15 +620,15 @@ static void dbg_poison(struct i915_ggtt *ggtt,
+ 
+ 		s = io_mapping_map_wc(&ggtt->iomap,
+ 				      ggtt->error_capture.start,
+-				      PAGE_SIZE);
+-		memset_io(s, x, PAGE_SIZE);
++				      I915_GTT_PAGE_SIZE);
++		memset_io(s, x, I915_GTT_PAGE_SIZE);
+ 		io_mapping_unmap(s);
+ 
+-		addr += PAGE_SIZE;
+-		size -= PAGE_SIZE;
++		addr += I915_GTT_PAGE_SIZE;
++		size -= I915_GTT_PAGE_SIZE;
+ 	}
+ 	mb();
+-	ggtt->vm.clear_range(&ggtt->vm, ggtt->error_capture.start, PAGE_SIZE);
++	ggtt->vm.clear_range(&ggtt->vm, ggtt->error_capture.start, I915_GTT_PAGE_SIZE);
+ 	mutex_unlock(&ggtt->error_mutex);
+ #endif
+ }
+@@ -1009,7 +1009,7 @@ i915_gem_stolen_smem_setup(struct drm_i915_private *i915, u16 type,
+ 	mem = intel_memory_region_create(i915,
+ 					 intel_graphics_stolen_res.start,
+ 					 resource_size(&intel_graphics_stolen_res),
+-					 PAGE_SIZE, 0, 0, type, instance,
++					 MMUPAGE_SIZE, 0, 0, type, instance,
+ 					 &i915_region_stolen_smem_ops);
+ 	if (IS_ERR(mem))
+ 		return mem;
+diff --git a/drivers/gpu/drm/sysfb/ofdrm.c b/drivers/gpu/drm/sysfb/ofdrm.c
+index 247cf13c80a0..9a0df5316bb2 100644
+--- a/drivers/gpu/drm/sysfb/ofdrm.c
++++ b/drivers/gpu/drm/sysfb/ofdrm.c
+@@ -947,8 +947,8 @@ static struct ofdrm_device *ofdrm_device_create(struct drm_driver *drv,
+ 	 * I/O resources
+ 	 */
+ 
+-	fb_pgbase = round_down(fb_base, PAGE_SIZE);
+-	fb_pgsize = fb_base - fb_pgbase + round_up(fb_size, PAGE_SIZE);
++	fb_pgbase = round_down(fb_base, MMUPAGE_SIZE);
++	fb_pgsize = fb_base - fb_pgbase + round_up(fb_size, MMUPAGE_SIZE);
+ 
+ 	ret = devm_aperture_acquire_for_platform_device(pdev, fb_pgbase, fb_pgsize);
+ 	if (ret) {
+diff --git a/drivers/video/fbdev/efifb.c b/drivers/video/fbdev/efifb.c
+index 47ebc0107209..e6743af401b1 100644
+--- a/drivers/video/fbdev/efifb.c
++++ b/drivers/video/fbdev/efifb.c
+@@ -433,8 +433,8 @@ static int efifb_probe(struct platform_device *dev)
+ 	size_remap  = size_vmode * 2;
+ 	if (size_remap > size_total)
+ 		size_remap = size_total;
+-	if (size_remap % PAGE_SIZE)
+-		size_remap += PAGE_SIZE - (size_remap % PAGE_SIZE);
++	if (size_remap % MMUPAGE_SIZE)
++		size_remap += MMUPAGE_SIZE - (size_remap % MMUPAGE_SIZE);
+ 	efifb_fix.smem_len = size_remap;
+ 
+ 	if (request_mem_region(efifb_fix.smem_start, size_remap, "efifb")) {
+-- 
+2.54.0
+

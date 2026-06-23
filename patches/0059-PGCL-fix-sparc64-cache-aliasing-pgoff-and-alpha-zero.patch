@@ -1,0 +1,128 @@
+From a3a35125d378cee2656f40f8aed147e87eaf2fe2 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 1 Apr 2026 11:51:45 +0200
+Subject: [PATCH 059/174] PGCL: fix sparc64 cache aliasing pgoff and alpha zero
+ page alignment
+
+sparc64: sys_sparc_64.c had 5 instances of pgoff << PAGE_SHIFT in cache
+aliasing calculations (COLOR_ALIGN, MAP_FIXED checks, align_offset).
+With PGCL, vm_pgoff is MMUPAGE-granular, so these must use MMUPAGE_SHIFT.
+The PAGE_SHIFT shift produced wrong cache aliasing offsets, causing
+MAP_SHARED+MAP_FIXED mmaps to return -EINVAL (mremap06, mmap04 failures).
+
+alpha: ZERO_PGE lives at physical 0x0A000, which is not PAGE_SIZE-aligned
+with PGCL (PAGE_SIZE=128KB). pfn_pte(page_to_pfn(ZERO_PAGE(0))) mapped
+physical 0 (SRM console data) instead of zeroed memory. Add a dedicated
+PAGE_SIZE-aligned empty_zero_page array, matching the pattern used by
+most other architectures. Fixes madvise03, madvise10, mmapstress07.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/alpha/include/asm/pgtable.h | 12 ++++++++++++
+ arch/alpha/mm/init.c             | 14 +++++++++++++-
+ arch/sparc/kernel/sys_sparc_64.c | 10 +++++-----
+ 3 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/arch/alpha/include/asm/pgtable.h b/arch/alpha/include/asm/pgtable.h
+index 83486711db20..e0659749c378 100644
+--- a/arch/alpha/include/asm/pgtable.h
++++ b/arch/alpha/include/asm/pgtable.h
+@@ -139,6 +139,18 @@ static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
+ 	return newprot;
+ }
+ 
++/*
++ * ZERO_PAGE is a global shared page that is always zero:  used
++ * for zero-mapped memory areas etc..
++ *
++ * With PGCL, ZERO_PGE (at 0x0A000) is not at a PAGE_SIZE boundary,
++ * so pfn_pte(page_to_pfn(ZERO_PAGE(0))) would map the wrong sub-page.
++ * Use a dedicated page-aligned zero page instead.
++ */
++extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)]
++	__attribute__((aligned(PAGE_SIZE)));
++#define ZERO_PAGE(vaddr)	(virt_to_page(empty_zero_page))
++
+ /*
+  * On certain platforms whose physical address space can overlap KSEG,
+  * namely EV6 and above, we must re-twiddle the physaddr to restore the
+diff --git a/arch/alpha/mm/init.c b/arch/alpha/mm/init.c
+index 20c891fa4464..62741040c6f3 100644
+--- a/arch/alpha/mm/init.c
++++ b/arch/alpha/mm/init.c
+@@ -222,10 +222,22 @@ void __init arch_zone_limits_init(unsigned long *max_zone_pfn)
+ }
+ 
+ /*
+- * paging_init() initializes the kernel's ZERO_PGE.
++ * Page-aligned zero page for PGCL.  With PGCL, ZERO_PGE (phys 0x0A000)
++ * is not at a PAGE_SIZE boundary, so pfn_pte(page_to_pfn()) would map
++ * physical 0 instead of 0x0A000.  This dedicated array is PAGE_SIZE-aligned,
++ * ensuring the zero page PTE maps correct zeroed memory.
++ */
++unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)]
++	__attribute__((aligned(PAGE_SIZE)));
++EXPORT_SYMBOL(empty_zero_page);
++
++/*
++ * paging_init() initializes the zero page.
+  */
+ void __init paging_init(void)
+ {
++	memset(empty_zero_page, 0, PAGE_SIZE);
++	/* Also zero the SRM ZERO_PGE for legacy users */
+ 	memset(absolute_pointer(ZERO_PGE), 0, MMUPAGE_SIZE);
+ }
+ 
+diff --git a/arch/sparc/kernel/sys_sparc_64.c b/arch/sparc/kernel/sys_sparc_64.c
+index ca837be2c466..b835b5f6cf36 100644
+--- a/arch/sparc/kernel/sys_sparc_64.c
++++ b/arch/sparc/kernel/sys_sparc_64.c
+@@ -83,7 +83,7 @@ static inline unsigned long COLOR_ALIGN(unsigned long addr,
+ 					 unsigned long pgoff)
+ {
+ 	unsigned long base = (addr+SHMLBA-1)&~(SHMLBA-1);
+-	unsigned long off = (pgoff<<PAGE_SHIFT) & (SHMLBA-1);
++	unsigned long off = (pgoff<<MMUPAGE_SHIFT) & (SHMLBA-1);
+ 
+ 	return base + off;
+ }
+@@ -115,7 +115,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if (!file_hugepage && (flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1)))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1)))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -146,7 +146,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 	info.high_limit = min(task_size, VA_EXCLUDE_START);
+ 	info.align_mask = get_align_mask(filp, flags);
+ 	if (!file_hugepage)
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	if ((addr & ~PAGE_MASK) && task_size > VA_EXCLUDE_END) {
+@@ -183,7 +183,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if (!file_hugepage && (flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1)))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1)))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -214,7 +214,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	info.high_limit = mm->mmap_base;
+ 	info.align_mask = get_align_mask(filp, flags);
+ 	if (!file_hugepage)
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	/*
+-- 
+2.54.0
+

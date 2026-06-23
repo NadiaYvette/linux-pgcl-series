@@ -1,0 +1,45 @@
+From 9ad3af6e601756401a3137d8094012a4df61f3e3 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 27 May 2026 06:26:43 +0200
+Subject: [PATCH 124/174] mm/rmap: reset nr_pages to 1 each PVMW iteration in
+ try_to_unmap_one and try_to_migrate_one
+
+Port of upstream commit 3f8968e9cbf9 ("mm/rmap: initialize nr_pages to
+1 at loop start in try_to_unmap_one") plus the same defensive change
+applied to try_to_migrate_one, which has the identical latent bug under
+the PGCL rmap conventions.
+
+In both functions nr_pages is declared at function scope and only
+updated mid-loop from pvmw.nr_mmupages on the present-PTE batched path.
+On a subsequent iteration that takes a different path (e.g. a
+device-exclusive PTE following a batched present-PTE clear), the stale
+nr_pages from the previous iteration is reused for get_and_clear_ptes /
+set_ptes / add_mm_counter / folio_put_refs / folio_remove_rmap_pte,
+corrupting refcount/mapcount and the RSS counters.
+
+Upstream's commit only patched try_to_unmap_one because Dev Jain only
+had a reproducer there, but the analysis carries over verbatim to
+try_to_migrate_one: same pvmw walker, same nr_pages plumbing into the
+PGCL-batched PTE/RSS helpers, same per-iteration staleness window.
+
+Signed-off-by: Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/rmap.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 7fd849910893..7a0f19d7619f 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -2570,6 +2570,8 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
+ 	mmu_notifier_invalidate_range_start(&range);
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
++		nr_pages = 1;
++
+ 		/* PMD-mapped THP migration entry */
+ 		if (!pvmw.pte) {
+ 			__maybe_unused unsigned long pfn;
+-- 
+2.54.0
+

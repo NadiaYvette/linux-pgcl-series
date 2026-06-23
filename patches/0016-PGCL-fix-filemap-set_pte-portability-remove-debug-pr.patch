@@ -1,0 +1,42 @@
+From 098ba2cdb6fe0487d467f7426dd8c636ea07fe2d Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 12 Mar 2026 23:39:56 +0100
+Subject: [PATCH 016/174] PGCL: fix filemap set_pte portability + remove debug
+ prints
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace bare set_pte() with set_ptes(mm, addr, ptep, entry, 1) in
+filemap_set_ptes_cluster — powerpc and other architectures that define
+their own set_ptes don't expose set_pte as a standalone function.
+Also remove hardcoded debug address range print.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ mm/filemap.c | 9 +--------
+ 1 file changed, 1 insertion(+), 8 deletions(-)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 79dc0ba2bb34..04df030a09a2 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3795,14 +3795,7 @@ static int filemap_set_ptes_cluster(struct vm_fault *vmf,
+ 		entry = pte_mksub(base, i * MMUPAGE_SIZE);
+ 		entry = pte_sw_mkyoung(entry);
+ 
+-		if (sub_addr >= 0x4ad000 && sub_addr < 0x4b3000) {
+-			pr_err("PGCL filemap_cluster HIT: sub_addr=%lx addr=%lx i=%d folio=%px pfn=%lx vm=[%lx-%lx]\n",
+-			       sub_addr, addr, i, folio, folio_pfn(folio),
+-			       vma->vm_start, vma->vm_end);
+-			dump_stack();
+-		}
+-
+-		set_pte(ptep + i, entry);
++		set_ptes(vma->vm_mm, sub_addr, ptep + i, entry, 1);
+ 		nr_set++;
+ 	}
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,687 @@
+From b4f89e4c2414b4e912409388c1fbc0489ab9dda1 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 13 Mar 2026 00:25:03 +0100
+Subject: [PATCH 017/174] PGCL: cross-arch fixes for PAGE_MMUSHIFT=4
+ compilation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fix compilation with PAGE_MMUSHIFT=4 (64KB kernel pages) on multiple
+architectures:
+
+- alpha: Use MMUPAGE_SIZE for CIA TBIA workaround page alignment
+  (avoids .align 17 exceeding assembler's 2^15 max)
+- mips: Use PTR_LI+and for THREAD_MASK when > 16 bits in stackframe.h
+  and genex.S (ori/xori limited to 16-bit immediates)
+- powerpc: Compute stack frame offset in C/register instead of immediate
+  for stdu/stwu/addi in irq.c, head_book3s_32.S, misc_32.S
+- s390: Use MMUPAGE_SIZE for hardware-defined structures (uv_secret_list,
+  lowcore, os_info, ipl_parameter_block, vsie_page, memcpy_real)
+- sparc: Use MMUPAGE_SIZE in TLB/cache flush assembly (hypersparc.S,
+  swift.S, tsunami.S, ultra.S, viking.S) — hardware page operations
+- mm: Replace bare set_pte() with set_ptes(mm,addr,ptep,pte,1) for
+  portability (powerpc doesn't expose set_pte as standalone function)
+
+Results: 7/11 architectures now compile with PAGE_MMUSHIFT=4.
+Remaining: arm64, sparc64 (page table layout), powerpc (linker script
+DATA_SHIFT), s390 (entry.S asm overflows) need deeper arch work.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/alpha/kernel/core_cia.c         |  4 ++--
+ arch/mips/include/asm/stackframe.h   |  5 +++++
+ arch/mips/kernel/genex.S             | 10 +++++++++
+ arch/powerpc/kernel/head_book3s_32.S |  9 ++++++--
+ arch/powerpc/kernel/irq.c            | 15 +++++++------
+ arch/powerpc/kernel/misc_32.S        |  4 +++-
+ arch/s390/include/asm/ipl.h          |  6 +++---
+ arch/s390/include/asm/maccess.h      |  4 ++--
+ arch/s390/include/asm/uv.h           |  2 +-
+ arch/s390/kernel/ipl.c               |  2 +-
+ arch/s390/kernel/os_info.c           |  2 +-
+ arch/s390/kernel/setup.c             |  2 +-
+ arch/s390/kvm/vsie.c                 |  2 +-
+ arch/s390/mm/maccess.c               |  2 +-
+ arch/sparc/mm/hypersparc.S           | 20 ++++++++---------
+ arch/sparc/mm/swift.S                |  6 +++---
+ arch/sparc/mm/tsunami.S              |  4 ++--
+ arch/sparc/mm/ultra.S                | 32 ++++++++++++++--------------
+ arch/sparc/mm/viking.S               | 10 ++++-----
+ include/linux/pte_cluster.h          |  2 +-
+ mm/memory.c                          |  6 +++---
+ mm/mremap.c                          |  2 +-
+ 22 files changed, 88 insertions(+), 63 deletions(-)
+
+diff --git a/arch/alpha/kernel/core_cia.c b/arch/alpha/kernel/core_cia.c
+index 6e577228e175..f88bb3852d0e 100644
+--- a/arch/alpha/kernel/core_cia.c
++++ b/arch/alpha/kernel/core_cia.c
+@@ -346,8 +346,8 @@ cia_prepare_tbia_workaround(int window)
+ static void __init
+ verify_tb_operation(void)
+ {
+-	static int page[PAGE_SIZE/4]
+-		__attribute__((aligned(PAGE_SIZE)))
++	static int page[MMUPAGE_SIZE/4]
++		__attribute__((aligned(MMUPAGE_SIZE)))
+ 		__initdata = { 0 };
+ 
+ 	struct pci_iommu_arena *arena = pci_isa_hose->sg_isa;
+diff --git a/arch/mips/include/asm/stackframe.h b/arch/mips/include/asm/stackframe.h
+index a13431379073..0f94ea9d9c4a 100644
+--- a/arch/mips/include/asm/stackframe.h
++++ b/arch/mips/include/asm/stackframe.h
+@@ -278,8 +278,13 @@
+ 		sll	k0, 3		/* extract cu0 bit */
+ 		bltz	k0, 9f
+ 
++#if _THREAD_MASK < 0x10000
+ 		ori	$28, sp, _THREAD_MASK
+ 		xori	$28, _THREAD_MASK
++#else
++		PTR_LI	$28, ~_THREAD_MASK
++		and	$28, sp, $28
++#endif
+ #ifdef CONFIG_CPU_CAVIUM_OCTEON
+ 		.set    mips64
+ 		pref    0, 0($28)       /* Prefetch the current pointer */
+diff --git a/arch/mips/kernel/genex.S b/arch/mips/kernel/genex.S
+index be1b049d856f..89d97d563a26 100644
+--- a/arch/mips/kernel/genex.S
++++ b/arch/mips/kernel/genex.S
+@@ -656,8 +656,13 @@ isrdhwr:
+ 	.set	noreorder
+ 	MFC0	k0, CP0_EPC
+ #if defined(CONFIG_CPU_R3000)
++#if _THREAD_MASK < 0x10000
+ 	ori	k1, _THREAD_MASK
+ 	xori	k1, _THREAD_MASK
++#else
++	PTR_LI	v1, ~_THREAD_MASK
++	and	k1, k1, v1
++#endif
+ 	LONG_L	v1, TI_TP_VALUE(k1)
+ 	LONG_ADDIU	k0, 4
+ 	jr	k0
+@@ -672,8 +677,13 @@ isrdhwr:
+ #endif
+ 	MTC0	k0, CP0_EPC
+ 	/* I hope three instructions between MTC0 and ERET are enough... */
++#if _THREAD_MASK < 0x10000
+ 	ori	k1, _THREAD_MASK
+ 	xori	k1, _THREAD_MASK
++#else
++	PTR_LI	k0, ~_THREAD_MASK
++	and	k1, k1, k0
++#endif
+ 	LONG_L	v1, TI_TP_VALUE(k1)
+ 	.set	push
+ 	.set	arch=r4000
+diff --git a/arch/powerpc/kernel/head_book3s_32.S b/arch/powerpc/kernel/head_book3s_32.S
+index c1779455ea32..9f67896c022a 100644
+--- a/arch/powerpc/kernel/head_book3s_32.S
++++ b/arch/powerpc/kernel/head_book3s_32.S
+@@ -832,7 +832,9 @@ __secondary_start:
+ 	lwz	r1,TASK_STACK(r1)
+ 
+ 	/* stack */
+-	addi	r1,r1,THREAD_SIZE-STACK_FRAME_MIN_SIZE
++	lis	r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@h
++	ori	r0,r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@l
++	add	r1,r1,r0
+ 	li	r0,0
+ 	tophys(r3,r1)
+ 	stw	r0,0(r3)
+@@ -959,8 +961,11 @@ END_MMU_FTR_SECTION_IFCLR(MMU_FTR_HPTE_TABLE)
+ 	/* stack */
+ 	lis	r1,init_thread_union@ha
+ 	addi	r1,r1,init_thread_union@l
++	lis	r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@h
++	ori	r0,r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@l
++	add	r1,r1,r0
+ 	li	r0,0
+-	stwu	r0,THREAD_SIZE-STACK_FRAME_MIN_SIZE(r1)
++	stw	r0,0(r1)
+ /*
+  * Do early platform-specific initialization,
+  * and set up the MMU.
+diff --git a/arch/powerpc/kernel/irq.c b/arch/powerpc/kernel/irq.c
+index a0e8b998c9b5..098365d26bea 100644
+--- a/arch/powerpc/kernel/irq.c
++++ b/arch/powerpc/kernel/irq.c
+@@ -203,9 +203,11 @@ static inline void check_stack_overflow(unsigned long sp)
+ static __always_inline void call_do_softirq(const void *sp)
+ {
+ 	/* Temporarily switch r1 to sp, call __do_softirq() then restore r1. */
++	const void *newsp = (const char *)sp + THREAD_SIZE - STACK_FRAME_MIN_SIZE;
++
+ 	asm volatile (
+-		 PPC_STLU "	%%r1, %[offset](%[sp])	;"
+-		"mr		%%r1, %[sp]		;"
++		 PPC_STL "	%%r1, 0(%[newsp])	;"
++		"mr		%%r1, %[newsp]		;"
+ #ifdef CONFIG_PPC_KERNEL_PCREL
+ 		"bl		%[callee]@notoc		;"
+ #else
+@@ -214,7 +216,7 @@ static __always_inline void call_do_softirq(const void *sp)
+ 		 PPC_LL "	%%r1, 0(%%r1)		;"
+ 		 : // Outputs
+ 		 : // Inputs
+-		   [sp] "b" (sp), [offset] "i" (THREAD_SIZE - STACK_FRAME_MIN_SIZE),
++		   [newsp] "b" (newsp),
+ 		   [callee] "i" (__do_softirq)
+ 		 : // Clobbers
+ 		   "lr", "xer", "ctr", "memory", "cr0", "cr1", "cr5", "cr6",
+@@ -257,12 +259,13 @@ static void __do_irq(struct pt_regs *regs, unsigned long oldsp)
+ static __always_inline void call_do_irq(struct pt_regs *regs, void *sp)
+ {
+ 	register unsigned long r3 asm("r3") = (unsigned long)regs;
++	void *newsp = (char *)sp + THREAD_SIZE - STACK_FRAME_MIN_SIZE;
+ 
+ 	/* Temporarily switch r1 to sp, call __do_irq() then restore r1. */
+ 	asm volatile (
+-		 PPC_STLU "	%%r1, %[offset](%[sp])	;"
++		 PPC_STL "	%%r1, 0(%[newsp])	;"
+ 		"mr		%%r4, %%r1		;"
+-		"mr		%%r1, %[sp]		;"
++		"mr		%%r1, %[newsp]		;"
+ #ifdef CONFIG_PPC_KERNEL_PCREL
+ 		"bl		%[callee]@notoc		;"
+ #else
+@@ -272,7 +275,7 @@ static __always_inline void call_do_irq(struct pt_regs *regs, void *sp)
+ 		 : // Outputs
+ 		   "+r" (r3)
+ 		 : // Inputs
+-		   [sp] "b" (sp), [offset] "i" (THREAD_SIZE - STACK_FRAME_MIN_SIZE),
++		   [newsp] "b" (newsp),
+ 		   [callee] "i" (__do_irq)
+ 		 : // Clobbers
+ 		   "lr", "xer", "ctr", "memory", "cr0", "cr1", "cr5", "cr6",
+diff --git a/arch/powerpc/kernel/misc_32.S b/arch/powerpc/kernel/misc_32.S
+index acb727f54e9d..f5a205ecc8db 100644
+--- a/arch/powerpc/kernel/misc_32.S
++++ b/arch/powerpc/kernel/misc_32.S
+@@ -316,7 +316,9 @@ EXPORT_SYMBOL(__bswapdi2)
+ _GLOBAL(start_secondary_resume)
+ 	/* Reset stack */
+ 	rlwinm	r1, r1, 0, 0, 31 - THREAD_SHIFT
+-	addi	r1,r1,THREAD_SIZE-STACK_FRAME_MIN_SIZE
++	lis	r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@h
++	ori	r0,r0,(THREAD_SIZE-STACK_FRAME_MIN_SIZE)@l
++	add	r1,r1,r0
+ 	li	r3,0
+ 	stw	r3,0(r1)		/* Zero the stack frame pointer	*/
+ 	bl	start_secondary
+diff --git a/arch/s390/include/asm/ipl.h b/arch/s390/include/asm/ipl.h
+index b0d00032479d..a1e56e1ae8b8 100644
+--- a/arch/s390/include/asm/ipl.h
++++ b/arch/s390/include/asm/ipl.h
+@@ -24,9 +24,9 @@ struct ipl_parameter_block {
+ 		struct ipl_pb0_ccw ccw;
+ 		struct ipl_pb0_eckd eckd;
+ 		struct ipl_pb0_nvme nvme;
+-		char raw[PAGE_SIZE - sizeof(struct ipl_pl_hdr)];
++		char raw[MMUPAGE_SIZE - sizeof(struct ipl_pl_hdr)];
+ 	};
+-} __packed __aligned(PAGE_SIZE);
++} __packed __aligned(MMUPAGE_SIZE);
+ 
+ #define NSS_NAME_SIZE 8
+ 
+@@ -53,7 +53,7 @@ struct ipl_parameter_block {
+ #define DIAG308_VMPARM_SIZE (64)
+ #define DIAG308_SCPDATA_OFFSET offsetof(struct ipl_parameter_block, \
+ 					fcp.scp_data)
+-#define DIAG308_SCPDATA_SIZE (PAGE_SIZE - DIAG308_SCPDATA_OFFSET)
++#define DIAG308_SCPDATA_SIZE (MMUPAGE_SIZE - DIAG308_SCPDATA_OFFSET)
+ 
+ struct save_area;
+ struct save_area * __init save_area_alloc(bool is_boot_cpu);
+diff --git a/arch/s390/include/asm/maccess.h b/arch/s390/include/asm/maccess.h
+index 50225940d971..53c62a6a4b98 100644
+--- a/arch/s390/include/asm/maccess.h
++++ b/arch/s390/include/asm/maccess.h
+@@ -4,8 +4,8 @@
+ 
+ #include <linux/types.h>
+ 
+-#define MEMCPY_REAL_SIZE	PAGE_SIZE
+-#define MEMCPY_REAL_MASK	PAGE_MASK
++#define MEMCPY_REAL_SIZE	MMUPAGE_SIZE
++#define MEMCPY_REAL_MASK	MMUPAGE_MASK
+ 
+ struct iov_iter;
+ 
+diff --git a/arch/s390/include/asm/uv.h b/arch/s390/include/asm/uv.h
+index d919e69662f5..0dad3aa8a7b6 100644
+--- a/arch/s390/include/asm/uv.h
++++ b/arch/s390/include/asm/uv.h
+@@ -429,7 +429,7 @@ struct uv_secret_list {
+ 	u64 reserved_08;
+ 	struct uv_secret_list_item secrets[85];
+ } __packed __aligned(8);
+-static_assert(sizeof(struct uv_secret_list) == PAGE_SIZE);
++static_assert(sizeof(struct uv_secret_list) == MMUPAGE_SIZE);
+ 
+ static inline int __uv_call(unsigned long r1, unsigned long r2)
+ {
+diff --git a/arch/s390/kernel/ipl.c b/arch/s390/kernel/ipl.c
+index 3c346b02ceb9..67996cfed56d 100644
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -2345,7 +2345,7 @@ static struct notifier_block on_panic_nb = {
+ 
+ void __init setup_ipl(void)
+ {
+-	BUILD_BUG_ON(sizeof(struct ipl_parameter_block) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct ipl_parameter_block) != MMUPAGE_SIZE);
+ 
+ 	ipl_info.type = get_ipl_type();
+ 	switch (ipl_info.type) {
+diff --git a/arch/s390/kernel/os_info.c b/arch/s390/kernel/os_info.c
+index 4a30c10ae63b..b67e8b0b80c1 100644
+--- a/arch/s390/kernel/os_info.c
++++ b/arch/s390/kernel/os_info.c
+@@ -73,7 +73,7 @@ void __init os_info_init(void)
+ {
+ 	struct lowcore *abs_lc;
+ 
+-	BUILD_BUG_ON(sizeof(struct os_info) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct os_info) != MMUPAGE_SIZE);
+ 	os_info.version_major = OS_INFO_VERSION_MAJOR;
+ 	os_info.version_minor = OS_INFO_VERSION_MINOR;
+ 	os_info.magic = OS_INFO_MAGIC;
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index b60284328fe3..1a625854431d 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -390,7 +390,7 @@ static void __init setup_lowcore(void)
+ 	/*
+ 	 * Setup lowcore for boot cpu
+ 	 */
+-	BUILD_BUG_ON(sizeof(struct lowcore) != LC_PAGES * PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct lowcore) != LC_PAGES * MMUPAGE_SIZE);
+ 	lc = memblock_alloc_low(sizeof(*lc), sizeof(*lc));
+ 	if (!lc)
+ 		panic("%s: Failed to allocate %zu bytes align=%zx\n",
+diff --git a/arch/s390/kvm/vsie.c b/arch/s390/kvm/vsie.c
+index e5a23f1c9749..8fa4f28f9b7f 100644
+--- a/arch/s390/kvm/vsie.c
++++ b/arch/s390/kvm/vsie.c
+@@ -1518,7 +1518,7 @@ int kvm_s390_handle_vsie(struct kvm_vcpu *vcpu)
+ 	if (vcpu->arch.sie_block->gpsw.mask & PSW_MASK_PSTATE)
+ 		return kvm_s390_inject_program_int(vcpu, PGM_PRIVILEGED_OP);
+ 
+-	BUILD_BUG_ON(sizeof(struct vsie_page) != PAGE_SIZE);
++	BUILD_BUG_ON(sizeof(struct vsie_page) != MMUPAGE_SIZE);
+ 	scb_addr = kvm_s390_get_base_disp_s(vcpu, NULL);
+ 
+ 	/* 512 byte alignment */
+diff --git a/arch/s390/mm/maccess.c b/arch/s390/mm/maccess.c
+index cfd219fe495c..ea7f2eb94fbd 100644
+--- a/arch/s390/mm/maccess.c
++++ b/arch/s390/mm/maccess.c
+@@ -87,7 +87,7 @@ size_t memcpy_real_iter(struct iov_iter *iter, unsigned long src, size_t count)
+ 	void *chunk;
+ 	pte_t pte;
+ 
+-	BUILD_BUG_ON(MEMCPY_REAL_SIZE != PAGE_SIZE);
++	BUILD_BUG_ON(MEMCPY_REAL_SIZE != MMUPAGE_SIZE);
+ 	while (count) {
+ 		phys = src & MEMCPY_REAL_MASK;
+ 		offset = src & ~MEMCPY_REAL_MASK;
+diff --git a/arch/sparc/mm/hypersparc.S b/arch/sparc/mm/hypersparc.S
+index 6c2521e85a42..0c05fdf8274c 100644
+--- a/arch/sparc/mm/hypersparc.S
++++ b/arch/sparc/mm/hypersparc.S
+@@ -90,10 +90,10 @@ hypersparc_flush_cache_range:
+ 	ld	[%g2 + %lo(vac_cache_size)], %o3
+ 
+ 	/* Here comes the fun part... */
+-	add	%o2, (PAGE_SIZE - 1), %o2
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	add	%o2, (MMUPAGE_SIZE - 1), %o2
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ 	add	%o4, %o4, %o5
+-	andn	%o2, (PAGE_SIZE - 1), %o2
++	andn	%o2, (MMUPAGE_SIZE - 1), %o2
+ 	add	%o4, %o5, %g1
+ 	sub	%o2, %o1, %g4
+ 	add	%o4, %g1, %g2
+@@ -128,7 +128,7 @@ hypersparc_flush_cache_range:
+ 	mov	SRMMU_CTX_REG, %g7
+ 	lda	[%g7] ASI_M_MMUREGS, %o3
+ 	sta	%o0, [%g7] ASI_M_MMUREGS
+-	add	%o2, -PAGE_SIZE, %o0
++	add	%o2, -MMUPAGE_SIZE, %o0
+ 1:
+ 	or	%o0, 0x400, %g7
+ 	lda	[%g7] ASI_M_FLUSH_PROBE, %g7
+@@ -151,7 +151,7 @@ hypersparc_flush_cache_range:
+ 3:
+ 	cmp	%o2, %o1
+ 	bne	1b
+-	 add	%o2, -PAGE_SIZE, %o0
++	 add	%o2, -MMUPAGE_SIZE, %o0
+ 	mov	SRMMU_FAULT_STATUS, %g5
+ 	lda	[%g5] ASI_M_MMUREGS, %g0
+ 	mov	SRMMU_CTX_REG, %g7
+@@ -176,7 +176,7 @@ hypersparc_flush_cache_page:
+ 	sethi	%hi(vac_line_size), %g1
+ 	ld	[%g1 + %lo(vac_line_size)], %o4
+ 	mov	SRMMU_CTX_REG, %o3
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ 	lda	[%o3] ASI_M_MMUREGS, %o2
+ 	sta	%g2, [%o3] ASI_M_MMUREGS
+ 	or	%o1, 0x400, %o5
+@@ -184,7 +184,7 @@ hypersparc_flush_cache_page:
+ 	orcc	%g0, %g1, %g0
+ 	be	2f
+ 	 add	%o4, %o4, %o5
+-	sub	%o1, -PAGE_SIZE, %o1
++	sub	%o1, -MMUPAGE_SIZE, %o1
+ 	add	%o4, %o5, %g1
+ 	add	%o4, %g1, %g2
+ 	add	%o4, %g2, %g3
+@@ -223,7 +223,7 @@ hypersparc_flush_sig_insns:
+ hypersparc_flush_page_to_ram:
+ 	sethi	%hi(vac_line_size), %g1
+ 	ld	[%g1 + %lo(vac_line_size)], %o4
+-	andn	%o0, (PAGE_SIZE - 1), %o0
++	andn	%o0, (MMUPAGE_SIZE - 1), %o0
+ 	add	%o4, %o4, %o5
+ 	or	%o0, 0x400, %g7
+ 	lda	[%g7] ASI_M_FLUSH_PROBE, %g5
+@@ -232,7 +232,7 @@ hypersparc_flush_page_to_ram:
+ 	be	2f
+ 	 add	%o4, %g1, %g2
+ 	add	%o4, %g2, %g3
+-	sub	%o0, -PAGE_SIZE, %o0
++	sub	%o0, -MMUPAGE_SIZE, %o0
+ 	add	%o4, %g3, %g4
+ 	add	%o4, %g4, %g5
+ 	add	%o4, %g5, %g7
+@@ -312,7 +312,7 @@ hypersparc_flush_tlb_page:
+ 	ld	[%o0 + VMA_VM_MM], %o0
+ 	mov	SRMMU_CTX_REG, %g1
+ 	ld	[%o0 + AOFF_mm_context], %o3
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ #ifndef CONFIG_SMP
+ 	cmp	%o3, -1
+ 	be	hypersparc_flush_tlb_page_out
+diff --git a/arch/sparc/mm/swift.S b/arch/sparc/mm/swift.S
+index f414bfd8d899..f9a056a843f1 100644
+--- a/arch/sparc/mm/swift.S
++++ b/arch/sparc/mm/swift.S
+@@ -132,7 +132,7 @@ swift_flush_cache_page:
+ 	lda	[%g7] ASI_M_MMUREGS, %g5
+ 	sta	%g2, [%g7] ASI_M_MMUREGS
+ 
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ #if 1
+ 	sethi	%hi(0x1000), %o0
+ 1:	subcc	%o0, 0x10, %o0
+@@ -178,7 +178,7 @@ swift_flush_cache_page_out:
+ 	.globl	swift_flush_page_to_ram
+ swift_flush_page_for_dma:
+ swift_flush_page_to_ram:
+-	andn	%o0, (PAGE_SIZE - 1), %o1
++	andn	%o0, (MMUPAGE_SIZE - 1), %o1
+ #if 1
+ 	sethi	%hi(0x1000), %o0
+ 1:	subcc	%o0, 0x10, %o0
+@@ -237,7 +237,7 @@ swift_flush_tlb_page:
+ 	ld	[%o0 + VMA_VM_MM], %o0
+ 	mov	SRMMU_CTX_REG, %g1
+ 	ld	[%o0 + AOFF_mm_context], %o3
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ 	cmp	%o3, -1
+ 	be	swift_flush_tlb_page_out
+ 	 nop
+diff --git a/arch/sparc/mm/tsunami.S b/arch/sparc/mm/tsunami.S
+index 62b742df65dc..4126ae15bbec 100644
+--- a/arch/sparc/mm/tsunami.S
++++ b/arch/sparc/mm/tsunami.S
+@@ -69,7 +69,7 @@ tsunami_flush_tlb_page:
+ 	ld	[%o0 + VMA_VM_MM], %o0
+ 	mov	SRMMU_CTX_REG, %g1
+ 	ld	[%o0 + AOFF_mm_context], %o3
+-	andn	%o1, (PAGE_SIZE - 1), %o1
++	andn	%o1, (MMUPAGE_SIZE - 1), %o1
+ 	cmp	%o3, -1
+ 	be	tsunami_flush_tlb_page_out
+ 	 lda	[%g1] ASI_M_MMUREGS, %g5
+@@ -96,7 +96,7 @@ tsunami_flush_tlb_page_out:
+ 
+ tsunami_copy_1page:
+ /* NOTE: This routine has to be shorter than 70insns --jj */
+-	or	%g0, (PAGE_SIZE >> 8), %g1
++	or	%g0, (MMUPAGE_SIZE >> 8), %g1
+ 1:
+ 	MIRROR_BLOCK(%o0, %o1, 0x00, %o2, %o3, %o4, %o5)
+ 	MIRROR_BLOCK(%o0, %o1, 0x20, %o2, %o3, %o4, %o5)
+diff --git a/arch/sparc/mm/ultra.S b/arch/sparc/mm/ultra.S
+index 70e658d107e0..1544cd0cf46c 100644
+--- a/arch/sparc/mm/ultra.S
++++ b/arch/sparc/mm/ultra.S
+@@ -121,7 +121,7 @@ __flush_tlb_kernel_range:	/* 31 insns */
+ 	 sub		%o1, %o0, %o3
+ 	srlx		%o3, 18, %o4
+ 	brnz,pn		%o4, __spitfire_flush_tlb_kernel_range_slow
+-	 sethi		%hi(PAGE_SIZE), %o4
++	 sethi		%hi(MMUPAGE_SIZE), %o4
+ 	sub		%o3, %o4, %o3
+ 	or		%o0, 0x20, %o0		! Nucleus
+ 1:	stxa		%g0, [%o0 + %o3] ASI_DMMU_DEMAP
+@@ -193,7 +193,7 @@ __flush_icache_page:	/* %o0 = phys_page */
+ 	srlx		%o0, PAGE_SHIFT, %o0
+ 	sethi		%hi(PAGE_OFFSET), %g1
+ 	sllx		%o0, PAGE_SHIFT, %o0
+-	sethi		%hi(PAGE_SIZE), %g2
++	sethi		%hi(MMUPAGE_SIZE), %g2
+ 	ldx		[%g1 + %lo(PAGE_OFFSET)], %g1
+ 	add		%o0, %g1, %o0
+ 1:	subcc		%g2, 32, %g2
+@@ -330,7 +330,7 @@ __cheetah_flush_tlb_kernel_range:	/* 31 insns */
+ 	 sub		%o1, %o0, %o3
+ 	srlx		%o3, 18, %o4
+ 	brnz,pn		%o4, 3f
+-	 sethi		%hi(PAGE_SIZE), %o4
++	 sethi		%hi(MMUPAGE_SIZE), %o4
+ 	sub		%o3, %o4, %o3
+ 	or		%o0, 0x20, %o0		! Nucleus
+ 1:	stxa		%g0, [%o0 + %o3] ASI_DMMU_DEMAP
+@@ -362,7 +362,7 @@ __cheetah_flush_dcache_page: /* 11 insns */
+ 	sethi		%hi(PAGE_OFFSET), %g1
+ 	ldx		[%g1 + %lo(PAGE_OFFSET)], %g1
+ 	sub		%o0, %g1, %o0
+-	sethi		%hi(PAGE_SIZE), %o4
++	sethi		%hi(MMUPAGE_SIZE), %o4
+ 1:	subcc		%o4, (1 << 5), %o4
+ 	stxa		%g0, [%o0 + %o4] ASI_DCACHE_INVALIDATE
+ 	membar		#Sync
+@@ -465,7 +465,7 @@ __hypervisor_flush_tlb_kernel_range: /* 31 insns */
+ 	srlx		%g2, 18, %g3
+ 	brnz,pn		%g3, 4f
+ 	 mov		%o0, %g1
+-	sethi		%hi(PAGE_SIZE), %g3
++	sethi		%hi(MMUPAGE_SIZE), %g3
+ 	sub		%g2, %g3, %g2
+ 1:	add		%g1, %g2, %o0	/* ARG0: virtual address */
+ 	mov		0, %o1		/* ARG1: mmu context */
+@@ -580,14 +580,14 @@ xcall_flush_tlb_page:	/* 20 insns */
+ 
+ 	.globl		xcall_flush_tlb_kernel_range
+ xcall_flush_tlb_kernel_range:	/* 44 insns */
+-	sethi		%hi(PAGE_SIZE - 1), %g2
+-	or		%g2, %lo(PAGE_SIZE - 1), %g2
++	sethi		%hi(MMUPAGE_SIZE - 1), %g2
++	or		%g2, %lo(MMUPAGE_SIZE - 1), %g2
+ 	andn		%g1, %g2, %g1
+ 	andn		%g7, %g2, %g7
+ 	sub		%g7, %g1, %g3
+ 	srlx		%g3, 18, %g2
+ 	brnz,pn		%g2, 2f
+-	 sethi		%hi(PAGE_SIZE), %g2
++	 sethi		%hi(MMUPAGE_SIZE), %g2
+ 	sub		%g3, %g2, %g3
+ 	or		%g1, 0x20, %g1		! Nucleus
+ 1:	stxa		%g0, [%g1 + %g3] ASI_DMMU_DEMAP
+@@ -744,14 +744,14 @@ xcall_fetch_glob_pmu_n4:
+ 	retry
+ 
+ __cheetah_xcall_flush_tlb_kernel_range:	/* 44 insns */
+-	sethi		%hi(PAGE_SIZE - 1), %g2
+-	or		%g2, %lo(PAGE_SIZE - 1), %g2
++	sethi		%hi(MMUPAGE_SIZE - 1), %g2
++	or		%g2, %lo(MMUPAGE_SIZE - 1), %g2
+ 	andn		%g1, %g2, %g1
+ 	andn		%g7, %g2, %g7
+ 	sub		%g7, %g1, %g3
+ 	srlx		%g3, 18, %g2
+ 	brnz,pn		%g2, 2f
+-	 sethi		%hi(PAGE_SIZE), %g2
++	 sethi		%hi(MMUPAGE_SIZE), %g2
+ 	sub		%g3, %g2, %g3
+ 	or		%g1, 0x20, %g1		! Nucleus
+ 1:	stxa		%g0, [%g1 + %g3] ASI_DMMU_DEMAP
+@@ -793,7 +793,7 @@ __cheetah_xcall_flush_tlb_kernel_range:	/* 44 insns */
+ 	.align		32
+ 	.globl		xcall_flush_dcache_page_cheetah
+ xcall_flush_dcache_page_cheetah: /* %g1 == physical page address */
+-	sethi		%hi(PAGE_SIZE), %g3
++	sethi		%hi(MMUPAGE_SIZE), %g3
+ 1:	subcc		%g3, (1 << 5), %g3
+ 	stxa		%g0, [%g1 + %g3] ASI_DCACHE_INVALIDATE
+ 	membar		#Sync
+@@ -827,7 +827,7 @@ xcall_flush_dcache_page_spitfire: /* %g1 == physical page address
+ 
+ 	brz,pn		%g5, 2f
+ #endif /* DCACHE_ALIASING_POSSIBLE */
+-	 sethi		%hi(PAGE_SIZE), %g3
++	 sethi		%hi(MMUPAGE_SIZE), %g3
+ 
+ 1:	flush		%g7
+ 	subcc		%g3, (1 << 5), %g3
+@@ -906,8 +906,8 @@ __hypervisor_xcall_flush_tlb_page: /* 20 insns */
+ 	.globl		__hypervisor_xcall_flush_tlb_kernel_range
+ __hypervisor_xcall_flush_tlb_kernel_range: /* 44 insns */
+ 	/* %g1=start, %g7=end, g2,g3,g4,g5,g6=scratch */
+-	sethi		%hi(PAGE_SIZE - 1), %g2
+-	or		%g2, %lo(PAGE_SIZE - 1), %g2
++	sethi		%hi(MMUPAGE_SIZE - 1), %g2
++	or		%g2, %lo(MMUPAGE_SIZE - 1), %g2
+ 	andn		%g1, %g2, %g1
+ 	andn		%g7, %g2, %g7
+ 	sub		%g7, %g1, %g3
+@@ -925,7 +925,7 @@ __hypervisor_xcall_flush_tlb_kernel_range: /* 44 insns */
+ 	mov		HV_MMU_UNMAP_ADDR_TRAP, %g6
+ 	brnz,pn		%o0, 1f
+ 	 mov		%o0, %g5
+-	sethi		%hi(PAGE_SIZE), %o2
++	sethi		%hi(MMUPAGE_SIZE), %o2
+ 	brnz,pt		%g3, 1b
+ 	 sub		%g3, %o2, %g3
+ 5:	mov		%g2, %o0
+diff --git a/arch/sparc/mm/viking.S b/arch/sparc/mm/viking.S
+index 48f062de7a7f..5d4d3c5e6331 100644
+--- a/arch/sparc/mm/viking.S
++++ b/arch/sparc/mm/viking.S
+@@ -41,11 +41,11 @@ viking_flush_page:
+ 	srl	%g3, 12, %g1		! ppage >> 12
+ 
+ 	clr	%o1			! set counter, 0 - 127
+-	sethi	%hi(PAGE_OFFSET + PAGE_SIZE - 0x80000000), %o3
++	sethi	%hi(PAGE_OFFSET + MMUPAGE_SIZE - 0x80000000), %o3
+ 	sethi	%hi(0x80000000), %o4
+ 	sethi	%hi(VIKING_PTAG_VALID), %o5
+-	sethi	%hi(2*PAGE_SIZE), %o0
+-	sethi	%hi(PAGE_SIZE), %g7
++	sethi	%hi(2*MMUPAGE_SIZE), %o0
++	sethi	%hi(MMUPAGE_SIZE), %g7
+ 	clr	%o2			! block counter, 0 - 3
+ 5:
+ 	sll	%o1, 5, %g4
+@@ -61,7 +61,7 @@ viking_flush_page:
+ 
+ 	andcc	%g2, %o5, %g0		! ptag VALID?
+ 	be	7f
+-	 add	%g4, %o3, %g2		! (PAGE_OFFSET + PAGE_SIZE) | (set << 5)
++	 add	%g4, %o3, %g2		! (PAGE_OFFSET + MMUPAGE_SIZE) | (set << 5)
+ 	ld	[%g2], %g3
+ 	ld	[%g2 + %g7], %g3
+ 	add	%g2, %o0, %g2
+@@ -91,7 +91,7 @@ viking_flush_page:
+ viking_mxcc_flush_page:
+ 	sethi	%hi(PAGE_OFFSET), %g2
+ 	sub	%o0, %g2, %g3
+-	sub	%g3, -PAGE_SIZE, %g3		! ppage + PAGE_SIZE
++	sub	%g3, -MMUPAGE_SIZE, %g3		! ppage + MMUPAGE_SIZE
+ 	sethi	%hi(MXCC_SRCSTREAM), %o3	! assume %hi(MXCC_SRCSTREAM) == %hi(MXCC_DESTSTREAM)
+ 	mov	0x10, %g2			! set cacheable bit
+ 	or	%o3, %lo(MXCC_SRCSTREAM), %o2
+diff --git a/include/linux/pte_cluster.h b/include/linux/pte_cluster.h
+index 4ce2bf501ca3..0c73ce3b5ffd 100644
+--- a/include/linux/pte_cluster.h
++++ b/include/linux/pte_cluster.h
+@@ -428,7 +428,7 @@ static inline unsigned long set_pte_cluster(pte_t *cluster[], pte_t pte)
+ 	for (j = 0; j < PAGE_MMUCOUNT; j++, offset += MMUPAGE_SIZE) {
+ 		if (!cluster[j])
+ 			continue;
+-		set_pte(cluster[j], pte_mksub(pte, offset));
++		set_ptes(NULL, 0, cluster[j], pte_mksub(pte, offset), 1);
+ 		rss++;
+ 	}
+ 	return rss;
+diff --git a/mm/memory.c b/mm/memory.c
+index 3e2313edc44d..3814bd7f8565 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1139,7 +1139,7 @@ static __always_inline void __copy_present_ptes(struct vm_area_struct *dst_vma,
+ 		int i;
+ 
+ 		for (i = 0; i < nr; i++) {
+-			set_pte(dst_pte + i, pte);
++			set_ptes(dst_vma->vm_mm, addr + (unsigned long)i * MMUPAGE_SIZE, dst_pte + i, pte, 1);
+ 			pte = __pte(pte_val(pte) + MMUPAGE_SIZE);
+ 		}
+ 		return;
+@@ -1245,7 +1245,7 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 					p = pte_mkold(p);
+ 					if (!userfaultfd_wp(dst_vma))
+ 						p = pte_clear_uffd_wp(p);
+-					set_pte(dst_pte + i, p);
++					set_ptes(dst_vma->vm_mm, addr + (unsigned long)i * MMUPAGE_SIZE, dst_pte + i, p, 1);
+ 				}
+ 				rss[MM_ANONPAGES] += nr;
+ 				return nr;
+@@ -5812,7 +5812,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 			if (!pte_none(ptep_get(ptep)))
+ 				continue;
+ 			sub_page = folio_page(folio, 0) + j;
+-			set_pte(ptep, pte_mksub(entry, (unsigned long)j * MMUPAGE_SIZE));
++			set_ptes(vma->vm_mm, a, ptep, pte_mksub(entry, (unsigned long)j * MMUPAGE_SIZE), 1);
+ 			rss++;
+ 		}
+ 		/*
+diff --git a/mm/mremap.c b/mm/mremap.c
+index 4a1187135fd0..5149e1755703 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -318,7 +318,7 @@ static int move_ptes(struct pagetable_move_control *pmc,
+ 				int j;
+ 
+ 				for (j = 0; j < nr_ptes; j++) {
+-					set_pte(new_ptep + j, pte);
++					set_ptes(mm, new_addr + (unsigned long)j * MMUPAGE_SIZE, new_ptep + j, pte, 1);
+ 					pte = __pte(pte_val(pte) +
+ 						    MMUPAGE_SIZE);
+ 				}
+-- 
+2.54.0
+

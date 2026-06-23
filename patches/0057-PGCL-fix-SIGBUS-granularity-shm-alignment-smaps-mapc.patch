@@ -1,0 +1,217 @@
+From a1e4b0fc32aacc3bfcd6ccf5d99eb808ad5b9087 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 31 Mar 2026 23:55:10 +0200
+Subject: [PATCH 057/174] PGCL: fix SIGBUS granularity, shm alignment, smaps
+ mapcount, anon clustering
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+filemap_fault/shmem_fault: SIGBUS at MMUPAGE granularity, not PAGE granularity.
+Userspace sees MMUPAGE_SIZE pages, so file-end SIGBUS must trigger at MMUPAGE
+boundaries. Without this, accesses to the last partial kernel page beyond EOF
+succeed when they should SIGBUS.
+
+task_mmu.c: Fix /proc/PID/status VmSize, VmExe, VmLib, VmData to report in
+MMUPAGE units (total_vm/exec_vm/data_vm are MMUPAGE-granular). Fix smaps
+mapcount normalization for non-large folios — with PGCL, each struct page
+has PAGE_MMUCOUNT PTEs per process, so raw mapcount overcounts sharing.
+
+ipc/shm.c: Fix shmat/shmdt alignment checks and pgoff comparisons to use
+MMUPAGE_SIZE/MMUPAGE_MASK. VMAs and shared memory segments are MMUPAGE-aligned.
+
+mm/memory.c: Suppress anonymous page clustering when MADV_RANDOM is set
+(VM_RAND_READ). MADV_RANDOM opts out of prefaulting; clustering prefaults
+all sub-pages within a kernel page, defeating MADV_RANDOM intent.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ fs/proc/task_mmu.c | 23 ++++++++++++++++-------
+ ipc/shm.c          | 10 +++++-----
+ mm/filemap.c       | 12 ++++++++----
+ mm/memory.c        |  5 ++++-
+ mm/shmem.c         |  9 +++++++++
+ 5 files changed, 42 insertions(+), 17 deletions(-)
+
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 82ff6a68b1b4..20596ede0b93 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -33,7 +33,7 @@
+ #define SENTINEL_VMA_GATE	-2
+ 
+ #define SEQ_PUT_DEC(str, val) \
+-		seq_put_decimal_ull_width(m, str, (val) << (PAGE_SHIFT-10), 8)
++		seq_put_decimal_ull_width(m, str, (val) << (MMUPAGE_SHIFT-10), 8)
+ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ {
+ 	unsigned long text, lib, swap, anon, file, shmem;
+@@ -58,9 +58,9 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ 		hiwater_rss = mm->hiwater_rss;
+ 
+ 	/* split executable areas between text and lib */
+-	text = PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK);
+-	text = min(text, mm->exec_vm << PAGE_SHIFT);
+-	lib = (mm->exec_vm << PAGE_SHIFT) - text;
++	text = MMUPAGE_ALIGN(mm->end_code) - (mm->start_code & MMUPAGE_MASK);
++	text = min(text, mm->exec_vm << MMUPAGE_SHIFT);
++	lib = (mm->exec_vm << MMUPAGE_SHIFT) - text;
+ 
+ 	swap = get_mm_counter_sum(mm, MM_SWAPENTS);
+ 	SEQ_PUT_DEC("VmPeak:\t", hiwater_vm);
+@@ -88,7 +88,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ 
+ unsigned long task_vsize(struct mm_struct *mm)
+ {
+-	return PAGE_SIZE * mm->total_vm;
++	return MMUPAGE_SIZE * mm->total_vm;
+ }
+ 
+ unsigned long task_statm(struct mm_struct *mm,
+@@ -97,8 +97,8 @@ unsigned long task_statm(struct mm_struct *mm,
+ {
+ 	*shared = get_mm_counter_sum(mm, MM_FILEPAGES) +
+ 			get_mm_counter_sum(mm, MM_SHMEMPAGES);
+-	*text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK))
+-								>> PAGE_SHIFT;
++	*text = (MMUPAGE_ALIGN(mm->end_code) - (mm->start_code & MMUPAGE_MASK))
++								>> MMUPAGE_SHIFT;
+ 	*data = mm->data_vm + mm->stack_vm;
+ 	*resident = *shared + get_mm_counter_sum(mm, MM_ANONPAGES);
+ 	return mm->total_vm;
+@@ -983,6 +983,15 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
+ 
+ 		if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT)) {
+ 			mapcount = folio_precise_page_mapcount(folio, page);
++			/*
++			 * With PGCL, non-large folios have one struct page
++			 * mapped by PAGE_MMUCOUNT PTEs per process.  The raw
++			 * mapcount counts PTEs, not processes.  Normalize to
++			 * approximate the number of sharing processes.
++			 */
++			if (!folio_test_large(folio))
++				mapcount = DIV_ROUND_UP(mapcount,
++							PAGE_MMUCOUNT);
+ 			exclusive = mapcount < 2;
+ 		}
+ 
+diff --git a/ipc/shm.c b/ipc/shm.c
+index b3e8a58e177d..8d0dc37fbfaf 100644
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@ -1552,7 +1552,7 @@ long do_shmat(int shmid, char __user *shmaddr, int shmflg,
+ 					goto out;
+ 			} else
+ #ifndef __ARCH_FORCE_SHMLBA
+-				if (addr & ~PAGE_MASK)
++				if (addr & ~MMUPAGE_MASK)
+ #endif
+ 					goto out;
+ 		}
+@@ -1739,7 +1739,7 @@ long ksys_shmdt(char __user *shmaddr)
+ 	VMA_ITERATOR(vmi, mm, addr);
+ #endif
+ 
+-	if (addr & ~PAGE_MASK)
++	if (addr & ~MMUPAGE_MASK)
+ 		return retval;
+ 
+ 	if (mmap_write_lock_killable(mm))
+@@ -1775,7 +1775,7 @@ long ksys_shmdt(char __user *shmaddr)
+ 		 * otherwise it starts at this address with no hassles.
+ 		 */
+ 		if ((vma->vm_ops == &shm_vm_ops) &&
+-			(vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) {
++			(vma->vm_start - addr)/MMUPAGE_SIZE == vma->vm_pgoff) {
+ 
+ 			/*
+ 			 * Record the file of the shm segment being
+@@ -1804,11 +1804,11 @@ long ksys_shmdt(char __user *shmaddr)
+ 	 * could possibly have landed at. Also cast things to loff_t to
+ 	 * prevent overflows and make comparisons vs. equal-width types.
+ 	 */
+-	size = PAGE_ALIGN(size);
++	size = MMUPAGE_ALIGN(size);
+ 	while (vma && (loff_t)(vma->vm_end - addr) <= size) {
+ 		/* finding a matching vma now does not alter retval */
+ 		if ((vma->vm_ops == &shm_vm_ops) &&
+-		    ((vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) &&
++		    ((vma->vm_start - addr)/MMUPAGE_SIZE == vma->vm_pgoff) &&
+ 		    (vma->vm_file == file)) {
+ 			do_vmi_align_munmap(&vmi, vma, mm, vma->vm_start,
+ 					    vma->vm_end, NULL, false);
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 04df030a09a2..fb1d5499a98f 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3532,8 +3532,12 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+ 	vm_fault_t ret = 0;
+ 	bool mapping_locked = false;
+ 
+-	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+-	if (unlikely(index >= max_idx))
++	/*
++	 * SIGBUS at MMUPAGE granularity: userspace sees MMUPAGE_SIZE pages,
++	 * so accesses beyond the file must SIGBUS at MMUPAGE boundaries.
++	 */
++	max_idx = DIV_ROUND_UP(i_size_read(inode), MMUPAGE_SIZE);
++	if (unlikely(vmf->pgoff >= max_idx))
+ 		return VM_FAULT_SIGBUS;
+ 
+ 	trace_mm_filemap_fault(mapping, index);
+@@ -3636,8 +3640,8 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+ 	 * Found the page and have a reference on it.
+ 	 * We must recheck i_size under page lock.
+ 	 */
+-	max_idx = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+-	if (unlikely(index >= max_idx)) {
++	max_idx = DIV_ROUND_UP(i_size_read(inode), MMUPAGE_SIZE);
++	if (unlikely(vmf->pgoff >= max_idx)) {
+ 		folio_unlock(folio);
+ 		folio_put(folio);
+ 		return VM_FAULT_SIGBUS;
+diff --git a/mm/memory.c b/mm/memory.c
+index d935a3c5b0bf..5efcae97271a 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5796,13 +5796,16 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		return handle_userfault(vmf, VM_UFFD_MISSING);
+ 	}
+ #if PAGE_MMUSHIFT
+-	if (nr_pages == 1) {
++	if (nr_pages == 1 && !(vma->vm_flags & VM_RAND_READ)) {
+ 		/*
+ 		 * Page clustering: map all sub-page PTEs within the
+ 		 * allocated kernel page that fall inside the VMA and
+ 		 * are currently pte_none.  This avoids wasting memory
+ 		 * by using only 1/PAGE_MMUCOUNT of each allocated page.
+ 		 *
++		 * Suppress clustering when MADV_RANDOM is set — the VMA
++		 * has opted out of prefaulting around the fault address.
++		 *
+ 		 * For anonymous VMAs (pgoff typically 0), the cluster
+ 		 * never crosses PMD boundaries since PAGE_MMUCOUNT
+ 		 * divides PTRS_PER_PTE evenly.
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 401a6d7b098c..6cfca69bfbae 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2756,6 +2756,15 @@ static vm_fault_t shmem_fault(struct vm_fault *vmf)
+ 	vm_fault_t ret = 0;
+ 	int err;
+ 
++	/*
++	 * SIGBUS at MMUPAGE granularity: userspace sees MMUPAGE_SIZE pages,
++	 * so accesses beyond the file must SIGBUS at MMUPAGE boundaries,
++	 * not at kernel PAGE boundaries.
++	 */
++	if (unlikely(vmf->pgoff >=
++		     DIV_ROUND_UP(i_size_read(inode), MMUPAGE_SIZE)))
++		return VM_FAULT_SIGBUS;
++
+ 	/*
+ 	 * Trinity finds that probing a hole which tmpfs is punching can
+ 	 * prevent the hole-punch from ever completing: noted in i_private.
+-- 
+2.54.0
+

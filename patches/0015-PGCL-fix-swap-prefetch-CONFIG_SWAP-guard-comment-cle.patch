@@ -1,0 +1,53 @@
+From 9087b9f4613fcc7a5a87d1045ef823919edf4d90 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 12 Mar 2026 22:20:13 +0100
+Subject: [PATCH 015/174] PGCL: fix swap prefetch CONFIG_SWAP guard + comment
+ cleanup
+
+Guard swap-in prefetch code with #ifdef CONFIG_SWAP for architectures
+that build without swap support (e.g. riscv tinyconfig). Also clean up
+fork rmap comment to reflect the actual struct page layout: with PGCL,
+there is one struct page per kernel page, no sub-pages in the memmap.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ mm/memory.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index daad0bb2c4af..3e2313edc44d 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1223,10 +1223,9 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 				/*
+ 				 * folio_try_dup_anon_rmap_ptes only does
+ 				 * atomic_inc(&folio->_mapcount) for non-large
+-				 * folios regardless of nr_pages.  With PGCL
+-				 * pseudo-compound, all sub-pages resolve to
+-				 * the same folio head, so we need nr mappings
+-				 * tracked in the head's _mapcount.
++				 * folios regardless of nr_pages.  With PGCL,
++				 * all PTEs within a kernel page map the same
++				 * folio, so we need nr mappings tracked.
+ 				 */
+ 				atomic_add(nr - 1, &folio->_mapcount);
+ 
+@@ -5497,6 +5496,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		put_swap_device(si);
+ 
+ 	/* Issue PGCL swap-in prefetch reads after releasing all locks */
++#ifdef CONFIG_SWAP
+ 	if (swap_prefetch_nr) {
+ 		struct swap_iocb *splug = NULL;
+ 		int i;
+@@ -5513,6 +5513,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		if (splug)
+ 			swap_read_unplug(splug);
+ 	}
++#endif
+ 
+ 	return ret;
+ out_nomap:
+-- 
+2.54.0
+

@@ -1,0 +1,99 @@
+From 026c27512b7c2f1e15f2e3fb1624233d01056d89 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 19 Jun 2026 01:48:11 +0200
+Subject: [PATCH 168/174] mm/swap: read the swap header at MMU-page granularity
+ under PGCL
+
+Userspace mkswap formats a swap area for an MMUPAGE-sized page -- that is
+what getpagesize() reports under page clustering -- but the kernel swaps in
+PAGE-sized (cluster) units.  read_swap_header() therefore failed two ways at
+PAGE_MMUSHIFT > 0: it looked for the "SWAPSPACE2" signature at PAGE_SIZE-10
+(mkswap wrote it at MMUPAGE_SIZE-10) and read info.last_page as a count of
+PAGE-sized slots (mkswap counts MMUPAGE-sized ones, ~PAGE_MMUCOUNT x more).
+The signature miss yields "Unable to find swap-space signature" and swapon
+fails -- so zram and disk swap don't come up on a clustered kernel.
+
+Fix read_swap_header():
+  - find the signature at MMUPAGE_SIZE-10;
+  - fold last_page from MMUPAGE units to whole PAGE clusters, discarding the
+    sub-cluster slack (the remainder of the header cluster and any partial
+    tail cluster);
+  - fold mkswap's MMUPAGE bad-page indices to cluster slots (a bad sub-page
+    poisons its cluster), skipping repeats.
+The kernel keeps swapping whole clusters; only the on-device header parsing
+becomes MMUPAGE-aware, so stock mkswap is used unchanged.  MMUPAGE_SIZE ==
+PAGE_SIZE and PAGE_MMUSHIFT == 0 without clustering, so this is a no-op there.
+
+Validated in a Fedora/QEMU testbed at PAGE_MMUSHIFT=4: swapon /dev/vdb now
+activates ("Adding 1048512k swap on /dev/vdb", swapon --show reports it
+active) where it previously failed the signature check.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ mm/swapfile.c | 35 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 05dff497d62c..0ce9f18da6f5 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -3295,7 +3295,13 @@ static unsigned long read_swap_header(struct swap_info_struct *si,
+ 	unsigned long swapfilepages;
+ 	unsigned long last_page;
+ 
+-	if (memcmp("SWAPSPACE2", swap_header->magic.magic, 10)) {
++	/*
++	 * Userspace mkswap formats the area for an MMUPAGE-sized page -- that is
++	 * what getpagesize() reports under page clustering -- so the signature
++	 * lives at MMUPAGE_SIZE-10, not PAGE_SIZE-10.  MMUPAGE_SIZE == PAGE_SIZE
++	 * when PAGE_MMUSHIFT == 0, so non-clustered builds are unchanged.
++	 */
++	if (memcmp("SWAPSPACE2", (char *)swap_header + MMUPAGE_SIZE - 10, 10)) {
+ 		pr_err("Unable to find swap-space signature\n");
+ 		return 0;
+ 	}
+@@ -3323,6 +3329,22 @@ static unsigned long read_swap_header(struct swap_info_struct *si,
+ 		pr_warn("Empty swap-file\n");
+ 		return 0;
+ 	}
++	if (PAGE_MMUSHIFT) {
++		/*
++		 * mkswap counted slots in MMUPAGE units; the kernel swaps whole
++		 * PAGE-sized clusters.  Fold the area down to whole clusters,
++		 * discarding the sub-cluster slack (the rest of the header
++		 * cluster and any partial tail cluster).  last_page is the index
++		 * of the last slot, so total slots == last_page + 1.
++		 */
++		unsigned long clusters = (last_page + 1) >> PAGE_MMUSHIFT;
++
++		if (!clusters) {
++			pr_warn("Swap area smaller than one kernel page\n");
++			return 0;
++		}
++		last_page = clusters - 1;
++	}
+ 	if (last_page > maxpages) {
+ 		pr_warn("Truncating oversized swap area, only using %luk out of %luk\n",
+ 			K(maxpages), K(last_page));
+@@ -3391,6 +3413,17 @@ static int setup_swap_clusters_info(struct swap_info_struct *si,
+ 			err = -EINVAL;
+ 			goto err;
+ 		}
++		if (PAGE_MMUSHIFT) {
++			/*
++			 * Bad pages are MMUPAGE indices; a bad sub-page poisons
++			 * its whole cluster.  Fold to the cluster slot, skipping
++			 * repeats (mkswap lists badpages in ascending order).
++			 */
++			if (i && (page_nr >> PAGE_MMUSHIFT) ==
++			    (swap_header->info.badpages[i - 1] >> PAGE_MMUSHIFT))
++				continue;
++			page_nr >>= PAGE_MMUSHIFT;
++		}
+ 		err = swap_cluster_setup_bad_slot(si, cluster_info, page_nr, false);
+ 		if (err)
+ 			goto err;
+-- 
+2.54.0
+

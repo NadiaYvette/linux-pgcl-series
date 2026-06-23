@@ -1,0 +1,76 @@
+From 44cdae932cae13cca0b43c2122ed0d446cd77b36 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 29 May 2026 16:33:48 +0200
+Subject: [PATCH 129/174] slub: cap oo_objects at MAX_OBJS_PER_PAGE to avoid
+ slab->objects overflow
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+oo_make() clamped order_objects() at OO_MASK (16 bits, 65535), but
+struct slab stores the count in a 15-bit bitfield (objects:15), so any
+clamp above MAX_OBJS_PER_PAGE silently truncates on the bitfield write:
+
+  slab->objects = oo_objects(oo);  /* 32768 → 0, 65535 → 32767, ... */
+
+With PGCL the kernel PAGE_SIZE can be 1 MB (PAGE_MMUSHIFT=6 on
+loongarch's default 16 KB hardware page).  At order 0 a kmalloc-32 slab
+then holds 1MB / 32 = 32768 objects, which is min(32768, OO_MASK) =
+32768 from oo_make, and the slab.objects bitfield wraps to zero.
+
+obj_exts_alloc_size() then sizes the per-slab obj_cgroup array as
+sizeof(slabobj_ext) * 0 = 0, but the slab itself hands out objects
+with real indices up to 32767; __memcg_slab_free_hook() does
+
+  off = obj_to_index(s, slab, p[i]);
+  obj_ext = slab_obj_ext(slab, obj_exts, off);
+  objcg = obj_ext->objcg;
+
+which reads sizeof(slabobj_ext)*off bytes past the (zero-sized)
+allocation and returns whatever happens to live there as objcg.  The
+subsequent obj_cgroup_uncharge_pages(objcg, ...) dereferences that
+garbage pointer and panics — observed on loongarch64 PGCL=6 the first
+time single_release() kfrees a 32-byte struct seq_operations, e.g.
+during mprotect05 in LTP.
+
+Cap at MAX_OBJS_PER_PAGE so the count always fits in the bitfield.
+Slabs of objects smaller than PAGE_SIZE/MAX_OBJS_PER_PAGE (32 bytes
+at PAGE_SIZE=1MB) will waste a few trailing object slots per slab,
+which is preferable to the silent corruption.
+
+Boot-tested on QEMU loongarch64 virt/la464 at PGCL=6 (PAGE_SIZE=1MB):
+pgcl-test 19/0, pgcl-stress 12/0, LTP 71p/3f/27s, no crashes.  Without
+this fix every LTP test that calls kfree on a 32-byte allocation
+(mprotect05, mremap06, munlock01/02, etc.) ADEs in
+obj_cgroup_uncharge_pages, eventually killing init.
+---
+ mm/slub.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index 86a251dbae68..b911f0f5eb63 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -586,8 +586,18 @@ static inline struct kmem_cache_order_objects oo_make(unsigned int order,
+ {
+ 	unsigned int nr = order_objects(order, size);
+ 
++	/*
++	 * Cap at MAX_OBJS_PER_PAGE rather than OO_MASK so that the value
++	 * fits in the 15-bit slab.objects bitfield even when PAGE_SIZE is
++	 * large enough (e.g. 1 MB with PGCL) that a small-object slab
++	 * would otherwise exceed it.  Without this cap, the bitfield write
++	 * silently truncates (32768 → 0 for kmalloc-32 at PAGE_SIZE=1MB),
++	 * obj_exts is sized 0, and obj_to_index() reads past the metadata
++	 * array — corrupting the obj_cgroup pointer on first kfree from
++	 * the slab.
++	 */
+ 	struct kmem_cache_order_objects x = {
+-		(order << OO_SHIFT) + min_t(unsigned int, nr, OO_MASK)
++		(order << OO_SHIFT) + min_t(unsigned int, nr, MAX_OBJS_PER_PAGE)
+ 	};
+ 
+ 	return x;
+-- 
+2.54.0
+

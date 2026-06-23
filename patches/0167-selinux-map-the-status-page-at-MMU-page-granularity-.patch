@@ -1,0 +1,56 @@
+From fa8406e72b2d0071dc42ef275da206795e5637d3 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 19 Jun 2026 00:28:50 +0200
+Subject: [PATCH 167/174] selinux: map the status page at MMU-page granularity
+ under PGCL
+
+sel_mmap_handle_status() rejected the mapping with -EIO unless the VMA was
+exactly PAGE_SIZE.  Userspace (libselinux selinux_status_open()) maps
+getpagesize() bytes, which is the MMU page size the ABI exposes to user
+space -- MMUPAGE_SIZE.  Under page clustering MMUPAGE_SIZE < PAGE_SIZE, so
+the check failed and every libselinux user that reads the fast status page
+got EIO: dbus-broker logs "could not open selinux status page: 5 (Input/
+output error)" and exits fatally, systemd restart-loops it, and the machine
+never reaches a login.
+
+The status struct lives at the head of the page and remap_pfn_range()
+already maps per-MMUPAGE from the cluster pfn, so gating on MMUPAGE_SIZE and
+mapping that many bytes is sufficient.  MMUPAGE_SIZE == PAGE_SIZE when
+PAGE_MMUSHIFT == 0, so non-clustered builds are unchanged.
+
+Found on a Fedora laptop (SELinux enforcing) booting PAGE_MMUSHIFT=4: the
+kernel was otherwise clean (full userspace + systemd) but blocked here.
+Matrix-invisible -- the QEMU test rootfs runs no SELinux.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ security/selinux/selinuxfs.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+index 25ca7d714014..06cc48468695 100644
+--- a/security/selinux/selinuxfs.c
++++ b/security/selinux/selinuxfs.c
+@@ -246,8 +246,16 @@ static int sel_mmap_handle_status(struct file *filp,
+ 
+ 	BUG_ON(!status);
+ 
+-	/* only allows one page from the head */
+-	if (vma->vm_pgoff > 0 || size != PAGE_SIZE)
++	/*
++	 * Only allows one page from the head.  Userspace (libselinux
++	 * selinux_status_open()) maps getpagesize() bytes, i.e. one MMU page
++	 * (MMUPAGE_SIZE), which under page clustering is smaller than the
++	 * kernel PAGE_SIZE.  Gate on MMUPAGE_SIZE so the status struct (which
++	 * lives at the head of the page) can be mapped; remap_pfn_range() below
++	 * maps the first MMU page of the cluster.  MMUPAGE_SIZE == PAGE_SIZE
++	 * when PAGE_MMUSHIFT == 0, so non-clustered behaviour is unchanged.
++	 */
++	if (vma->vm_pgoff > 0 || size != MMUPAGE_SIZE)
+ 		return -EIO;
+ 	/* disallow writable mapping */
+ 	if (vma->vm_flags & VM_WRITE)
+-- 
+2.54.0
+

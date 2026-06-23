@@ -1,0 +1,230 @@
+From 1a0893094d5cecbbf73159590738216382db9d2f Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 12 Mar 2026 13:48:22 +0100
+Subject: [PATCH 013/174] PGCL: revert pgcl_page_folio, fix anon clustering
+ rmap, disable khugepaged
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Revert the pgcl_page_folio() approach from all call sites — the partial
+conversion caused refcount mismatches between page_folio (used by TLB
+gather/release_pages) and pgcl_page_folio (used by fault paths), leading
+to double-frees and list corruption.  The helper remains defined in
+mm/internal.h for future use but is currently uncalled.
+
+Re-enable anonymous page clustering with correct per-sub-page rmap
+tracking: each additional PTE gets a proper folio_ref_add + atomic_add
+on _mapcount, consistent with the sub-page refcount model used by the
+rest of the kernel.
+
+COW clustering remains disabled pending a rmap-consistent implementation.
+
+Disable khugepaged PTE collapse for PAGE_MMUSHIFT>0 — the collapse path
+assumes PAGE_SIZE == MMUPAGE_SIZE for iteration counts, address strides,
+and copy helpers.
+
+Fix mempolicy PTE walker to step by MMUPAGE_SIZE and compute interleave
+index with MMUPAGE_SHIFT.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ mm/internal.h   | 28 ++++++++++++++++++++++++++++
+ mm/khugepaged.c | 19 +++++++++++++++++++
+ mm/memory.c     | 25 +++++++++++++++++++------
+ mm/mempolicy.c  |  6 +++---
+ 4 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/mm/internal.h b/mm/internal.h
+index 71cbe2aa40c4..88ef607ea3f5 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -393,6 +393,34 @@ static inline unsigned int folio_pte_batch_flags(struct folio *folio,
+ unsigned int folio_pte_batch(struct folio *folio, pte_t *ptep, pte_t pte,
+ 		unsigned int max_nr);
+ 
++#if PAGE_MMUSHIFT
++/**
++ * pgcl_page_folio - get the PGCL kernel page's head folio from any sub-page
++ * @page: any struct page pointer (may be a sub-page within a PGCL kernel page)
++ *
++ * For PGCL, order-0 allocations span PAGE_MMUCOUNT hardware pages but are
++ * NOT compound, so page_folio() returns the sub-page itself instead of the
++ * kernel page's head.  This helper returns the correct head by rounding
++ * down to the nearest PAGE_MMUCOUNT-aligned pfn.
++ *
++ * For compound pages (large folios), compound_head() already returns the
++ * correct head, so we defer to page_folio().
++ */
++static inline struct folio *pgcl_page_folio(struct page *page)
++{
++	unsigned long head = READ_ONCE(page->compound_head);
++
++	if (unlikely(head & 1))
++		return (struct folio *)(head - 1);
++	return (struct folio *)(page - (page_to_pfn(page) & (PAGE_MMUCOUNT - 1)));
++}
++#else
++static inline struct folio *pgcl_page_folio(struct page *page)
++{
++	return page_folio(page);
++}
++#endif
++
+ #if PAGE_MMUSHIFT
+ /**
+  * pgcl_pte_batch - count contiguous PTEs mapping the same kernel page
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 216a2c48cd59..631872368242 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1264,6 +1264,20 @@ static enum scan_result collapse_scan_pmd(struct mm_struct *mm,
+ 
+ 	VM_BUG_ON(start_addr & ~HPAGE_PMD_MASK);
+ 
++#if PAGE_MMUSHIFT
++	/*
++	 * khugepaged PTE collapse assumes PAGE_SIZE == MMUPAGE_SIZE throughout:
++	 * iteration counts (HPAGE_PMD_NR), address strides (PAGE_SIZE),
++	 * and copy helpers (clear_user_highpage/copy_mc_user_highpage) all
++	 * operate at PAGE_SIZE granularity. With PAGE_MMUSHIFT > 0, a PMD's
++	 * PTE entries number HPAGE_PMD_NR * PAGE_MMUCOUNT and each maps
++	 * MMUPAGE_SIZE, not PAGE_SIZE. Disable collapse until sub-page
++	 * copy/clear helpers are implemented.
++	 */
++	result = SCAN_FAIL;
++	goto out;
++#endif
++
+ 	result = find_pmd_or_thp_or_none(mm, start_addr, &pmd);
+ 	if (result != SCAN_SUCCEED) {
+ 		cc->progress++;
+@@ -1512,6 +1526,11 @@ static enum scan_result try_collapse_pte_mapped_thp(struct mm_struct *mm, unsign
+ 
+ 	mmap_assert_locked(mm);
+ 
++#if PAGE_MMUSHIFT
++	/* See comment in hpage_collapse_scan_pmd() */
++	return SCAN_FAIL;
++#endif
++
+ 	/* First check VMA found, in case page tables are being torn down */
+ 	if (!vma || !vma->vm_file ||
+ 	    !range_in_vma(vma, haddr, haddr + HPAGE_PMD_SIZE))
+diff --git a/mm/memory.c b/mm/memory.c
+index 889ecfd41e0c..ce61ae3871ad 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4141,7 +4141,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 			folio_remove_rmap_pte(old_folio, vmf->page, vma);
+ 		}
+ 
+-#if PAGE_MMUSHIFT && 0 /* DISABLED FOR DEBUG */
++#if PAGE_MMUSHIFT && 0 /* temporarily disabled */
+ 		/*
+ 		 * COW clustering: remap neighbor PTEs in the same kernel
+ 		 * page that still point to the old page.  The new page
+@@ -4169,6 +4169,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 					(unsigned long)j * MMUPAGE_SIZE;
+ 				pte_t *ptep = base_pte + j;
+ 				pte_t pteval;
++				struct page *sub_page;
+ 
+ 				/* Skip the PTE we already handled */
+ 				if (ptep == vmf->pte)
+@@ -4185,19 +4186,23 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 				    page_folio(vmf->page))
+ 					continue;
+ 
++				sub_page = folio_page(new_folio, 0) + j;
++
+ 				/* Clear+flush old, set new */
+ 				ptep_clear_flush(vma, a, ptep);
+ 				set_pte_at(mm, a, ptep,
+ 					   pte_mksub(base_entry,
+ 						     (unsigned long)j *
+ 						     MMUPAGE_SIZE));
++				folio_ref_add(new_folio, 1);
++				folio_add_anon_rmap_pte(new_folio,
++							sub_page, vma, a,
++							RMAP_NONE);
+ 				folio_remove_rmap_pte(old_folio,
+ 						      pte_page(pteval), vma);
+ 				extra++;
+ 			}
+ 			if (extra) {
+-				folio_ref_add(new_folio, extra);
+-				atomic_add(extra, &new_folio->_mapcount);
+ 				/*
+ 				 * Drop old folio refs for the remapped
+ 				 * neighbor PTEs.  The faulting PTE's ref
+@@ -5745,7 +5750,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		return handle_userfault(vmf, VM_UFFD_MISSING);
+ 	}
+ #if PAGE_MMUSHIFT
+-	if (nr_pages == 1 && 0) { /* DISABLED FOR DEBUG */
++	if (nr_pages == 1) {
+ 		/*
+ 		 * Page clustering: map all sub-page PTEs within the
+ 		 * allocated kernel page that fall inside the VMA and
+@@ -5781,6 +5786,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		for (j = 0; j < PAGE_MMUCOUNT; j++) {
+ 			unsigned long a = base_addr + (unsigned long)j * MMUPAGE_SIZE;
+ 			pte_t *ptep = base_pte + j;
++			struct page *sub_page;
+ 
+ 			/* Skip if outside VMA bounds */
+ 			if (a < vma->vm_start || a >= vma->vm_end)
+@@ -5788,16 +5794,23 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 			/* Skip if PTE already occupied */
+ 			if (!pte_none(ptep_get(ptep)))
+ 				continue;
++			sub_page = folio_page(folio, 0) + j;
+ 			set_pte(ptep, pte_mksub(entry, (unsigned long)j * MMUPAGE_SIZE));
+ 			rss++;
+ 		}
+ 		/*
+-		 * Adjust refcount and mapcount for the extra PTEs.
++		 * Adjust refcount and rmap for the extra PTEs.
+ 		 * folio_add_new_anon_rmap set mapcount to 0 (= 1 mapping)
+-		 * and PageAnonExclusive.  We need mapcount = rss.
++		 * and PageAnonExclusive.  Add rmap for the extras.
+ 		 */
+ 		if (rss > 1) {
+ 			folio_ref_add(folio, rss - 1);
++			/*
++			 * For a newly allocated exclusive folio, all sub-page
++			 * PTEs map the same folio.  Use atomic_add on _mapcount
++			 * directly since folio_add_new_anon_rmap already set
++			 * up the anon_vma and the folio is exclusively owned.
++			 */
+ 			atomic_add(rss - 1, &folio->_mapcount);
+ 		}
+ 		/* Fix RSS: we added 1 above (nr_pages), need rss total */
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 4e4421b22b59..5f87fc7dcf8e 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -705,8 +705,8 @@ static int queue_folios_pte_range(pmd_t *pmd, unsigned long addr,
+ 		walk->action = ACTION_AGAIN;
+ 		return 0;
+ 	}
+-	for (; addr != end; pte += nr, addr += nr * PAGE_SIZE) {
+-		max_nr = (end - addr) >> PAGE_SHIFT;
++	for (; addr != end; pte += nr, addr += nr * MMUPAGE_SIZE) {
++		max_nr = (end - addr) >> MMUPAGE_SHIFT;
+ 		nr = 1;
+ 		ptent = ptep_get(pte);
+ 		if (pte_none(ptent))
+@@ -2049,7 +2049,7 @@ struct mempolicy *get_vma_policy(struct vm_area_struct *vma,
+ 	if (pol->mode == MPOL_INTERLEAVE ||
+ 	    pol->mode == MPOL_WEIGHTED_INTERLEAVE) {
+ 		*ilx += vma->vm_pgoff >> order;
+-		*ilx += (addr - vma->vm_start) >> (PAGE_SHIFT + order);
++		*ilx += (addr - vma->vm_start) >> (MMUPAGE_SHIFT + order);
+ 	}
+ 	return pol;
+ }
+-- 
+2.54.0
+

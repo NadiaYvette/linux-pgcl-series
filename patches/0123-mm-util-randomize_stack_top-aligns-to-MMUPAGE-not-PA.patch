@@ -1,0 +1,53 @@
+From 44135f92a7c9350e71419eb55a4d0ac4b7cf2d31 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 22 May 2026 14:52:44 +0200
+Subject: [PATCH 123/174] mm/util: randomize_stack_top aligns to MMUPAGE, not
+ PAGE
+
+Same overshoot pattern as commit e45ede859836 (fs/exec: align stack_top
+to MMUPAGE granularity). randomize_stack_top() returned
+PAGE_ALIGN(stack_top) [- random_variable]. Under page clustering with
+PAGE_SIZE > MMUPAGE_SIZE, when the input stack_top is MMUPAGE-aligned
+but not PAGE-aligned (s390x STACK_TOP = VDSO_LIMIT - vdso_size() -
+PAGE_SIZE ends in 0xc000), PAGE_ALIGN rounds up past STACK_TOP_MAX,
+and the small random_variable (~0..a few MB) cannot bring the result
+back below the temporary-stack VMA's vm_end.
+
+binfmt_elf is the dominant caller (binfmt_elf.c:1031), so the bad
+return value lands directly in setup_arg_pages, where stack_shift =
+vma->vm_end - stack_top wraps negative. relocate_vma_down then
+computes new_start = old_start - shift wrapping to just above
+old_start; vma_expand stores a new tree entry covering only the new
+range, leaving the old tree entry's left portion intact -> two tree
+slots referencing the same VMA -> validate_mm's i > mm->map_count
+check trips BUG_ON during execve.
+
+Reproduced on s390x PGCL=4 as 1/74 verify-loop runs after the exec.c
+fix; root cause traced to randomize_stack_top by the matching VMA
+range pattern (vm_start advanced into the original temp-stack range by
+a small multiple of MMUPAGE_SIZE).
+
+Signed-off-by: Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/util.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mm/util.c b/mm/util.c
+index dcd27bacb6b5..0cd11e262d32 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -348,9 +348,9 @@ unsigned long randomize_stack_top(unsigned long stack_top)
+ 		random_variable <<= PAGE_SHIFT;
+ 	}
+ #ifdef CONFIG_STACK_GROWSUP
+-	return PAGE_ALIGN(stack_top) + random_variable;
++	return MMUPAGE_ALIGN(stack_top) + random_variable;
+ #else
+-	return PAGE_ALIGN(stack_top) - random_variable;
++	return MMUPAGE_ALIGN(stack_top) - random_variable;
+ #endif
+ }
+ 
+-- 
+2.54.0
+

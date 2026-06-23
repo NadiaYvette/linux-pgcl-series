@@ -1,0 +1,71 @@
+From 7d757c725f82875b96cc7031f6434b970a2e6b72 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 7 May 2026 21:10:42 +0200
+Subject: [PATCH 096/174] arm64: mmu: declare_vma assertion uses MMUPAGE
+ alignment
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+declare_vma is called from declare_kernel_vmas with kernel section
+boundaries (_text, _etext, __start_rodata, __inittext_*, __initdata_*,
+_data, _end).  These are SEGMENT_ALIGN-aligned (SZ_64K) per the linker
+script, which equals PAGE_SIZE under non-PGCL builds and PGCL=4 with
+4K-MMU configs but not at higher MMUSHIFT.
+
+At PGCL=6 (MMUSHIFT=6 over a 4K MMU → PAGE_SIZE = 256K), 64K-aligned
+segment boundaries are no longer PAGE_ALIGNED, and `BUG_ON(!PAGE_ALIGNED
+(size))` trips with size=0xfd0000 (15.8MB, divisible by 64K but not
+256K), panicing in paging_init before earlycon prints anything.
+
+The vmap area into which declare_vma installs entries is MMUPAGE-
+granular, not PAGE-granular: the underlying page tables map MMUPAGE-
+sized hardware pages, and vm_area_add_early treats the size in
+MMUPAGE units.  PAGE alignment is therefore an over-strict requirement
+that PGCL violates without correctness consequence.
+
+Switch the assertions and the VM_NO_GUARD trailer-pad to MMUPAGE_SIZE.
+On non-PGCL builds MMUPAGE_SIZE == PAGE_SIZE so behavior is identical;
+on PGCL kernels we accept SEGMENT_ALIGN-sized sections.
+
+Verified: aarch64 PGCL=6 standalone boot now progresses past
+paging_init through to the virtio_mmio probe (next blocker, separate).
+Pre-fix: silent-boot hang in declare_vma BUG before any earlycon
+output.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/arm64/mm/mmu.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index 5f69d1b96feb..501fc14a6a0c 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -1225,11 +1225,18 @@ static void __init declare_vma(struct vm_struct *vma,
+ 	phys_addr_t pa_start = __pa_symbol(va_start);
+ 	unsigned long size = va_end - va_start;
+ 
+-	BUG_ON(!PAGE_ALIGNED(pa_start));
+-	BUG_ON(!PAGE_ALIGNED(size));
++	/*
++	 * Kernel segments are SEGMENT_ALIGN-aligned (64K), which equals
++	 * PAGE_SIZE when MMUPAGE_SHIFT == PAGE_SHIFT but is smaller under
++	 * page-clustering (PAGE_SIZE up to 1MB on PGCL=6 with 16K MMU).
++	 * vmap area is MMUPAGE-granular regardless, so MMUPAGE alignment
++	 * is sufficient here.
++	 */
++	BUG_ON(!IS_ALIGNED(pa_start, MMUPAGE_SIZE));
++	BUG_ON(!IS_ALIGNED(size, MMUPAGE_SIZE));
+ 
+ 	if (!(vm_flags & VM_NO_GUARD))
+-		size += PAGE_SIZE;
++		size += MMUPAGE_SIZE;
+ 
+ 	vma->addr	= va_start;
+ 	vma->phys_addr	= pa_start;
+-- 
+2.54.0
+

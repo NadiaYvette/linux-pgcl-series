@@ -1,0 +1,3792 @@
+From c07453c4ed8c63b030a9e1a2e9ad18f55f6f683f Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 4 Mar 2026 22:40:30 +0100
+Subject: [PATCH 001/174] PGCL: Page clustering (larpage) forward-port to Linux
+ 6.19
+
+Decouple kernel PAGE_SIZE from hardware MMUPAGE_SIZE on x86_64.
+When CONFIG_PAGE_MMUSHIFT > 0, the kernel allocates physical memory
+in PAGE_SIZE chunks (e.g. 16KB for PAGE_MMUSHIFT=2) while mapping
+individual MMUPAGE_SIZE (4KB) PTEs to userspace.
+
+Core infrastructure:
+- Add MMUPAGE_SIZE/MMUPAGE_SHIFT/MMUPAGE_MASK definitions
+- PAGE_SIZE = MMUPAGE_SIZE << PAGE_MMUSHIFT
+- Add pte_cluster.h for multi-PTE fault handling
+- Add pgoff unit conversion helpers (page cache vs VMA units)
+
+x86_64 changes:
+- Boot sequence: identity mapping, trampoline, early page tables
+- CPA (Change Page Attribute): page_level_shift() uses MMUPAGE_SHIFT
+- clear_page/copy_page: operate on PAGE_SIZE bytes
+- VDSO, fixmap, CPU entry area: MMUPAGE-aware
+
+MM subsystem:
+- vm_pgoff is in MMUPAGE units (supports sub-PAGE mmap offsets)
+- All PTE walkers step by MMUPAGE_SIZE (vmscan, swapfile, mlock,
+  memory-failure, rmap, procfs)
+- Userspace syscall alignment: mmap, mlock, msync, mprotect, mremap,
+  brk use MMUPAGE_MASK/MMUPAGE_ALIGN
+- procfs: smaps RSS/PSS accounting per MMUPAGE, pagemap interface
+  with MMUPAGE granularity
+- Rmap: folio_within_range/vma_address handle PAGE/MMUPAGE unit
+  conversion via pgoff_page_to_mmu()/pgoff_to_vma_addr()
+
+Subsystem fixes:
+- ELF loader: ELF_EXEC_PAGESIZE = MMUPAGE_SIZE (AT_PAGESZ = 4096)
+- perf: ring buffer mmap fault handler for MMUPAGE pgoff
+- uprobes, BPF stackmap: vm_pgoff << MMUPAGE_SHIFT
+- secretmem, relay: vmf->pgoff conversion
+
+Status: PAGE_MMUSHIFT=2 (16KB pages) boots to busybox userspace
+on QEMU x86_64 SMP=4. W+X mapping check passes.
+
+Based on Hugh Dickins' original "larpage" patch (2001) and
+William Lee Irwin III's PGCL patches (2002-2004).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/Kconfig                            |  23 +
+ arch/x86/boot/compressed/head_64.S      |   2 +-
+ arch/x86/boot/compressed/ident_map_64.c |  10 +-
+ arch/x86/boot/compressed/pgtable_64.c   |   6 +-
+ arch/x86/entry/vdso/vma.c               |  12 +-
+ arch/x86/include/asm/boot.h             |   4 +-
+ arch/x86/include/asm/elf.h              |   2 +-
+ arch/x86/include/asm/fixmap.h           |  10 +-
+ arch/x86/include/asm/page_types.h       |   2 +-
+ arch/x86/include/asm/pgtable.h          |   2 +-
+ arch/x86/include/asm/pgtable_64.h       |   2 +-
+ arch/x86/include/asm/pgtable_64_types.h |   2 +-
+ arch/x86/include/asm/vdso/vsyscall.h    |   2 +-
+ arch/x86/kernel/alternative.c           |  33 +-
+ arch/x86/kernel/apic/vector.c           |   3 +
+ arch/x86/kernel/head64.c                |   7 +-
+ arch/x86/kernel/head_64.S               |   4 +-
+ arch/x86/kernel/irqinit.c               |   7 +-
+ arch/x86/kernel/sys_x86_64.c            |   4 +-
+ arch/x86/lib/clear_page_64.S            |   1 +
+ arch/x86/lib/copy_page_64.S             |   5 +-
+ arch/x86/mm/cpu_entry_area.c            |  10 +-
+ arch/x86/mm/dump_pagetables.c           |   4 +-
+ arch/x86/mm/init.c                      |   8 +-
+ arch/x86/mm/init_64.c                   |  10 +-
+ arch/x86/mm/ioremap.c                   |  20 +-
+ arch/x86/mm/pat/set_memory.c            | 125 ++++--
+ arch/x86/mm/pgtable.c                   |   2 +-
+ arch/x86/mm/pti.c                       |   2 +-
+ arch/x86/realmode/init.c                |  15 +-
+ arch/x86/realmode/rm/realmode.lds.S     |   4 +-
+ arch/x86/realmode/rm/trampoline_32.S    |   2 +-
+ arch/x86/realmode/rm/trampoline_64.S    |   6 +-
+ fs/binfmt_elf.c                         |   8 +-
+ fs/proc/task_mmu.c                      |  44 +-
+ include/asm-generic/fixmap.h            |  12 +-
+ include/linux/mm.h                      |  62 +++
+ include/linux/pagemap.h                 |  23 +-
+ include/linux/pgtable.h                 |  38 +-
+ include/linux/pte_cluster.h             | 532 ++++++++++++++++++++++++
+ include/vdso/datapage.h                 |   4 +-
+ include/vdso/page.h                     |  32 +-
+ kernel/bpf/stackmap.c                   |   2 +-
+ kernel/events/core.c                    |   6 +-
+ kernel/events/ring_buffer.c             |  10 +-
+ kernel/events/uprobes.c                 |   8 +-
+ kernel/relay.c                          |   2 +-
+ lib/vdso/datastore.c                    |   2 +-
+ mm/early_ioremap.c                      |  16 +-
+ mm/filemap.c                            |  22 +-
+ mm/gup.c                                |   2 +-
+ mm/internal.h                           |  22 +-
+ mm/ksm.c                                |   4 +-
+ mm/madvise.c                            |  18 +-
+ mm/memory-failure.c                     |   4 +-
+ mm/memory.c                             |  76 +++-
+ mm/migrate_device.c                     |   4 +-
+ mm/mincore.c                            |  10 +-
+ mm/mlock.c                              |  18 +-
+ mm/mmap.c                               |  42 +-
+ mm/mprotect.c                           |  14 +-
+ mm/mremap.c                             |  20 +-
+ mm/msync.c                              |   6 +-
+ mm/page_vma_mapped.c                    |   4 +-
+ mm/pagewalk.c                           |  10 +-
+ mm/rmap.c                               |   8 +-
+ mm/secretmem.c                          |   2 +-
+ mm/shmem.c                              |  11 +-
+ mm/swap_state.c                         |   2 +-
+ mm/swapfile.c                           |   2 +-
+ mm/userfaultfd.c                        |  10 +-
+ mm/util.c                               |   6 +-
+ mm/vma.c                                |  22 +-
+ mm/vmalloc.c                            |  66 ++-
+ mm/vmscan.c                             |   6 +-
+ 75 files changed, 1212 insertions(+), 351 deletions(-)
+ create mode 100644 include/linux/pte_cluster.h
+
+diff --git a/arch/Kconfig b/arch/Kconfig
+index e86880045158..04c069dc2f93 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -1369,6 +1369,29 @@ config PAGE_SHIFT
+ 	default	16 if PAGE_SIZE_64KB
+ 	default	18 if PAGE_SIZE_256KB
+ 
++config PAGE_MMUSHIFT
++	int "Extra PAGE_SIZE shift over MMU page size (page clustering)"
++	default 0
++	help
++	  This specifies the additional shift of the kernel's internal
++	  PAGE_SIZE over the hardware MMU page size (MMUPAGE_SIZE).
++	  The kernel allocates physical memory in PAGE_SIZE chunks
++	  (= 2^PAGE_MMUSHIFT * MMUPAGE_SIZE) but maps individual
++	  MMUPAGE_SIZE PTEs to userspace, preserving the standard
++	  TLB/MMU base page ABI.
++
++	  When set to 0 (the default), PAGE_SIZE equals MMUPAGE_SIZE
++	  and the kernel behaves identically to a stock configuration.
++
++	  When set to N > 0, the kernel page size is 2^N times the
++	  hardware page size. For example, on x86 with PAGE_MMUSHIFT=2,
++	  the kernel uses 16KB pages internally while userspace still
++	  sees 4KB pages via the MMU.
++
++	  This is based on Hugh Dickins' "larpage" work (2001).
++
++	  If unsure, leave this at 0.
++
+ # This allows to use a set of generic functions to determine mmap base
+ # address by giving priority to top-down scheme only if the process
+ # is not in legacy mode (compat task, unlimited stack size or
+diff --git a/arch/x86/boot/compressed/head_64.S b/arch/x86/boot/compressed/head_64.S
+index d9dab940ff62..b42a7e42b716 100644
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@ -536,4 +536,4 @@ SYM_DATA_LOCAL(pgtable,		.fill BOOT_PGT_SIZE, 1, 0)
+  * The page table is going to be used instead of page table in the trampoline
+  * memory.
+  */
+-SYM_DATA_LOCAL(top_pgtable,	.fill PAGE_SIZE, 1, 0)
++SYM_DATA_LOCAL(top_pgtable,	.fill MMUPAGE_SIZE, 1, 0)
+diff --git a/arch/x86/boot/compressed/ident_map_64.c b/arch/x86/boot/compressed/ident_map_64.c
+index dfb9c2deb77c..82824727f7e5 100644
+--- a/arch/x86/boot/compressed/ident_map_64.c
++++ b/arch/x86/boot/compressed/ident_map_64.c
+@@ -68,7 +68,7 @@ static void *alloc_pgt_page(void *context)
+ 	}
+ 
+ 	entry = pages->pgt_buf + pages->pgt_buf_offset;
+-	pages->pgt_buf_offset += PAGE_SIZE;
++	pages->pgt_buf_offset += MMUPAGE_SIZE;	/* HW page table = one MMU page */
+ 
+ 	return entry;
+ }
+@@ -206,10 +206,10 @@ static pte_t *split_large_pmd(struct x86_mapping_info *info,
+ 	/* No large page - clear PSE flag */
+ 	page_flags  = info->page_flag & ~_PAGE_PSE;
+ 
+-	/* Populate the PTEs */
++	/* Populate the PTEs — step by MMUPAGE_SIZE (hardware page size) */
+ 	for (i = 0; i < PTRS_PER_PMD; i++) {
+ 		set_pte(&pte[i], __pte(address | page_flags));
+-		address += PAGE_SIZE;
++		address += MMUPAGE_SIZE;
+ 	}
+ 
+ 	/*
+@@ -239,8 +239,8 @@ static void clflush_page(unsigned long address)
+ 	 * cause another #VC exception and the GHCB is not ready to use yet.
+ 	 */
+ 	flush_size = 64;
+-	start      = (char *)(address & PAGE_MASK);
+-	end        = start + PAGE_SIZE;
++	start      = (char *)(address & MMUPAGE_MASK);
++	end        = start + MMUPAGE_SIZE;
+ 
+ 	/*
+ 	 * First make sure there are no pending writes on the cache-lines to
+diff --git a/arch/x86/boot/compressed/pgtable_64.c b/arch/x86/boot/compressed/pgtable_64.c
+index 0e89e197e112..4447dd83f882 100644
+--- a/arch/x86/boot/compressed/pgtable_64.c
++++ b/arch/x86/boot/compressed/pgtable_64.c
+@@ -61,7 +61,7 @@ static unsigned long find_trampoline_placement(void)
+ 	if (ebda_start > BIOS_START_MIN && ebda_start < bios_start)
+ 		bios_start = ebda_start;
+ 
+-	bios_start = round_down(bios_start, PAGE_SIZE);
++	bios_start = round_down(bios_start, MMUPAGE_SIZE);
+ 
+ 	/* Find the first usable memory region under bios_start. */
+ 	for (i = boot_params_ptr->e820_entries - 1; i >= 0; i--) {
+@@ -82,7 +82,7 @@ static unsigned long find_trampoline_placement(void)
+ 			new = entry->addr + entry->size;
+ 
+ 		/* Keep bios_start page-aligned. */
+-		new = round_down(new, PAGE_SIZE);
++		new = round_down(new, MMUPAGE_SIZE);
+ 
+ 		/* Skip the entry if it's too small. */
+ 		if (new - TRAMPOLINE_32BIT_SIZE < entry->addr)
+@@ -184,7 +184,7 @@ asmlinkage void configure_5level_paging(struct boot_params *bp, void *pgtable)
+ 		 */
+ 		pgdp = (pgd_t *)native_read_cr3_pa();
+ 		new_cr3 = (u64 *)(native_pgd_val(pgdp[0]) & PTE_PFN_MASK);
+-		memcpy(trampoline_32bit, new_cr3, PAGE_SIZE);
++		memcpy(trampoline_32bit, new_cr3, MMUPAGE_SIZE);
+ 	}
+ 
+ 	toggle_la57(trampoline_32bit);
+diff --git a/arch/x86/entry/vdso/vma.c b/arch/x86/entry/vdso/vma.c
+index d903bce24f15..a89f462859a3 100644
+--- a/arch/x86/entry/vdso/vma.c
++++ b/arch/x86/entry/vdso/vma.c
+@@ -38,7 +38,7 @@ unsigned int __read_mostly vdso64_enabled = 1;
+ int __init init_vdso_image(const struct vdso_image *image)
+ {
+ 	BUILD_BUG_ON(VDSO_CLOCKMODE_MAX >= 32);
+-	BUG_ON(image->size % PAGE_SIZE != 0);
++	BUG_ON(image->size % MMUPAGE_SIZE != 0);
+ 
+ 	apply_alternatives((struct alt_instr *)(image->data + image->alt),
+ 			   (struct alt_instr *)(image->data + image->alt +
+@@ -54,10 +54,10 @@ static vm_fault_t vdso_fault(const struct vm_special_mapping *sm,
+ {
+ 	const struct vdso_image *image = vma->vm_mm->context.vdso_image;
+ 
+-	if (!image || (vmf->pgoff << PAGE_SHIFT) >= image->size)
++	if (!image || (vmf->pgoff << MMUPAGE_SHIFT) >= image->size)
+ 		return VM_FAULT_SIGBUS;
+ 
+-	vmf->page = virt_to_page(image->data + (vmf->pgoff << PAGE_SHIFT));
++	vmf->page = virt_to_page(image->data + (vmf->pgoff << MMUPAGE_SHIFT));
+ 	get_page(vmf->page);
+ 	return 0;
+ }
+@@ -137,13 +137,13 @@ static int map_vdso(const struct vdso_image *image, unsigned long addr)
+ 		return -EINTR;
+ 
+ 	addr = get_unmapped_area(NULL, addr,
+-				 image->size + __VDSO_PAGES * PAGE_SIZE, 0, 0);
++				 image->size + __VDSO_PAGES * MMUPAGE_SIZE, 0, 0);
+ 	if (IS_ERR_VALUE(addr)) {
+ 		ret = addr;
+ 		goto up_fail;
+ 	}
+ 
+-	text_start = addr + __VDSO_PAGES * PAGE_SIZE;
++	text_start = addr + __VDSO_PAGES * MMUPAGE_SIZE;
+ 
+ 	/*
+ 	 * MAYWRITE to allow gdb to COW and set breakpoints
+@@ -170,7 +170,7 @@ static int map_vdso(const struct vdso_image *image, unsigned long addr)
+ 
+ 	vma = _install_special_mapping(mm,
+ 				       VDSO_VCLOCK_PAGES_START(addr),
+-				       VDSO_NR_VCLOCK_PAGES * PAGE_SIZE,
++				       VDSO_NR_VCLOCK_PAGES * MMUPAGE_SIZE,
+ 				       VM_READ|VM_MAYREAD|VM_IO|VM_DONTDUMP|
+ 				       VM_PFNMAP|VM_SEALED_SYSMAP,
+ 				       &vvar_vclock_mapping);
+diff --git a/arch/x86/include/asm/boot.h b/arch/x86/include/asm/boot.h
+index f7b67cb73915..937ddcb99282 100644
+--- a/arch/x86/include/asm/boot.h
++++ b/arch/x86/include/asm/boot.h
+@@ -74,9 +74,9 @@
+ # define BOOT_STACK_SIZE	0x1000
+ #endif
+ 
+-#define TRAMPOLINE_32BIT_SIZE		(2 * PAGE_SIZE)
++#define TRAMPOLINE_32BIT_SIZE		(2 * MMUPAGE_SIZE)
+ 
+-#define TRAMPOLINE_32BIT_CODE_OFFSET	PAGE_SIZE
++#define TRAMPOLINE_32BIT_CODE_OFFSET	MMUPAGE_SIZE
+ #define TRAMPOLINE_32BIT_CODE_SIZE	0xA0
+ 
+ #ifndef __ASSEMBLER__
+diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
+index c7f98977663c..bccc41639081 100644
+--- a/arch/x86/include/asm/elf.h
++++ b/arch/x86/include/asm/elf.h
+@@ -224,7 +224,7 @@ extern int force_personality32;
+ #endif /* !CONFIG_X86_32 */
+ 
+ #define CORE_DUMP_USE_REGSET
+-#define ELF_EXEC_PAGESIZE	4096
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This is the base location for PIE (ET_DYN with INTERP) loads. On
+diff --git a/arch/x86/include/asm/fixmap.h b/arch/x86/include/asm/fixmap.h
+index 4519c9f35ba0..64ff2d21b7f2 100644
+--- a/arch/x86/include/asm/fixmap.h
++++ b/arch/x86/include/asm/fixmap.h
+@@ -55,8 +55,8 @@
+ extern unsigned long __FIXADDR_TOP;
+ #define FIXADDR_TOP	((unsigned long)__FIXADDR_TOP)
+ #else
+-#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
+-			 PAGE_SIZE)
++#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + MMUPAGE_SIZE, 1<<PMD_SHIFT) - \
++			 MMUPAGE_SIZE)
+ #endif
+ 
+ /*
+@@ -83,7 +83,7 @@ enum fixed_addresses {
+ 	FIX_HOLE,
+ #else
+ #ifdef CONFIG_X86_VSYSCALL_EMULATION
+-	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> PAGE_SHIFT,
++	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> MMUPAGE_SHIFT,
+ #endif
+ #endif
+ 	FIX_DBGP_BASE,
+@@ -147,9 +147,9 @@ enum fixed_addresses {
+ 
+ extern void reserve_top_address(unsigned long reserve);
+ 
+-#define FIXADDR_SIZE		(__end_of_permanent_fixed_addresses << PAGE_SHIFT)
++#define FIXADDR_SIZE		(__end_of_permanent_fixed_addresses << MMUPAGE_SHIFT)
+ #define FIXADDR_START		(FIXADDR_TOP - FIXADDR_SIZE)
+-#define FIXADDR_TOT_SIZE	(__end_of_fixed_addresses << PAGE_SHIFT)
++#define FIXADDR_TOT_SIZE	(__end_of_fixed_addresses << MMUPAGE_SHIFT)
+ #define FIXADDR_TOT_START	(FIXADDR_TOP - FIXADDR_TOT_SIZE)
+ 
+ extern int fixmaps_set;
+diff --git a/arch/x86/include/asm/page_types.h b/arch/x86/include/asm/page_types.h
+index 3e0801a0f782..83c34af483e8 100644
+--- a/arch/x86/include/asm/page_types.h
++++ b/arch/x86/include/asm/page_types.h
+@@ -13,7 +13,7 @@
+ /* Cast P*D_MASK to a signed type so that it is sign-extended if
+    virtual addresses are 32-bits but physical addresses are larger
+    (ie, 32-bit PAE). */
+-#define PHYSICAL_PAGE_MASK	(((signed long)PAGE_MASK) & __PHYSICAL_MASK)
++#define PHYSICAL_PAGE_MASK	(((signed long)MMUPAGE_MASK) & __PHYSICAL_MASK)
+ #define PHYSICAL_PMD_PAGE_MASK	(((signed long)PMD_MASK) & __PHYSICAL_MASK)
+ #define PHYSICAL_PUD_PAGE_MASK	(((signed long)PUD_MASK) & __PHYSICAL_MASK)
+ 
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 2187e9cfcefa..a83cd97ecd86 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -1470,7 +1470,7 @@ static inline void clone_pgd_range(pgd_t *dst, pgd_t *src, int count)
+ #define PTE_SHIFT ilog2(PTRS_PER_PTE)
+ static inline int page_level_shift(enum pg_level level)
+ {
+-	return (PAGE_SHIFT - PTE_SHIFT) + level * PTE_SHIFT;
++	return (MMUPAGE_SHIFT - PTE_SHIFT) + level * PTE_SHIFT;
+ }
+ static inline unsigned long page_level_size(enum pg_level level)
+ {
+diff --git a/arch/x86/include/asm/pgtable_64.h b/arch/x86/include/asm/pgtable_64.h
+index ce45882ccd07..8df5f6ffb338 100644
+--- a/arch/x86/include/asm/pgtable_64.h
++++ b/arch/x86/include/asm/pgtable_64.h
+@@ -277,7 +277,7 @@ L4_START_KERNEL = l4_index(__START_KERNEL_map)
+ L3_START_KERNEL = pud_index(__START_KERNEL_map)
+ 
+ #define SYM_DATA_START_PAGE_ALIGNED(name)			\
+-	SYM_START(name, SYM_L_GLOBAL, .balign PAGE_SIZE)
++	SYM_START(name, SYM_L_GLOBAL, .balign MMUPAGE_SIZE)
+ 
+ /* Automate the creation of 1 to 1 mapping pmd entries */
+ #define PMDS(START, PERM, COUNT)			\
+diff --git a/arch/x86/include/asm/pgtable_64_types.h b/arch/x86/include/asm/pgtable_64_types.h
+index 7eb61ef6a185..fda1d393050d 100644
+--- a/arch/x86/include/asm/pgtable_64_types.h
++++ b/arch/x86/include/asm/pgtable_64_types.h
+@@ -188,7 +188,7 @@ extern unsigned int ptrs_per_p4d;
+ 
+ #define EARLY_DYNAMIC_PAGE_TABLES	64
+ 
+-#define PGD_KERNEL_START	((PAGE_SIZE / 2) / sizeof(pgd_t))
++#define PGD_KERNEL_START	((MMUPAGE_SIZE / 2) / sizeof(pgd_t))
+ 
+ /*
+  * We borrow bit 3 to remember PG_anon_exclusive.
+diff --git a/arch/x86/include/asm/vdso/vsyscall.h b/arch/x86/include/asm/vdso/vsyscall.h
+index 4aa311a923f2..3c7f9064f5f8 100644
+--- a/arch/x86/include/asm/vdso/vsyscall.h
++++ b/arch/x86/include/asm/vdso/vsyscall.h
+@@ -5,7 +5,7 @@
+ #define __VDSO_PAGES	6
+ 
+ #define VDSO_NR_VCLOCK_PAGES	2
+-#define VDSO_VCLOCK_PAGES_START(_b)	((_b) + (__VDSO_PAGES - VDSO_NR_VCLOCK_PAGES) * PAGE_SIZE)
++#define VDSO_VCLOCK_PAGES_START(_b)	((_b) + (__VDSO_PAGES - VDSO_NR_VCLOCK_PAGES) * MMUPAGE_SIZE)
+ #define VDSO_PAGE_PVCLOCK_OFFSET	0
+ #define VDSO_PAGE_HVCLOCK_OFFSET	1
+ 
+diff --git a/arch/x86/kernel/alternative.c b/arch/x86/kernel/alternative.c
+index 62936a3bde19..9a925590a210 100644
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -2545,13 +2545,19 @@ typedef void text_poke_f(void *dst, const void *src, size_t len);
+ 
+ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t len)
+ {
+-	bool cross_page_boundary = offset_in_page(addr) + len > PAGE_SIZE;
++	/*
++	 * Use MMUPAGE (hardware page) granularity for offset and boundary
++	 * calculations, since each PTE maps one MMUPAGE, not one PAGE.
++	 */
++	unsigned long mmu_offset = (unsigned long)addr & ~MMUPAGE_MASK;
++	bool cross_page_boundary = mmu_offset + len > MMUPAGE_SIZE;
+ 	struct page *pages[2] = {NULL};
+ 	struct mm_struct *prev_mm;
+ 	unsigned long flags;
+ 	pte_t pte, *ptep;
+ 	spinlock_t *ptl;
+ 	pgprot_t pgprot;
++	phys_addr_t phys;
+ 
+ 	/*
+ 	 * While boot memory allocator is running we cannot use struct pages as
+@@ -2562,12 +2568,12 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 	if (!core_kernel_text((unsigned long)addr)) {
+ 		pages[0] = vmalloc_to_page(addr);
+ 		if (cross_page_boundary)
+-			pages[1] = vmalloc_to_page(addr + PAGE_SIZE);
++			pages[1] = vmalloc_to_page(addr + MMUPAGE_SIZE);
+ 	} else {
+ 		pages[0] = virt_to_page(addr);
+ 		WARN_ON(!PageReserved(pages[0]));
+ 		if (cross_page_boundary)
+-			pages[1] = virt_to_page(addr + PAGE_SIZE);
++			pages[1] = virt_to_page(addr + MMUPAGE_SIZE);
+ 	}
+ 	/*
+ 	 * If something went wrong, crash and burn since recovery paths are not
+@@ -2593,12 +2599,19 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 
+ 	local_irq_save(flags);
+ 
+-	pte = mk_pte(pages[0], pgprot);
++	/*
++	 * Map the MMUPAGE containing addr. Use the physical address directly
++	 * to correctly handle sub-PAGE_SIZE offsets within a kernel page.
++	 */
++	phys = __pa((unsigned long)addr & MMUPAGE_MASK);
++	pte = __pte((phys & PTE_PFN_MASK) | pgprot_val(pgprot));
+ 	set_pte_at(text_poke_mm, text_poke_mm_addr, ptep, pte);
+ 
+ 	if (cross_page_boundary) {
+-		pte = mk_pte(pages[1], pgprot);
+-		set_pte_at(text_poke_mm, text_poke_mm_addr + PAGE_SIZE, ptep + 1, pte);
++		phys = __pa(((unsigned long)addr & MMUPAGE_MASK) + MMUPAGE_SIZE);
++		pte = __pte((phys & PTE_PFN_MASK) | pgprot_val(pgprot));
++		set_pte_at(text_poke_mm, text_poke_mm_addr + MMUPAGE_SIZE,
++			   ptep + 1, pte);
+ 	}
+ 
+ 	/*
+@@ -2608,7 +2621,7 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 	prev_mm = use_temporary_mm(text_poke_mm);
+ 
+ 	kasan_disable_current();
+-	func((u8 *)text_poke_mm_addr + offset_in_page(addr), src, len);
++	func((u8 *)text_poke_mm_addr + mmu_offset, src, len);
+ 	kasan_enable_current();
+ 
+ 	/*
+@@ -2619,7 +2632,7 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 
+ 	pte_clear(text_poke_mm, text_poke_mm_addr, ptep);
+ 	if (cross_page_boundary)
+-		pte_clear(text_poke_mm, text_poke_mm_addr + PAGE_SIZE, ptep + 1);
++		pte_clear(text_poke_mm, text_poke_mm_addr + MMUPAGE_SIZE, ptep + 1);
+ 
+ 	/*
+ 	 * Loading the previous page-table hierarchy requires a serializing
+@@ -2633,8 +2646,8 @@ static void *__text_poke(text_poke_f func, void *addr, const void *src, size_t l
+ 	 * IRQs, but not if the mm is not used, as it is in this point.
+ 	 */
+ 	flush_tlb_mm_range(text_poke_mm, text_poke_mm_addr, text_poke_mm_addr +
+-			   (cross_page_boundary ? 2 : 1) * PAGE_SIZE,
+-			   PAGE_SHIFT, false);
++			   (cross_page_boundary ? 2 : 1) * MMUPAGE_SIZE,
++			   MMUPAGE_SHIFT, false);
+ 
+ 	if (func == text_poke_memcpy) {
+ 		/*
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index bddc54465399..b85690fd56e0 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -775,6 +775,7 @@ void __init lapic_assign_system_vectors(void)
+ {
+ 	unsigned int i, vector;
+ 
++	pr_info("lapic_assign_system_vectors: vector_matrix=%px\n", vector_matrix);
+ 	for_each_set_bit(vector, system_vectors, NR_VECTORS)
+ 		irq_matrix_assign_system(vector_matrix, vector, false);
+ 
+@@ -815,8 +816,10 @@ int __init arch_early_irq_init(void)
+ 	 */
+ 	vector_matrix = irq_alloc_matrix(NR_VECTORS, FIRST_EXTERNAL_VECTOR,
+ 					 FIRST_SYSTEM_VECTOR);
++	pr_info("arch_early_irq_init: vector_matrix=%px at &=%px\n", vector_matrix, &vector_matrix);
+ 	BUG_ON(!vector_matrix);
+ 
++	pr_info("arch_early_irq_init: calling arch_early_ioapic_init\n");
+ 	return arch_early_ioapic_init();
+ }
+ 
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index fd28b53dbac5..bc3a31a385fa 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -252,7 +252,12 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
+ 	 * This needs to happen *before* kasan_early_init() because latter maps stuff
+ 	 * into that page.
+ 	 */
+-	clear_page(init_top_pgt);
++	/*
++	 * init_top_pgt is a PGD (MMUPAGE_SIZE, not PAGE_SIZE).
++	 * Use memset to avoid overwriting adjacent data when
++	 * PAGE_MMUSHIFT > 0.
++	 */
++	memset(init_top_pgt, 0, PTRS_PER_PGD * sizeof(pgd_t));
+ 
+ 	/*
+ 	 * SME support may update early_pmd_flags to include the memory
+diff --git a/arch/x86/kernel/head_64.S b/arch/x86/kernel/head_64.S
+index 7ed5520dd52e..5b7893fb50a6 100644
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -590,7 +590,7 @@ SYM_PIC_ALIAS(vc_no_ghcb);
+ #define PTI_USER_PGD_FILL	512
+ /* This ensures they are 8k-aligned: */
+ #define SYM_DATA_START_PTI_ALIGNED(name) \
+-	SYM_START(name, SYM_L_GLOBAL, .balign 2 * PAGE_SIZE)
++	SYM_START(name, SYM_L_GLOBAL, .balign 2 * MMUPAGE_SIZE)
+ #else
+ #define SYM_DATA_START_PTI_ALIGNED(name) \
+ 	SYM_DATA_START_PAGE_ALIGNED(name)
+@@ -657,7 +657,7 @@ SYM_DATA_START_PAGE_ALIGNED(level2_fixmap_pgt)
+ 	.fill	(512 - 4 - FIXMAP_PMD_NUM),8,0
+ 	pgtno = 0
+ 	.rept (FIXMAP_PMD_NUM)
+-	.quad level1_fixmap_pgt + (pgtno << PAGE_SHIFT) - __START_KERNEL_map \
++	.quad level1_fixmap_pgt + (pgtno << MMUPAGE_SHIFT) - __START_KERNEL_map \
+ 		+ _PAGE_TABLE_NOENC;
+ 	pgtno = pgtno + 1
+ 	.endr
+diff --git a/arch/x86/kernel/irqinit.c b/arch/x86/kernel/irqinit.c
+index 6ab9eac64670..cd3e878468a1 100644
+--- a/arch/x86/kernel/irqinit.c
++++ b/arch/x86/kernel/irqinit.c
+@@ -94,16 +94,21 @@ void __init init_IRQ(void)
+ 
+ void __init native_init_IRQ(void)
+ {
++	pr_info("native_init_IRQ: entry\n");
+ 	/* Execute any quirks before the call gates are initialised: */
+ 	x86_init.irqs.pre_vector_init();
++	pr_info("native_init_IRQ: after pre_vector_init\n");
+ 
+ 	/* FRED's IRQ path may be used even if FRED isn't fully enabled. */
+ 	if (IS_ENABLED(CONFIG_X86_FRED))
+ 		fred_complete_exception_setup();
+ 
+-	if (!cpu_feature_enabled(X86_FEATURE_FRED))
++	if (!cpu_feature_enabled(X86_FEATURE_FRED)) {
++		pr_info("native_init_IRQ: about to call idt_setup_apic_and_irq_gates\n");
+ 		idt_setup_apic_and_irq_gates();
++	}
+ 
++	pr_info("native_init_IRQ: about to call lapic_assign_system_vectors\n");
+ 	lapic_assign_system_vectors();
+ 
+ 	if (!acpi_ioapic && !of_ioapic && nr_legacy_irqs()) {
+diff --git a/arch/x86/kernel/sys_x86_64.c b/arch/x86/kernel/sys_x86_64.c
+index 776ae6fa7f2d..ea4f34fe89e9 100644
+--- a/arch/x86/kernel/sys_x86_64.c
++++ b/arch/x86/kernel/sys_x86_64.c
+@@ -152,7 +152,7 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len,
+ 	info.low_limit = begin;
+ 	info.high_limit = end;
+ 	if (!(filp && is_file_hugepages(filp))) {
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 		info.start_gap = stack_guard_placement(vm_flags);
+ 	}
+ 	if (filp) {
+@@ -207,7 +207,7 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr0,
+ 	info.high_limit = get_mmap_base(0);
+ 	if (!(filp && is_file_hugepages(filp))) {
+ 		info.start_gap = stack_guard_placement(vm_flags);
+-		info.align_offset = pgoff << PAGE_SHIFT;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	}
+ 
+ 	/*
+diff --git a/arch/x86/lib/clear_page_64.S b/arch/x86/lib/clear_page_64.S
+index f7f356e7218b..407007a871cf 100644
+--- a/arch/x86/lib/clear_page_64.S
++++ b/arch/x86/lib/clear_page_64.S
+@@ -4,6 +4,7 @@
+ #include <linux/cfi_types.h>
+ #include <linux/objtool.h>
+ #include <asm/asm.h>
++#include <asm/page_types.h>
+ 
+ /*
+  * Zero page aligned region.
+diff --git a/arch/x86/lib/copy_page_64.S b/arch/x86/lib/copy_page_64.S
+index d8e87fedc20d..d12078e9aa4d 100644
+--- a/arch/x86/lib/copy_page_64.S
++++ b/arch/x86/lib/copy_page_64.S
+@@ -6,6 +6,7 @@
+ #include <linux/cfi_types.h>
+ #include <asm/cpufeatures.h>
+ #include <asm/alternative.h>
++#include <asm/page_types.h>
+ 
+ /*
+  * Some CPUs run faster using the string copy instructions (sane microcode).
+@@ -16,7 +17,7 @@
+ 	ALIGN
+ SYM_TYPED_FUNC_START(copy_page)
+ 	ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
+-	movl	$4096/8, %ecx
++	movl	$PAGE_SIZE/8, %ecx
+ 	rep	movsq
+ 	RET
+ SYM_FUNC_END(copy_page)
+@@ -27,7 +28,7 @@ SYM_FUNC_START_LOCAL(copy_page_regs)
+ 	movq	%rbx,	(%rsp)
+ 	movq	%r12,	1*8(%rsp)
+ 
+-	movl	$(4096/64)-5,	%ecx
++	movl	$(PAGE_SIZE/64)-5,	%ecx
+ 	.p2align 4
+ .Loop64:
+ 	dec	%rcx
+diff --git a/arch/x86/mm/cpu_entry_area.c b/arch/x86/mm/cpu_entry_area.c
+index 575f863f3c75..4418a9d8b5af 100644
+--- a/arch/x86/mm/cpu_entry_area.c
++++ b/arch/x86/mm/cpu_entry_area.c
+@@ -79,7 +79,7 @@ EXPORT_SYMBOL(get_cpu_entry_area);
+ void cea_set_pte(void *cea_vaddr, phys_addr_t pa, pgprot_t flags)
+ {
+ 	unsigned long va = (unsigned long) cea_vaddr;
+-	pte_t pte = pfn_pte(pa >> PAGE_SHIFT, flags);
++	pte_t pte = __pte((pa & MMUPAGE_MASK) | pgprot_val(flags));
+ 
+ 	/*
+ 	 * The cpu_entry_area is shared between the user and kernel
+@@ -98,7 +98,9 @@ void cea_set_pte(void *cea_vaddr, phys_addr_t pa, pgprot_t flags)
+ static void __init
+ cea_map_percpu_pages(void *cea_vaddr, void *ptr, int pages, pgprot_t prot)
+ {
+-	for ( ; pages; pages--, cea_vaddr+= PAGE_SIZE, ptr += PAGE_SIZE)
++	int mmupages = pages * PAGE_MMUCOUNT;
++
++	for ( ; mmupages; mmupages--, cea_vaddr += MMUPAGE_SIZE, ptr += MMUPAGE_SIZE)
+ 		cea_set_pte(cea_vaddr, per_cpu_ptr_to_phys(ptr), prot);
+ }
+ 
+@@ -122,8 +124,8 @@ static void __init percpu_setup_debug_store(unsigned int cpu)
+ 	 * Force the population of PMDs for not yet allocated per cpu
+ 	 * memory like debug store buffers.
+ 	 */
+-	npages = sizeof(struct debug_store_buffers) / PAGE_SIZE;
+-	for (; npages; npages--, cea += PAGE_SIZE)
++	npages = sizeof(struct debug_store_buffers) / MMUPAGE_SIZE;
++	for (; npages; npages--, cea += MMUPAGE_SIZE)
+ 		cea_set_pte(cea, 0, PAGE_NONE);
+ #endif
+ }
+diff --git a/arch/x86/mm/dump_pagetables.c b/arch/x86/mm/dump_pagetables.c
+index 2afa7a23340e..67f3feb95a1d 100644
+--- a/arch/x86/mm/dump_pagetables.c
++++ b/arch/x86/mm/dump_pagetables.c
+@@ -149,7 +149,7 @@ static struct addr_marker address_markers[] = {
+ #endif /* !CONFIG_X86_64 */
+ 
+ /* Multipliers for offsets within the PTEs */
+-#define PTE_LEVEL_MULT (PAGE_SIZE)
++#define PTE_LEVEL_MULT (MMUPAGE_SIZE)
+ #define PMD_LEVEL_MULT (PTRS_PER_PTE * PTE_LEVEL_MULT)
+ #define PUD_LEVEL_MULT (PTRS_PER_PMD * PMD_LEVEL_MULT)
+ #define P4D_LEVEL_MULT (PTRS_PER_PUD * PUD_LEVEL_MULT)
+@@ -228,7 +228,7 @@ static void note_wx(struct pg_state *st, unsigned long addr)
+ {
+ 	unsigned long npages;
+ 
+-	npages = (addr - st->start_address) / PAGE_SIZE;
++	npages = (addr - st->start_address) / MMUPAGE_SIZE;
+ 
+ #ifdef CONFIG_PCI_BIOS
+ 	/*
+diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
+index fb67217fddcd..4897b9bb4bc2 100644
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@ -836,11 +836,11 @@ void __init poking_init(void)
+ 	 */
+ 	text_poke_mm_addr = TASK_UNMAPPED_BASE;
+ 	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE))
+-		text_poke_mm_addr += (kaslr_get_random_long("Poking") & PAGE_MASK) %
+-			(TASK_SIZE - TASK_UNMAPPED_BASE - 3 * PAGE_SIZE);
++		text_poke_mm_addr += (kaslr_get_random_long("Poking") & MMUPAGE_MASK) %
++			(TASK_SIZE - TASK_UNMAPPED_BASE - 3 * MMUPAGE_SIZE);
+ 
+-	if (((text_poke_mm_addr + PAGE_SIZE) & ~PMD_MASK) == 0)
+-		text_poke_mm_addr += PAGE_SIZE;
++	if (((text_poke_mm_addr + MMUPAGE_SIZE) & ~PMD_MASK) == 0)
++		text_poke_mm_addr += MMUPAGE_SIZE;
+ 
+ 	/*
+ 	 * We need to trigger the allocation of the page-tables that will be
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index df2261fa4f98..f7f7ca9fea08 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -481,12 +481,12 @@ phys_pte_init(pte_t *pte_page, unsigned long paddr, unsigned long paddr_end,
+ 	i = pte_index(paddr);
+ 
+ 	for (; i < PTRS_PER_PTE; i++, paddr = paddr_next, pte++) {
+-		paddr_next = (paddr & PAGE_MASK) + PAGE_SIZE;
++		paddr_next = (paddr & MMUPAGE_MASK) + MMUPAGE_SIZE;
+ 		if (paddr >= paddr_end) {
+ 			if (!after_bootmem &&
+-			    !e820__mapped_any(paddr & PAGE_MASK, paddr_next,
++			    !e820__mapped_any(paddr & MMUPAGE_MASK, paddr_next,
+ 					     E820_TYPE_RAM) &&
+-			    !e820__mapped_any(paddr & PAGE_MASK, paddr_next,
++			    !e820__mapped_any(paddr & MMUPAGE_MASK, paddr_next,
+ 					     E820_TYPE_ACPI))
+ 				set_pte_init(pte, __pte(0), init);
+ 			continue;
+@@ -505,8 +505,8 @@ phys_pte_init(pte_t *pte_page, unsigned long paddr, unsigned long paddr_end,
+ 		}
+ 
+ 		pages++;
+-		set_pte_init(pte, pfn_pte(paddr >> PAGE_SHIFT, prot), init);
+-		paddr_last = (paddr & PAGE_MASK) + PAGE_SIZE;
++		set_pte_init(pte, __pte((paddr & MMUPAGE_MASK) | pgprot_val(prot)), init);
++		paddr_last = (paddr & MMUPAGE_MASK) + MMUPAGE_SIZE;
+ 	}
+ 
+ 	update_page_count(PG_LEVEL_4K, pages);
+diff --git a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+index 12c8180ca1ba..f14fe4356594 100644
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -219,11 +219,11 @@ __ioremap_caller(resource_size_t phys_addr, unsigned long size,
+ 	}
+ 
+ 	/*
+-	 * Mappings have to be page-aligned
++	 * Mappings have to be MMU-page-aligned (hardware page size)
+ 	 */
+-	offset = phys_addr & ~PAGE_MASK;
+-	phys_addr &= PAGE_MASK;
+-	size = PAGE_ALIGN(last_addr+1) - phys_addr;
++	offset = phys_addr & ~MMUPAGE_MASK;
++	phys_addr &= MMUPAGE_MASK;
++	size = ALIGN(last_addr+1, MMUPAGE_SIZE) - phys_addr;
+ 
+ 	/*
+ 	 * Mask out any bits not part of the actual physical
+@@ -821,7 +821,7 @@ void __init *early_memremap_decrypted_wp(resource_size_t phys_addr,
+ }
+ #endif	/* CONFIG_AMD_MEM_ENCRYPT */
+ 
+-static pte_t bm_pte[PAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
++static pte_t bm_pte[MMUPAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
+ 
+ static inline pmd_t * __init early_ioremap_pmd(unsigned long addr)
+ {
+@@ -842,7 +842,7 @@ static inline pte_t * __init early_ioremap_pte(unsigned long addr)
+ 
+ bool __init is_early_ioremap_ptep(pte_t *ptep)
+ {
+-	return ptep >= &bm_pte[0] && ptep < &bm_pte[PAGE_SIZE/sizeof(pte_t)];
++	return ptep >= &bm_pte[0] && ptep < &bm_pte[MMUPAGE_SIZE/sizeof(pte_t)];
+ }
+ 
+ void __init early_ioremap_init(void)
+@@ -850,9 +850,9 @@ void __init early_ioremap_init(void)
+ 	pmd_t *pmd;
+ 
+ #ifdef CONFIG_X86_64
+-	BUILD_BUG_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
++	BUILD_BUG_ON((fix_to_virt(0) + MMUPAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
+ #else
+-	WARN_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
++	WARN_ON((fix_to_virt(0) + MMUPAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
+ #endif
+ 
+ 	early_ioremap_setup();
+@@ -865,7 +865,7 @@ void __init early_ioremap_init(void)
+ 	 * The boot-ioremap range spans multiple pmds, for which
+ 	 * we are not prepared:
+ 	 */
+-#define __FIXADDR_TOP (-PAGE_SIZE)
++#define __FIXADDR_TOP (-MMUPAGE_SIZE)
+ 	BUILD_BUG_ON((__fix_to_virt(FIX_BTMAP_BEGIN) >> PMD_SHIFT)
+ 		     != (__fix_to_virt(FIX_BTMAP_END) >> PMD_SHIFT));
+ #undef __FIXADDR_TOP
+@@ -900,7 +900,7 @@ void __init __early_set_fixmap(enum fixed_addresses idx,
+ 	pgprot_val(flags) &= __supported_pte_mask;
+ 
+ 	if (pgprot_val(flags))
+-		set_pte(pte, pfn_pte(phys >> PAGE_SHIFT, flags));
++		set_pte(pte, __pte((phys & MMUPAGE_MASK) | pgprot_val(flags)));
+ 	else
+ 		pte_clear(&init_mm, addr, pte);
+ 	flush_tlb_one_kernel(addr);
+diff --git a/arch/x86/mm/pat/set_memory.c b/arch/x86/mm/pat/set_memory.c
+index d023a40a1e03..31b6c8f8f864 100644
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@ -873,8 +873,13 @@ phys_addr_t slow_virt_to_phys(void *__virt_addr)
+ 		offset = virt_addr & ~PMD_MASK;
+ 		break;
+ 	default:
+-		phys_addr = (phys_addr_t)pte_pfn(*pte) << PAGE_SHIFT;
+-		offset = virt_addr & ~PAGE_MASK;
++	{
++		phys_addr_t raw = pte_val(*pte);
++
++		raw ^= protnone_mask(raw);
++		phys_addr = raw & PTE_PFN_MASK;
++		offset = virt_addr & ~MMUPAGE_MASK;
++	}
+ 	}
+ 
+ 	return (phys_addr_t)(phys_addr | offset);
+@@ -1087,13 +1092,18 @@ static int should_split_large_page(pte_t *kpte, unsigned long address,
+ 	return do_split;
+ }
+ 
+-static void split_set_pte(struct cpa_data *cpa, pte_t *pte, unsigned long pfn,
++static void split_set_pte(struct cpa_data *cpa, pte_t *pte, phys_addr_t paddr,
+ 			  pgprot_t ref_prot, unsigned long address,
+ 			  unsigned long size)
+ {
+ 	unsigned int npg = PFN_DOWN(size);
++	unsigned long pfn = PFN_DOWN(paddr);
+ 	pgprot_t prot;
+ 
++	/* Ensure at least 1 page for static_protections range check */
++	if (npg < 1)
++		npg = 1;
++
+ 	/*
+ 	 * If should_split_large_page() discovered an inconsistent mapping,
+ 	 * remove the invalid protection in the split mapping.
+@@ -1115,12 +1125,21 @@ static void split_set_pte(struct cpa_data *cpa, pte_t *pte, unsigned long pfn,
+ 	 * pages. Warn for now and revisit it in case this actually
+ 	 * happens.
+ 	 */
+-	if (size == PAGE_SIZE)
++	if (size <= MMUPAGE_SIZE)
+ 		ref_prot = prot;
+ 	else
+ 		pr_warn_once("CPA: Cannot fixup static protections for PUD split\n");
+ set:
+-	set_pte(pte, pfn_pte(pfn, ref_prot));
++	if (size <= MMUPAGE_SIZE) {
++		/*
++		 * PTE level: use MMUPAGE-granularity physical address directly
++		 * to avoid losing sub-PAGE_SIZE address bits through pfn_pte().
++		 */
++		set_pte(pte, __pte((paddr & PTE_PFN_MASK) |
++				   pgprot_val(ref_prot)));
++	} else {
++		set_pte(pte, pfn_pte(pfn, ref_prot));
++	}
+ }
+ 
+ static int
+@@ -1158,13 +1177,12 @@ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 		ref_prot = pgprot_large_2_4k(ref_prot);
+ 		ref_pfn = pmd_pfn(*(pmd_t *)kpte);
+ 		lpaddr = address & PMD_MASK;
+-		lpinc = PAGE_SIZE;
++		lpinc = MMUPAGE_SIZE;
+ 		break;
+ 
+ 	case PG_LEVEL_1G:
+ 		ref_prot = pud_pgprot(*(pud_t *)kpte);
+ 		ref_pfn = pud_pfn(*(pud_t *)kpte);
+-		pfninc = PMD_SIZE >> PAGE_SHIFT;
+ 		lpaddr = address & PUD_MASK;
+ 		lpinc = PMD_SIZE;
+ 		/*
+@@ -1184,11 +1202,16 @@ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 	ref_prot = pgprot_clear_protnone_bits(ref_prot);
+ 
+ 	/*
+-	 * Get the target pfn from the original entry:
++	 * Get the target physical address from the original entry.
++	 * Use physical address arithmetic to avoid losing sub-PAGE_SIZE
++	 * address bits when PAGE_MMUSHIFT > 0.
+ 	 */
+-	pfn = ref_pfn;
+-	for (i = 0; i < PTRS_PER_PTE; i++, pfn += pfninc, lpaddr += lpinc)
+-		split_set_pte(cpa, pbase + i, pfn, ref_prot, lpaddr, lpinc);
++	{
++		phys_addr_t paddr = (phys_addr_t)ref_pfn << PAGE_SHIFT;
++
++		for (i = 0; i < PTRS_PER_PTE; i++, paddr += lpinc, lpaddr += lpinc)
++			split_set_pte(cpa, pbase + i, paddr, ref_prot, lpaddr, lpinc);
++	}
+ 
+ 	if (virt_addr_valid(address)) {
+ 		unsigned long pfn = PFN_DOWN(__pa(address));
+@@ -1438,7 +1461,7 @@ static bool unmap_pte_range(pmd_t *pmd, unsigned long start, unsigned long end)
+ 	while (start < end) {
+ 		set_pte(pte, __pte(0));
+ 
+-		start += PAGE_SIZE;
++		start += MMUPAGE_SIZE;
+ 		pte++;
+ 	}
+ 
+@@ -1573,18 +1596,23 @@ static void populate_pte(struct cpa_data *cpa,
+ 			 unsigned num_pages, pmd_t *pmd, pgprot_t pgprot)
+ {
+ 	pte_t *pte;
++	phys_addr_t paddr;
++	unsigned int num_mmu_pages = num_pages << PAGE_MMUSHIFT;
+ 
+ 	pte = pte_offset_kernel(pmd, start);
+ 
+ 	pgprot = pgprot_clear_protnone_bits(pgprot);
++	paddr = (phys_addr_t)cpa->pfn << PAGE_SHIFT;
+ 
+-	while (num_pages-- && start < end) {
+-		set_pte(pte, pfn_pte(cpa->pfn, pgprot));
++	while (num_mmu_pages-- && start < end) {
++		set_pte(pte, __pte((paddr & PTE_PFN_MASK) |
++				   pgprot_val(pgprot)));
+ 
+-		start	 += PAGE_SIZE;
+-		cpa->pfn++;
++		start += MMUPAGE_SIZE;
++		paddr += MMUPAGE_SIZE;
+ 		pte++;
+ 	}
++	cpa->pfn = PFN_DOWN(paddr);
+ }
+ 
+ static long populate_pmd(struct cpa_data *cpa,
+@@ -1864,38 +1892,51 @@ static int __change_page_attr(struct cpa_data *cpa, int primary)
+ 		return __cpa_process_fault(cpa, address, primary);
+ 
+ 	if (level == PG_LEVEL_4K) {
+-		pte_t new_pte;
+-		pgprot_t old_prot = pte_pgprot(old_pte);
+-		pgprot_t new_prot = pte_pgprot(old_pte);
+-		unsigned long pfn = pte_pfn(old_pte);
++		/*
++		 * When PAGE_MMUSHIFT > 0, one logical page spans multiple
++		 * MMUPAGE-sized PTEs.  Process all PAGE_MMUCOUNT PTEs for
++		 * this logical page so the outer loop can advance by
++		 * PAGE_SIZE correctly.
++		 */
++		int sub;
+ 
+-		pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
+-		pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
++		for (sub = 0; sub < PAGE_MMUCOUNT; sub++) {
++			pte_t sub_old = *(kpte + sub);
++			unsigned long sub_addr = address + sub * MMUPAGE_SIZE;
++			pte_t new_pte;
++			pgprot_t old_prot, new_prot;
+ 
+-		cpa_inc_4k_install();
+-		/* Hand in lpsize = 0 to enforce the protection mechanism */
+-		new_prot = static_protections(new_prot, address, pfn, 1, 0,
+-					      CPA_PROTECT);
++			if (pte_none(sub_old))
++				continue;
+ 
+-		new_prot = verify_rwx(old_prot, new_prot, address, pfn, 1,
+-				      nx, rw);
++			old_prot = pte_pgprot(sub_old);
++			new_prot = pte_pgprot(sub_old);
+ 
+-		new_prot = pgprot_clear_protnone_bits(new_prot);
++			pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
++			pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
+ 
+-		/*
+-		 * We need to keep the pfn from the existing PTE,
+-		 * after all we're only going to change its attributes
+-		 * not the memory it points to
+-		 */
+-		new_pte = pfn_pte(pfn, new_prot);
+-		cpa->pfn = pfn;
+-		/*
+-		 * Do we really change anything ?
+-		 */
+-		if (pte_val(old_pte) != pte_val(new_pte)) {
+-			set_pte_atomic(kpte, new_pte);
+-			cpa->flags |= CPA_FLUSHTLB;
++			cpa_inc_4k_install();
++			new_prot = static_protections(new_prot, sub_addr,
++						      pte_pfn(sub_old), 1, 0,
++						      CPA_PROTECT);
++			new_prot = verify_rwx(old_prot, new_prot, sub_addr,
++					      pte_pfn(sub_old), 1, nx, rw);
++			new_prot = pgprot_clear_protnone_bits(new_prot);
++
++			{
++				phys_addr_t phys = pte_val(sub_old);
++
++				phys ^= protnone_mask(phys);
++				phys &= PTE_PFN_MASK;
++				new_pte = __pte(phys | pgprot_val(new_prot));
++			}
++
++			if (pte_val(sub_old) != pte_val(new_pte)) {
++				set_pte_atomic(kpte + sub, new_pte);
++				cpa->flags |= CPA_FLUSHTLB;
++			}
+ 		}
++		cpa->pfn = pte_pfn(old_pte);
+ 		cpa->numpages = 1;
+ 		return 0;
+ 	}
+diff --git a/arch/x86/mm/pgtable.c b/arch/x86/mm/pgtable.c
+index da7f0a03cf90..68acdee8a6c3 100644
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -588,7 +588,7 @@ void native_set_fixmap(unsigned /* enum fixed_addresses */ idx,
+ 	/* Sanitize 'prot' against any unsupported bits: */
+ 	pgprot_val(flags) &= __default_kernel_pte_mask;
+ 
+-	__native_set_fixmap(idx, pfn_pte(phys >> PAGE_SHIFT, flags));
++	__native_set_fixmap(idx, __pte((phys & MMUPAGE_MASK) | pgprot_val(flags)));
+ }
+ 
+ #ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
+diff --git a/arch/x86/mm/pti.c b/arch/x86/mm/pti.c
+index 631f0375bd42..c83961900633 100644
+--- a/arch/x86/mm/pti.c
++++ b/arch/x86/mm/pti.c
+@@ -473,7 +473,7 @@ static void __init pti_clone_user_shared(void)
+ 		if (WARN_ON(!target_pte))
+ 			return;
+ 
+-		*target_pte = pfn_pte(pa >> PAGE_SHIFT, PAGE_KERNEL);
++		*target_pte = __pte((pa & MMUPAGE_MASK) | pgprot_val(PAGE_KERNEL));
+ 	}
+ }
+ 
+diff --git a/arch/x86/realmode/init.c b/arch/x86/realmode/init.c
+index 88be32026768..63a1449f4b62 100644
+--- a/arch/x86/realmode/init.c
++++ b/arch/x86/realmode/init.c
+@@ -194,16 +194,23 @@ static void __init set_real_mode_permissions(void)
+ 		PAGE_ALIGN(real_mode_header->ro_end) -
+ 		__pa(base);
+ 
++	/*
++	 * With PAGE_MMUSHIFT > 0, text_start may be MMUPAGE-aligned
++	 * rather than PAGE-aligned.  Round down to PAGE boundary so
++	 * the CPA code gets a page-aligned address.
++	 */
++	unsigned long text_start_phys =
++		PAGE_ALIGN_DOWN(real_mode_header->text_start);
++
+ 	size_t text_size =
+-		PAGE_ALIGN(real_mode_header->ro_end) -
+-		real_mode_header->text_start;
++		PAGE_ALIGN(real_mode_header->ro_end) - text_start_phys;
+ 
+ 	unsigned long text_start =
+-		(unsigned long) __va(real_mode_header->text_start);
++		(unsigned long) __va(text_start_phys);
+ 
+ 	set_memory_nx((unsigned long) base, size >> PAGE_SHIFT);
+ 	set_memory_ro((unsigned long) base, ro_size >> PAGE_SHIFT);
+-	set_memory_x((unsigned long) text_start, text_size >> PAGE_SHIFT);
++	set_memory_x(text_start, text_size >> PAGE_SHIFT);
+ }
+ 
+ void __init init_real_mode(void)
+diff --git a/arch/x86/realmode/rm/realmode.lds.S b/arch/x86/realmode/rm/realmode.lds.S
+index 63aa51875ba0..e884bf584c1e 100644
+--- a/arch/x86/realmode/rm/realmode.lds.S
++++ b/arch/x86/realmode/rm/realmode.lds.S
+@@ -33,7 +33,7 @@ SECTIONS
+ 		video_cards_end = .;
+ 	}
+ 
+-	. = ALIGN(PAGE_SIZE);
++	. = ALIGN(MMUPAGE_SIZE);
+ 	pa_text_start = .;
+ 	.text : {
+ 		*(.text)
+@@ -51,7 +51,7 @@ SECTIONS
+ 	}
+ 	pa_ro_end = .;
+ 
+-	. = ALIGN(PAGE_SIZE);
++	. = ALIGN(MMUPAGE_SIZE);
+ 	.data : {
+ 		*(.data)
+ 		*(.data.*)
+diff --git a/arch/x86/realmode/rm/trampoline_32.S b/arch/x86/realmode/rm/trampoline_32.S
+index 3fad907a179f..4f9701a5f273 100644
+--- a/arch/x86/realmode/rm/trampoline_32.S
++++ b/arch/x86/realmode/rm/trampoline_32.S
+@@ -28,7 +28,7 @@
+ 	.text
+ 	.code16
+ 
+-	.balign	PAGE_SIZE
++	.balign	MMUPAGE_SIZE
+ SYM_CODE_START(trampoline_start)
+ 	wbinvd			# Needed for NUMA-Q should be harmless for others
+ 
+diff --git a/arch/x86/realmode/rm/trampoline_64.S b/arch/x86/realmode/rm/trampoline_64.S
+index 14d9c7daf90f..6d32a16c0ec2 100644
+--- a/arch/x86/realmode/rm/trampoline_64.S
++++ b/arch/x86/realmode/rm/trampoline_64.S
+@@ -57,7 +57,7 @@
+ 	movl	$rm_stack_end, %esp
+ .endm
+ 
+-	.balign	PAGE_SIZE
++	.balign	MMUPAGE_SIZE
+ SYM_CODE_START(trampoline_start)
+ 	cli			# We should be safe anyway
+ 	wbinvd
+@@ -279,8 +279,8 @@ SYM_DATA_START(tr_compat)
+ SYM_DATA_END(tr_compat)
+ 
+ 	.bss
+-	.balign	PAGE_SIZE
+-SYM_DATA(trampoline_pgd, .space PAGE_SIZE)
++	.balign	MMUPAGE_SIZE
++SYM_DATA(trampoline_pgd, .space MMUPAGE_SIZE)
+ 
+ 	.balign	8
+ SYM_DATA_START(trampoline_header)
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index 16a56b6b3f6c..b7d82c5e3da8 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -79,10 +79,10 @@ static int elf_core_dump(struct coredump_params *cprm);
+ #define elf_core_dump	NULL
+ #endif
+ 
+-#if ELF_EXEC_PAGESIZE > PAGE_SIZE
++#if ELF_EXEC_PAGESIZE > MMUPAGE_SIZE
+ #define ELF_MIN_ALIGN	ELF_EXEC_PAGESIZE
+ #else
+-#define ELF_MIN_ALIGN	PAGE_SIZE
++#define ELF_MIN_ALIGN	MMUPAGE_SIZE
+ #endif
+ 
+ #ifndef ELF_CORE_EFLAGS
+@@ -1335,7 +1335,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		 * leave a gap between .bss and brk.
+ 		 */
+ 		if (!brk_moved)
+-			mm->brk = mm->start_brk = mm->brk + PAGE_SIZE;
++			mm->brk = mm->start_brk = mm->brk + MMUPAGE_SIZE;
+ 
+ 		mm->brk = mm->start_brk = arch_randomize_brk(mm);
+ 		brk_moved = true;
+@@ -1658,7 +1658,7 @@ static int fill_files_note(struct memelfnote *note, struct coredump_params *cprm
+ 
+ 	/* Now we know exact count of files, can store it */
+ 	data[0] = count;
+-	data[1] = PAGE_SIZE;
++	data[1] = ELF_EXEC_PAGESIZE;
+ 	/*
+ 	 * Count usually is less than mm->map_count,
+ 	 * we need to move filenames down.
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 751b9ba160fb..63efbde9c1cb 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -475,7 +475,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+ 
+ 		dev = inode->i_sb->s_dev;
+ 		ino = inode->i_ino;
+-		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
++		pgoff = ((loff_t)vma->vm_pgoff) << MMUPAGE_SHIFT;
+ 	}
+ 
+ 	start = vma->vm_start;
+@@ -717,7 +717,7 @@ static int do_procmap_query(struct mm_struct *mm, void __user *uarg)
+ 	if (vma->vm_file) {
+ 		const struct inode *inode = file_user_inode(vma->vm_file);
+ 
+-		karg.vma_offset = ((__u64)vma->vm_pgoff) << PAGE_SHIFT;
++		karg.vma_offset = ((__u64)vma->vm_pgoff) << MMUPAGE_SHIFT;
+ 		karg.dev_major = MAJOR(inode->i_sb->s_dev);
+ 		karg.dev_minor = MINOR(inode->i_sb->s_dev);
+ 		karg.inode = inode->i_ino;
+@@ -974,7 +974,7 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
+ 	 * mapcount atomically.
+ 	 */
+ 	for (i = 0; i < nr; i++, page++) {
+-		unsigned long pss = PAGE_SIZE << PSS_SHIFT;
++		unsigned long pss = MMUPAGE_SIZE << PSS_SHIFT;
+ 
+ 		if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT)) {
+ 			mapcount = folio_precise_page_mapcount(folio, page);
+@@ -983,7 +983,7 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
+ 
+ 		if (mapcount >= 2)
+ 			pss /= mapcount;
+-		smaps_page_accumulate(mss, folio, PAGE_SIZE, pss,
++		smaps_page_accumulate(mss, folio, MMUPAGE_SIZE, pss,
+ 				dirty, locked, exclusive);
+ 	}
+ }
+@@ -1010,7 +1010,7 @@ static void smaps_pte_hole_lookup(unsigned long addr, struct mm_walk *walk)
+ #ifdef CONFIG_SHMEM
+ 	if (walk->ops->pte_hole) {
+ 		/* depth is not used */
+-		smaps_pte_hole(addr, addr + PAGE_SIZE, 0, walk);
++		smaps_pte_hole(addr, addr + MMUPAGE_SIZE, 0, walk);
+ 	}
+ #endif
+ }
+@@ -1038,15 +1038,15 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
+ 		if (softleaf_is_swap(entry)) {
+ 			int mapcount;
+ 
+-			mss->swap += PAGE_SIZE;
++			mss->swap += MMUPAGE_SIZE;
+ 			mapcount = swp_swapcount(entry);
+ 			if (mapcount >= 2) {
+-				u64 pss_delta = (u64)PAGE_SIZE << PSS_SHIFT;
++				u64 pss_delta = (u64)MMUPAGE_SIZE << PSS_SHIFT;
+ 
+ 				do_div(pss_delta, mapcount);
+ 				mss->swap_pss += pss_delta;
+ 			} else {
+-				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
++				mss->swap_pss += (u64)MMUPAGE_SIZE << PSS_SHIFT;
+ 			}
+ 		} else if (softleaf_has_pfn(entry)) {
+ 			if (softleaf_is_device_private(entry))
+@@ -1124,7 +1124,7 @@ static int smaps_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 		walk->action = ACTION_AGAIN;
+ 		return 0;
+ 	}
+-	for (; addr != end; pte++, addr += PAGE_SIZE)
++	for (; addr != end; pte++, addr += MMUPAGE_SIZE)
+ 		smaps_pte_entry(pte, addr, walk);
+ 	pte_unmap_unlock(pte - 1, ptl);
+ out:
+@@ -1712,7 +1712,7 @@ static int clear_refs_pte_range(pmd_t *pmd, unsigned long addr,
+ 		walk->action = ACTION_AGAIN;
+ 		return 0;
+ 	}
+-	for (; addr != end; pte++, addr += PAGE_SIZE) {
++	for (; addr != end; pte++, addr += MMUPAGE_SIZE) {
+ 		ptent = ptep_get(pte);
+ 
+ 		if (cp->type == CLEAR_REFS_SOFT_DIRTY) {
+@@ -1909,7 +1909,7 @@ static int pagemap_pte_hole(unsigned long start, unsigned long end,
+ 		else
+ 			hole_end = end;
+ 
+-		for (; addr < hole_end; addr += PAGE_SIZE) {
++		for (; addr < hole_end; addr += MMUPAGE_SIZE) {
+ 			err = add_to_pagemap(&pme, pm);
+ 			if (err)
+ 				goto out;
+@@ -1921,7 +1921,7 @@ static int pagemap_pte_hole(unsigned long start, unsigned long end,
+ 		/* Addresses in the VMA. */
+ 		if (vma->vm_flags & VM_SOFTDIRTY)
+ 			pme = make_pme(0, PM_SOFT_DIRTY);
+-		for (; addr < min(end, vma->vm_end); addr += PAGE_SIZE) {
++		for (; addr < min(end, vma->vm_end); addr += MMUPAGE_SIZE) {
+ 			err = add_to_pagemap(&pme, pm);
+ 			if (err)
+ 				goto out;
+@@ -2002,7 +2002,7 @@ static int pagemap_pmd_range_thp(pmd_t *pmdp, unsigned long addr,
+ 		unsigned long end, struct vm_area_struct *vma,
+ 		struct pagemapread *pm)
+ {
+-	unsigned int idx = (addr & ~PMD_MASK) >> PAGE_SHIFT;
++	unsigned int idx = (addr & ~PMD_MASK) >> MMUPAGE_SHIFT;
+ 	u64 flags = 0, frame = 0;
+ 	pmd_t pmd = *pmdp;
+ 	struct page *page = NULL;
+@@ -2053,7 +2053,7 @@ static int pagemap_pmd_range_thp(pmd_t *pmdp, unsigned long addr,
+ 	}
+ 
+ populate_pagemap:
+-	for (; addr != end; addr += PAGE_SIZE, idx++) {
++	for (; addr != end; addr += MMUPAGE_SIZE, idx++) {
+ 		u64 cur_flags = flags;
+ 		pagemap_entry_t pme;
+ 
+@@ -2103,7 +2103,7 @@ static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
+ 		walk->action = ACTION_AGAIN;
+ 		return err;
+ 	}
+-	for (; addr < end; pte++, addr += PAGE_SIZE) {
++	for (; addr < end; pte++, addr += MMUPAGE_SIZE) {
+ 		pagemap_entry_t pme;
+ 
+ 		pme = pte_to_pagemap_entry(pm, vma, addr, ptep_get(pte));
+@@ -2157,7 +2157,7 @@ static int pagemap_hugetlb_range(pte_t *ptep, unsigned long hmask,
+ 		flags |= PM_UFFD_WP;
+ 	}
+ 
+-	for (; addr != end; addr += PAGE_SIZE) {
++	for (; addr != end; addr += MMUPAGE_SIZE) {
+ 		pagemap_entry_t pme = make_pme(frame, flags);
+ 
+ 		err = add_to_pagemap(&pme, pm);
+@@ -2237,7 +2237,7 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
+ 	/* do not disclose physical addresses: attack vector */
+ 	pm.show_pfn = file_ns_capable(file, &init_user_ns, CAP_SYS_ADMIN);
+ 
+-	pm.len = (PAGEMAP_WALK_SIZE >> PAGE_SHIFT);
++	pm.len = (PAGEMAP_WALK_SIZE >> MMUPAGE_SHIFT);
+ 	pm.buffer = kmalloc_array(pm.len, PM_ENTRY_BYTES, GFP_KERNEL);
+ 	ret = -ENOMEM;
+ 	if (!pm.buffer)
+@@ -2249,16 +2249,16 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
+ 
+ 	/* watch out for wraparound */
+ 	start_vaddr = end_vaddr;
+-	if (svpfn <= (ULONG_MAX >> PAGE_SHIFT)) {
++	if (svpfn <= (ULONG_MAX >> MMUPAGE_SHIFT)) {
+ 		unsigned long end;
+ 
+ 		ret = mmap_read_lock_killable(mm);
+ 		if (ret)
+ 			goto out_free;
+-		start_vaddr = untagged_addr_remote(mm, svpfn << PAGE_SHIFT);
++		start_vaddr = untagged_addr_remote(mm, svpfn << MMUPAGE_SHIFT);
+ 		mmap_read_unlock(mm);
+ 
+-		end = start_vaddr + ((count / PM_ENTRY_BYTES) << PAGE_SHIFT);
++		end = start_vaddr + ((count / PM_ENTRY_BYTES) << MMUPAGE_SHIFT);
+ 		if (end >= start_vaddr && end < mm->task_size)
+ 			end_vaddr = end;
+ 	}
+@@ -2979,7 +2979,7 @@ static int pagemap_scan_init_bounce_buffer(struct pagemap_scan_private *p)
+ 	if (!p->arg.vec_len)
+ 		return 0;
+ 
+-	p->vec_buf_len = min_t(size_t, PAGEMAP_WALK_SIZE >> PAGE_SHIFT,
++	p->vec_buf_len = min_t(size_t, PAGEMAP_WALK_SIZE >> MMUPAGE_SHIFT,
+ 			       p->arg.vec_len);
+ 	p->vec_buf = kmalloc_objs(*p->vec_buf, p->vec_buf_len);
+ 	if (!p->vec_buf)
+@@ -3249,7 +3249,7 @@ static int gather_pte_stats(pmd_t *pmd, unsigned long addr,
+ 			continue;
+ 		gather_stats(page, md, pte_dirty(ptent), 1);
+ 
+-	} while (pte++, addr += PAGE_SIZE, addr != end);
++	} while (pte++, addr += MMUPAGE_SIZE, addr != end);
+ 	pte_unmap_unlock(orig_pte, ptl);
+ 	cond_resched();
+ 	return 0;
+diff --git a/include/asm-generic/fixmap.h b/include/asm-generic/fixmap.h
+index 29cab7947980..cb2cb5f35349 100644
+--- a/include/asm-generic/fixmap.h
++++ b/include/asm-generic/fixmap.h
+@@ -18,8 +18,14 @@
+ #include <linux/bug.h>
+ #include <linux/mm_types.h>
+ 
+-#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << PAGE_SHIFT))
+-#define __virt_to_fix(x)	((FIXADDR_TOP - ((x)&PAGE_MASK)) >> PAGE_SHIFT)
++/*
++ * Fixmap slots are spaced at MMUPAGE_SIZE (the hardware MMU page size),
++ * not PAGE_SIZE, because each slot maps a single PTE which addresses
++ * one MMU page.  When PAGE_MMUSHIFT == 0, this is identical to the
++ * original PAGE_SHIFT spacing.
++ */
++#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << MMUPAGE_SHIFT))
++#define __virt_to_fix(x)	((FIXADDR_TOP - ((x)&MMUPAGE_MASK)) >> MMUPAGE_SHIFT)
+ 
+ #ifndef __ASSEMBLY__
+ /*
+@@ -75,7 +81,7 @@ static inline unsigned long virt_to_fix(const unsigned long vaddr)
+ ({									\
+ 	unsigned long ________addr;					\
+ 	__set_fixmap(idx, phys, flags);					\
+-	________addr = fix_to_virt(idx) + ((phys) & (PAGE_SIZE - 1));	\
++	________addr = fix_to_virt(idx) + ((phys) & (MMUPAGE_SIZE - 1));\
+ 	________addr;							\
+ })
+ 
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index fc2acedf0b76..6ab852eea699 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -229,6 +229,12 @@ static inline bool page_range_contiguous(const struct page *page,
+ /* test whether an address (unsigned long or pointer) is aligned to PAGE_SIZE */
+ #define PAGE_ALIGNED(addr)	IS_ALIGNED((unsigned long)(addr), PAGE_SIZE)
+ 
++/* to align the pointer to the (next) MMUPAGE boundary */
++#define MMUPAGE_ALIGN(addr) ALIGN(addr, MMUPAGE_SIZE)
++
++/* test whether an address is aligned to MMUPAGE_SIZE */
++#define MMUPAGE_ALIGNED(addr)	IS_ALIGNED((unsigned long)(addr), MMUPAGE_SIZE)
++
+ /**
+  * folio_page_idx - Return the number of a page in a folio.
+  * @folio: The folio.
+@@ -760,6 +766,62 @@ struct vm_fault {
+ 
+ struct vm_uffd_ops;
+ 
++/*
++ * vma_suboffset - compute the byte offset of a virtual address within
++ * its kernel page, based on the VMA's file offset alignment.
++ *
++ * When PAGE_MMUSHIFT == 0, always returns 0 (no sub-pages).
++ *
++ * When PAGE_MMUSHIFT > 0, the kernel page containing a given virtual
++ * address depends on the alignment of vm_pgoff.  Two addresses in the
++ * same VMA that are PAGE_SIZE apart always land in different kernel pages,
++ * but the boundary between kernel pages is shifted by the VMA's file
++ * offset modulo PAGE_MMUCOUNT.
++ */
++static inline unsigned long vma_suboffset(struct vm_area_struct *vma,
++					  unsigned long address)
++{
++#if PAGE_MMUSHIFT
++	return (((address >> MMUPAGE_SHIFT) - vma->vm_pgoff) &
++		(PAGE_MMUCOUNT - 1)) << MMUPAGE_SHIFT;
++#else
++	return 0;
++#endif
++}
++
++/*
++ * Page cache pgoff conversion helpers for PGCL.
++ *
++ * In PGCL, vma->vm_pgoff is in MMUPAGE-sized units (to support sub-PAGE
++ * mmap offsets), while the page cache indexes folios in PAGE-sized units.
++ * These helpers convert between the two.
++ *
++ * When PAGE_MMUSHIFT == 0, these are identity operations.
++ */
++
++/* Convert page cache index (PAGE-unit) to VMA pgoff (MMUPAGE-unit) */
++static inline pgoff_t pgoff_page_to_mmu(pgoff_t page_pgoff)
++{
++	return page_pgoff << PAGE_MMUSHIFT;
++}
++
++/* Convert VMA pgoff (MMUPAGE-unit) to page cache index (PAGE-unit) */
++static inline pgoff_t pgoff_mmu_to_page(pgoff_t mmu_pgoff)
++{
++	return mmu_pgoff >> PAGE_MMUSHIFT;
++}
++
++/*
++ * Compute the virtual address in a VMA for a page cache pgoff.
++ * Handles the unit mismatch: pgoff is in PAGE units, vm_pgoff is MMUPAGE.
++ */
++static inline unsigned long pgoff_to_vma_addr(
++		const struct vm_area_struct *vma, pgoff_t pgoff)
++{
++	return vma->vm_start +
++		((pgoff << PAGE_SHIFT) - ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT));
++}
++
+ /*
+  * These are the virtual MM functions - opening of an area, closing and
+  * unmapping it (needed to keep files on disk up-to-date etc), pointer
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 31a848485ad9..21b0febaf7c5 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -1065,15 +1065,36 @@ static inline pgoff_t folio_pgoff(const struct folio *folio)
+ 	return folio->index;
+ }
+ 
++/*
++ * With PAGE_MMUSHIFT > 0 (larpage), vm_pgoff is in MMUPAGE-sized units
++ * so that file-backed mappings preserve sub-PAGE offset granularity.
++ * This function returns the MMUPAGE-unit pgoff for a given address.
++ */
+ static inline pgoff_t linear_page_index(const struct vm_area_struct *vma,
+ 					const unsigned long address)
+ {
+ 	pgoff_t pgoff;
+-	pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
++	pgoff = (address - vma->vm_start) >> MMUPAGE_SHIFT;
+ 	pgoff += vma->vm_pgoff;
+ 	return pgoff;
+ }
+ 
++/*
++ * Convert MMUPAGE-unit pgoff to page cache index (PAGE-sized units).
++ */
++static inline pgoff_t pgoff_to_page_cache_index(pgoff_t pgoff)
++{
++	return pgoff >> PAGE_MMUSHIFT;
++}
++
++/*
++ * Return the sub-MMUPAGE index within a PAGE for a given MMUPAGE pgoff.
++ */
++static inline unsigned int pgoff_sub_page_index(pgoff_t pgoff)
++{
++	return pgoff & (PAGE_MMUCOUNT - 1);
++}
++
+ struct wait_page_key {
+ 	struct folio *folio;
+ 	int bit_nr;
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index cdd68ed3ae1a..7c4d6a49a1ca 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -47,7 +47,7 @@
+ 
+ static inline unsigned long pte_index(unsigned long address)
+ {
+-	return (address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
++	return (address >> MMUPAGE_SHIFT) & (PTRS_PER_PTE - 1);
+ }
+ 
+ #ifndef pmd_index
+@@ -1020,6 +1020,42 @@ static inline pte_t pte_mkwrite(pte_t pte, struct vm_area_struct *vma)
+ }
+ #endif
+ 
++/*
++ * pte_mksub - adjust a PTE to address a sub-page (MMU page) within a
++ * kernel page.  offset is in bytes, always a multiple of MMUPAGE_SIZE.
++ * When PAGE_MMUSHIFT == 0, this is a no-op (offset is always 0).
++ * Architectures should override this if their PTE format requires
++ * special handling.
++ */
++#ifndef pte_mksub
++static inline pte_t pte_mksub(pte_t pte, unsigned long offset)
++{
++#if PAGE_MMUSHIFT
++	return __pte(pte_val(pte) + offset);
++#else
++	return pte;
++#endif
++}
++#define pte_mksub pte_mksub
++#endif
++
++/*
++ * pte_suboffset - extract the sub-page byte offset from a PTE.
++ * Returns the offset of the addressed MMU page within its kernel page.
++ * When PAGE_MMUSHIFT == 0, always returns 0.
++ */
++#ifndef pte_suboffset
++static inline unsigned long pte_suboffset(pte_t pte)
++{
++#if PAGE_MMUSHIFT
++	return (pte_val(pte) & (PAGE_SIZE - 1)) & MMUPAGE_MASK;
++#else
++	return 0;
++#endif
++}
++#define pte_suboffset pte_suboffset
++#endif
++
+ #if defined(CONFIG_ARCH_WANT_PMD_MKWRITE) && !defined(pmd_mkwrite)
+ static inline pmd_t pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma)
+ {
+diff --git a/include/linux/pte_cluster.h b/include/linux/pte_cluster.h
+new file mode 100644
+index 000000000000..051766f7b401
+--- /dev/null
++++ b/include/linux/pte_cluster.h
+@@ -0,0 +1,532 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_PTE_CLUSTER_H
++#define _LINUX_PTE_CLUSTER_H
++
++/*
++ * include/linux/pte_cluster.h
++ *
++ * Translated from include/linux/folio.h by Hugh Dickins hugh@veritas.com
++ * 31may01 to modern (6.x) kernel APIs.
++ *
++ * Original naming used "folio" which now conflicts with struct folio
++ * (compound page abstraction, 5.16+). Renamed to "pte_cluster".
++ *
++ * This header is intended for inclusion in mm/memory.c alone.
++ * It provides functions for the fault handlers do_fault(),
++ * do_anonymous_page(), do_swap_page() and do_wp_page().
++ *
++ * On a standard system (PAGE_MMUSHIFT == 0), these functions are
++ * trivial.  On a system with page clustering (PAGE_MMUSHIFT != 0),
++ * they manage the awkwardness of presenting small MMUPAGE_SIZE pages
++ * to user programs from a kernel pool of large PAGE_SIZE pages.
++ *
++ * Shared file mappings present little problem, but without this
++ * treatment, private mappings might quickly degenerate into needing
++ * one PAGE_SIZE page to support each MMUPAGE_SIZE mapping.
++ */
++
++#include <linux/mm.h>
++#include <linux/pgtable.h>
++#include <linux/swap.h>
++#include <linux/swapops.h>
++#include <linux/highmem.h>
++
++#if PAGE_MMUSHIFT
++
++/*
++ * Test whether pte2 indicates the same page as pte1.
++ */
++static inline int pte_cluster_match(pte_t *pte1, pte_t *pte2)
++{
++	if (pte_none(*pte1))
++		return pte_none(*pte2);
++	if (pte_present(*pte1)) {
++		if (!pte_present(*pte2))
++			return 0;
++		return pte_page(*pte2) == pte_page(*pte1);
++	}
++	if (pte_none(*pte2) || pte_present(*pte2))
++		return 0;
++	return __pte_to_swp_entry(*pte2).val == __pte_to_swp_entry(*pte1).val;
++}
++
++/*
++ * Test whether nearby vma2 could ever share a private page with vma1.
++ */
++static inline int vma_neighbourly(struct vm_area_struct *vma1,
++				  struct vm_area_struct *vma2)
++{
++	if ((vma1->vm_flags | vma2->vm_flags) & VM_MAYSHARE)
++		return 0;
++	if ((((vma1->vm_start - vma2->vm_start) >> MMUPAGE_SHIFT) -
++	      (vma1->vm_pgoff - vma2->vm_pgoff)) & (PAGE_MMUCOUNT - 1))
++		return 0;
++	return 1;
++}
++
++/*
++ * Prepare pte_cluster of page table pointers for the fault handlers.
++ *
++ * Walks the page table to fill in an array of PTE pointers for all
++ * MMU pages within the kernel page containing 'address'.  Entries
++ * that fall outside the VMA (or outside the page table) are set to
++ * NULL.  When 'wide' is set, neighbouring VMAs that could share a
++ * private page are included.
++ *
++ * Modern port notes:
++ * - Uses 5-level page tables (pgd -> p4d -> pud -> pmd -> pte)
++ * - Uses pte_offset_map() / pte_unmap() instead of raw pte_offset()
++ * - Uses find_vma() and VMA iteration via vma_next()
++ *
++ * Returns nonzero if the page_table_lock was not held throughout
++ * (requiring a re-call after re-acquiring the lock).
++ */
++static __maybe_unused int prepare_pte_cluster(pte_t *cluster[],
++	struct vm_area_struct *vma,
++	unsigned long address, pte_t *ptep, int wide)
++{
++	struct vm_area_struct *vmp;
++	unsigned long suboffset;
++	unsigned long base, addr;
++	int subnr, ptenr;
++	int j, limit;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *mapped_pte;
++	int reprep = 0;
++
++	suboffset = vma_suboffset(vma, address);
++	base = (address - suboffset) & MMUPAGE_MASK;
++	subnr = suboffset >> MMUPAGE_SHIFT;
++	ptenr = (address & ~PMD_MASK) >> MMUPAGE_SHIFT;
++
++	/* First approximation: set full vector of probable pteps */
++	ptep -= subnr;
++	for (j = 0; j < PAGE_MMUCOUNT; j++)
++		cluster[j] = ptep + j;
++	j = 0;
++
++	/* Second approximation: wipe pteps which don't belong to vma;
++	 * but if wide, include neighbouring vmas perhaps sharing page.
++	 */
++	addr = base;
++	if (addr > TASK_SIZE) {	/* wrapped */
++		for (; addr > TASK_SIZE; addr += MMUPAGE_SIZE, j++)
++			cluster[j] = NULL;
++	}
++	if (addr < vma->vm_start) {
++		if (wide) {
++			for (vmp = find_vma(vma->vm_mm, addr);
++			     vmp && vmp != vma;
++			     vmp = find_vma(vma->vm_mm, addr)) {
++				for (; addr < vmp->vm_start;
++				     addr += MMUPAGE_SIZE, j++)
++					cluster[j] = NULL;
++				if (vma_neighbourly(vma, vmp)) {
++					j += (min(vmp->vm_end,
++						  vma->vm_start) - addr)
++						>> MMUPAGE_SHIFT;
++					addr = min(vmp->vm_end, vma->vm_start);
++				} else {
++					addr = vmp->vm_end;
++				}
++				if (addr >= vma->vm_start)
++					break;
++			}
++		}
++		for (; addr < vma->vm_start; addr += MMUPAGE_SIZE, j++)
++			cluster[j] = NULL;
++	}
++	if (vma->vm_end < base + PAGE_SIZE) {
++		j = (vma->vm_end - base) >> MMUPAGE_SHIFT;
++		if (wide) {
++			addr = vma->vm_end;
++			vmp = find_vma(vma->vm_mm, addr);
++			while (vmp && vmp->vm_start < base + PAGE_SIZE) {
++				for (; addr < vmp->vm_start;
++				     addr += MMUPAGE_SIZE, j++)
++					cluster[j] = NULL;
++				if (vma_neighbourly(vma, vmp)) {
++					unsigned long end = min(vmp->vm_end,
++							base + PAGE_SIZE);
++					j += (end - addr) >> MMUPAGE_SHIFT;
++					addr = end;
++				} else {
++					addr = vmp->vm_end;
++				}
++				if (addr >= base + PAGE_SIZE)
++					break;
++				vmp = find_vma(vma->vm_mm, addr);
++			}
++		}
++		for (; j < PAGE_MMUCOUNT; j++)
++			cluster[j] = NULL;
++	}
++
++	/* Third approximation: fix pteps to page table below or above.
++	 *
++	 * If the kernel page spans a page table boundary (the cluster
++	 * entries straddle two different PTE pages), we need to walk
++	 * the page tables to find the other PTE page.
++	 */
++	if (subnr > ptenr) {
++		limit = subnr - ptenr;
++		for (j = 0; !cluster[j]; j++)
++			;
++		if (j < limit) {
++			mapped_pte = NULL;
++			pgd = pgd_offset(vma->vm_mm, base);
++			if (!pgd_none(*pgd) && !pgd_bad(*pgd)) {
++				p4d = p4d_offset(pgd, base);
++				if (!p4d_none(*p4d) && !p4d_bad(*p4d)) {
++					pud = pud_offset(p4d, base);
++					if (!pud_none(*pud) && !pud_bad(*pud)) {
++						pmd = pmd_offset(pud, base);
++						if (!pmd_none(*pmd) &&
++						    !pmd_bad(*pmd))
++							mapped_pte = pte_offset_map(pmd, base);
++					}
++				}
++			}
++			if (mapped_pte) {
++				for (; j < limit; j++) {
++					if (cluster[j])
++						cluster[j] = mapped_pte + j;
++				}
++				pte_unmap(mapped_pte);
++			} else {
++				for (; j < limit; j++)
++					cluster[j] = NULL;
++				reprep = 1;
++			}
++		}
++	}
++	if (ptenr > subnr + PTRS_PER_PTE - PAGE_MMUCOUNT) {
++		j = subnr + PTRS_PER_PTE - ptenr;
++		for (limit = PAGE_MMUCOUNT; !cluster[limit-1]; limit--)
++			;
++		if (j < limit) {
++			mapped_pte = NULL;
++			base += PAGE_SIZE;
++			pgd = pgd_offset(vma->vm_mm, base);
++			if (!pgd_none(*pgd) && !pgd_bad(*pgd)) {
++				p4d = p4d_offset(pgd, base);
++				if (!p4d_none(*p4d) && !p4d_bad(*p4d)) {
++					pud = pud_offset(p4d, base);
++					if (!pud_none(*pud) && !pud_bad(*pud)) {
++						pmd = pmd_offset(pud, base);
++						if (!pmd_none(*pmd) &&
++						    !pmd_bad(*pmd))
++							mapped_pte = pte_offset_map(pmd, base);
++					}
++				}
++			}
++			if (mapped_pte) {
++				mapped_pte -= PAGE_MMUCOUNT;
++				for (; j < limit; j++) {
++					if (cluster[j])
++						cluster[j] = mapped_pte + j;
++				}
++				pte_unmap(mapped_pte + PAGE_MMUCOUNT);
++			} else {
++				for (; j < limit; j++)
++					cluster[j] = NULL;
++				reprep = 1;
++			}
++		}
++	}
++	return reprep;	/* needs recall if page_table_lock dropped */
++}
++
++/*
++ * Check if the wide cluster already has a private page allocated to it.
++ *
++ * This examines all the PTE entries in the cluster to see if they
++ * already reference a private page (one not shared with other processes).
++ * If found, the existing page can be reused instead of allocating a new one.
++ *
++ * swap_page: the page being swapped in (for do_swap_page), or NULL.
++ */
++static __maybe_unused struct page *private_cluster_page(pte_t *cluster[],
++					 struct page *swap_page)
++{
++	struct page *page;
++	struct folio *folio;
++	swp_entry_t entry;
++	pte_t swap_pte;
++	int fcount, pcount, scount, tcount;
++	int i, j;
++
++	for (j = PAGE_MMUCOUNT - 1; !cluster[j]; j--)
++		;
++	fcount = j + 1;
++
++	/*
++	 * The easiest way to handle the do_swap_page() case is
++	 * to make up one extra element on the end of the cluster:
++	 * typically all the cluster entries will be swapped out,
++	 * and we need one present page to make sense of them.
++	 */
++	if (swap_page) {
++		swap_pte = mk_pte(swap_page, PAGE_KERNEL);
++		cluster[fcount] = &swap_pte;
++		fcount++;
++	}
++
++	j = 0;
++	while (j < fcount) {
++		if (!cluster[j] || !pte_present(*cluster[j])) {
++			j++;
++			continue;
++		}
++		tcount = 1;
++		page = pte_page(*cluster[j]);
++		while (++j < fcount) {
++			if (!cluster[j] || !pte_present(*cluster[j]))
++				continue;
++			if (pte_page(*cluster[j]) != page)
++				break;
++			tcount++;
++		}
++		if (PageReserved(page))
++			continue;
++		folio = page_folio(page);
++		if (folio_test_swapcache(folio)) {
++			if (page != swap_page) {
++				if (!folio_trylock(folio))
++					continue;
++				if (!folio_test_swapcache(folio)) {
++					folio_unlock(folio);
++					continue;
++				}
++			}
++			entry = folio->swap;
++			pcount = page_count(page) - 1;	/* omit swap cache */
++			scount = swp_swapcount(entry) - 1; /* omit swap cache */
++			if (page != swap_page)
++				folio_unlock(folio);
++			if (pcount + scount > fcount)
++				continue;
++		} else {
++			if (folio->mapping)
++				continue;
++			pcount = page_count(page);
++			scount = 0;
++		}
++		pcount -= tcount;
++		if (j + pcount > fcount)
++			continue;
++		for (i = j + 1; pcount && i < fcount; i++) {
++			if (!cluster[i] || !pte_present(*cluster[i]))
++				continue;
++			if (pte_page(*cluster[i]) == page)
++				pcount--;
++		}
++		if (pcount)
++			continue;
++		for (i = 0; scount && i < fcount; i++) {
++			if (!cluster[i] || pte_present(*cluster[i]))
++				continue;
++			if (__pte_to_swp_entry(*cluster[i]).val == entry.val)
++				scount--;
++		}
++		if (scount)
++			continue;
++		return page;
++	}
++	return NULL;
++}
++
++/*
++ * Replace page just allocated by private cluster page if it has one.
++ */
++static inline struct page *private_cluster_page_xchg(pte_t *cluster[],
++						     struct page *new_page)
++{
++	struct page *cluster_page = private_cluster_page(cluster, NULL);
++
++	if (!cluster_page)
++		return new_page;
++	put_page(new_page);
++	get_page(cluster_page);
++	return cluster_page;
++}
++
++/*
++ * Limit cluster to page table entries of this vma matching this *ptep.
++ */
++static __maybe_unused void restrict_pte_cluster(pte_t *cluster[],
++	struct vm_area_struct *vma,
++	unsigned long address, pte_t *ptep)
++{
++	unsigned long addr;
++	int j;
++
++	addr = address - vma_suboffset(vma, address);
++	for (j = 0; j < PAGE_MMUCOUNT; j++, addr += MMUPAGE_SIZE) {
++		if (!cluster[j])
++			continue;
++		if (addr < vma->vm_start || addr >= vma->vm_end ||
++		    !pte_cluster_match(cluster[j], ptep))
++			cluster[j] = NULL;
++	}
++}
++
++/*
++ * Copy (or clear) cluster of mmupages from src_page to dst_page.
++ *
++ * Uses kmap_local_page() (modern replacement for kmap/kunmap).
++ * For the zero page case, uses memset to clear.
++ */
++static __maybe_unused void copy_pte_cluster(pte_t *cluster[],
++	struct page *dst_page,
++	struct page *src_page, unsigned long address)
++{
++	char *src, *dst;
++	unsigned int size;
++	unsigned int offset = 0;
++	int j = 0;
++
++	dst = kmap_local_page(dst_page);
++	src = (src_page != ZERO_PAGE(address)) ?
++		kmap_local_page(src_page) : NULL;
++
++	while (j < PAGE_MMUCOUNT) {
++		if (!cluster[j]) {
++			offset += MMUPAGE_SIZE;
++			j++;
++			continue;
++		}
++		size = MMUPAGE_SIZE;
++		while (++j < PAGE_MMUCOUNT) {
++			if (!cluster[j])
++				break;
++			size += MMUPAGE_SIZE;
++		}
++		if (src)
++			memcpy(dst + offset, src + offset, size);
++		else
++			memset(dst + offset, 0, size);
++		offset += size;
++	}
++	if (src)
++		kunmap_local(src);
++	kunmap_local(dst);
++}
++
++/*
++ * Update page table entries of the cluster, counting how many done.
++ */
++static inline unsigned long set_pte_cluster(pte_t *cluster[], pte_t pte)
++{
++	unsigned long offset = 0;
++	unsigned long rss = 0;
++	int j;
++
++	for (j = 0; j < PAGE_MMUCOUNT; j++, offset += MMUPAGE_SIZE) {
++		if (!cluster[j])
++			continue;
++		set_pte(cluster[j], pte_mksub(pte, offset));
++		rss++;
++	}
++	return rss;
++}
++
++/*
++ * Flush TLB entries for the cluster (if ptes were present before).
++ */
++static inline void flush_pte_cluster(pte_t *cluster[],
++	struct vm_area_struct *vma, unsigned long address)
++{
++	unsigned long start, end;
++	int j;
++
++	start = (address - vma_suboffset(vma, address)) & MMUPAGE_MASK;
++	end = start + PAGE_SIZE;
++	for (j = 0; !cluster[j]; j++)
++		start += MMUPAGE_SIZE;
++	for (j = PAGE_MMUCOUNT - 1; !cluster[j]; j--)
++		end -= MMUPAGE_SIZE;
++	flush_tlb_range(vma, start, end);
++}
++
++#define adjust_page_ref_count(page, extra) \
++	page_ref_add(page, extra)
++
++#else  /* PAGE_MMUSHIFT 0 */
++
++static inline int prepare_pte_cluster(pte_t *cluster[],
++	struct vm_area_struct *vma,
++	unsigned long address, pte_t *ptep, int wide)
++{
++	cluster[0] = ptep;
++	return 0;
++}
++
++/*
++ * Calling convention different if !PAGE_MMUSHIFT: page always passed in.
++ *
++ * Check if this is a private page that can be reused for COW.
++ */
++static inline struct page *private_cluster_page(pte_t *cluster[],
++						struct page *page)
++{
++	struct folio *folio = page_folio(page);
++	int doing_wp = pte_present(*cluster[0]);
++	int count;
++
++	if (PageReserved(page))
++		return NULL;
++	if (folio_test_swapcache(folio)) {
++		if (doing_wp) {
++			if (!folio_trylock(folio))
++				return NULL;
++			if (!folio_test_swapcache(folio)) {
++				folio_unlock(folio);
++				return NULL;
++			}
++		}
++		count = page_count(page) + swp_swapcount(folio->swap) - 3;
++		if (doing_wp)
++			folio_unlock(folio);
++		else
++			count--;	/* swap not yet freed */
++	} else {
++		count = page_count(page) - 1;
++	}
++	return count ? NULL : page;
++}
++
++#define private_cluster_page_xchg(cluster, new_page) \
++	(new_page)
++
++#define restrict_pte_cluster(cluster, vma, address, ptep) \
++	do {} while (0)
++
++static inline void copy_pte_cluster(pte_t *cluster[], struct page *dst_page,
++	struct page *src_page, unsigned long address)
++{
++	if (src_page == ZERO_PAGE(address)) {
++		clear_highpage(dst_page);
++	} else {
++		copy_highpage(dst_page, src_page);
++	}
++}
++
++static inline unsigned long set_pte_cluster(pte_t *cluster[], pte_t pte)
++{
++	set_pte(cluster[0], pte);
++	return 1;
++}
++
++#define flush_pte_cluster(cluster, vma, address) \
++	flush_tlb_page((vma), (address))
++
++#define adjust_page_ref_count(page, extra) \
++	do {} while (0)
++
++#endif /* PAGE_MMUSHIFT 0 */
++
++#endif /* _LINUX_PTE_CLUSTER_H */
+diff --git a/include/vdso/datapage.h b/include/vdso/datapage.h
+index 5977723fb3b5..9d2cf8928431 100644
+--- a/include/vdso/datapage.h
++++ b/include/vdso/datapage.h
+@@ -164,8 +164,8 @@ extern struct vdso_time_data *vdso_k_time_data;
+ extern struct vdso_rng_data *vdso_k_rng_data;
+ extern struct vdso_arch_data *vdso_k_arch_data;
+ 
+-#define VDSO_ARCH_DATA_SIZE ALIGN(sizeof(struct vdso_arch_data), PAGE_SIZE)
+-#define VDSO_ARCH_DATA_PAGES (VDSO_ARCH_DATA_SIZE >> PAGE_SHIFT)
++#define VDSO_ARCH_DATA_SIZE ALIGN(sizeof(struct vdso_arch_data), MMUPAGE_SIZE)
++#define VDSO_ARCH_DATA_PAGES (VDSO_ARCH_DATA_SIZE >> MMUPAGE_SHIFT)
+ 
+ enum vdso_pages {
+ 	VDSO_TIME_PAGE_OFFSET,
+diff --git a/include/vdso/page.h b/include/vdso/page.h
+index bc47186c07fc..f898f2fbe0a1 100644
+--- a/include/vdso/page.h
++++ b/include/vdso/page.h
+@@ -5,25 +5,43 @@
+ #include <uapi/linux/const.h>
+ 
+ /*
+- * PAGE_SHIFT determines the page size.
++ * MMUPAGE_SHIFT is the hardware MMU page shift (from arch Kconfig).
++ * PAGE_MMUSHIFT is the extra shift for page clustering (Hugh Dickins, 2001).
++ * PAGE_SHIFT = MMUPAGE_SHIFT + PAGE_MMUSHIFT.
+  *
+- * Note: This definition is required because PAGE_SHIFT is used
+- * in several places throughout the codebase.
++ * When PAGE_MMUSHIFT == 0 (default), PAGE_SIZE == MMUPAGE_SIZE and the
++ * kernel behaves identically to a stock configuration.
++ *
++ * When PAGE_MMUSHIFT > 0, the kernel allocates memory in PAGE_SIZE
++ * chunks but maps individual MMUPAGE_SIZE PTEs to userspace, preserving
++ * the standard TLB/MMU base page ABI.
+  */
+-#define PAGE_SHIFT      CONFIG_PAGE_SHIFT
++#define MMUPAGE_SHIFT	CONFIG_PAGE_SHIFT
++#define PAGE_MMUSHIFT	CONFIG_PAGE_MMUSHIFT
++#define PAGE_MMUCOUNT	(_AC(1,UL) << PAGE_MMUSHIFT)
++
++#define MMUPAGE_SIZE	(_AC(1,UL) << MMUPAGE_SHIFT)
++
++#if !defined(CONFIG_64BIT)
++#define MMUPAGE_MASK	(~((1 << MMUPAGE_SHIFT) - 1))
++#else
++#define MMUPAGE_MASK	(~(MMUPAGE_SIZE - 1))
++#endif
++
++#define PAGE_SHIFT	(MMUPAGE_SHIFT + PAGE_MMUSHIFT)
+ 
+-#define PAGE_SIZE	(_AC(1,UL) << CONFIG_PAGE_SHIFT)
++#define PAGE_SIZE	(_AC(1,UL) << PAGE_SHIFT)
+ 
+ #if !defined(CONFIG_64BIT)
+ /*
+  * Applies only to 32-bit architectures.
+  *
+- * Subtle: (1 << CONFIG_PAGE_SHIFT) is an int, not an unsigned long.
++ * Subtle: (1 << PAGE_SHIFT) is an int, not an unsigned long.
+  * So if we assign PAGE_MASK to a larger type it gets extended the
+  * way we want (i.e. with 1s in the high bits) while masking a
+  * 64-bit value such as phys_addr_t.
+  */
+-#define PAGE_MASK	(~((1 << CONFIG_PAGE_SHIFT) - 1))
++#define PAGE_MASK	(~((1 << PAGE_SHIFT) - 1))
+ #else
+ #define PAGE_MASK	(~(PAGE_SIZE - 1))
+ #endif
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index da3d328f5c15..2b7887f83cba 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -201,7 +201,7 @@ static void stack_map_get_build_id_offset(struct bpf_stack_build_id *id_offs,
+ 			continue;
+ 		}
+ build_id_valid:
+-		id_offs[i].offset = (vma->vm_pgoff << PAGE_SHIFT) + ip - vma->vm_start;
++		id_offs[i].offset = (vma->vm_pgoff << MMUPAGE_SHIFT) + ip - vma->vm_start;
+ 		id_offs[i].status = BPF_STACK_BUILD_ID_VALID;
+ 		prev_vma = vma;
+ 		prev_build_id = id_offs[i].build_id;
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 7935d5663944..6a8b9d3cbe1f 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7366,7 +7366,7 @@ static int perf_mmap_aux(struct vm_area_struct *vma, struct perf_event *event,
+ 	if (aux_offset < perf_data_size(rb) + PAGE_SIZE)
+ 		return -EINVAL;
+ 
+-	if (aux_offset != vma->vm_pgoff << PAGE_SHIFT)
++	if (aux_offset != vma->vm_pgoff << MMUPAGE_SHIFT)
+ 		return -EINVAL;
+ 
+ 	/* already mapped with a different offset */
+@@ -9856,7 +9856,7 @@ static bool perf_addr_filter_vma_adjust(struct perf_addr_filter *filter,
+ 					struct perf_addr_filter_range *fr)
+ {
+ 	unsigned long vma_size = vma->vm_end - vma->vm_start;
+-	unsigned long off = vma->vm_pgoff << PAGE_SHIFT;
++	unsigned long off = vma->vm_pgoff << MMUPAGE_SHIFT;
+ 	struct file *file = vma->vm_file;
+ 
+ 	if (!perf_addr_filter_match(filter, file, off, vma_size))
+@@ -9946,7 +9946,7 @@ void perf_event_mmap(struct vm_area_struct *vma)
+ 			/* .tid */
+ 			.start  = vma->vm_start,
+ 			.len    = vma->vm_end - vma->vm_start,
+-			.pgoff  = (u64)vma->vm_pgoff << PAGE_SHIFT,
++			.pgoff  = (u64)vma->vm_pgoff << MMUPAGE_SHIFT,
+ 		},
+ 		/* .maj (attr_mmap2 only) */
+ 		/* .min (attr_mmap2 only) */
+diff --git a/kernel/events/ring_buffer.c b/kernel/events/ring_buffer.c
+index 9fe92161715e..e53359f06000 100644
+--- a/kernel/events/ring_buffer.c
++++ b/kernel/events/ring_buffer.c
+@@ -806,13 +806,13 @@ void rb_free_aux(struct perf_buffer *rb)
+ static struct page *
+ __perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
+ {
+-	if (pgoff > rb->nr_pages)
++	if (pgoff > (unsigned long)rb->nr_pages << PAGE_MMUSHIFT)
+ 		return NULL;
+ 
+-	if (pgoff == 0)
++	if (pgoff < PAGE_MMUCOUNT)
+ 		return virt_to_page(rb->user_page);
+ 
+-	return virt_to_page(rb->data_pages[pgoff - 1]);
++	return virt_to_page(rb->data_pages[(pgoff >> PAGE_MMUSHIFT) - 1]);
+ }
+ 
+ static void *perf_mmap_alloc_page(int cpu)
+@@ -896,10 +896,10 @@ static struct page *
+ __perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
+ {
+ 	/* The '>' counts in the user page. */
+-	if (pgoff > data_page_nr(rb))
++	if (pgoff > (unsigned long)data_page_nr(rb) << PAGE_MMUSHIFT)
+ 		return NULL;
+ 
+-	return vmalloc_to_page((void *)rb->user_page + pgoff * PAGE_SIZE);
++	return vmalloc_to_page((void *)rb->user_page + pgoff * MMUPAGE_SIZE);
+ }
+ 
+ static void rb_free_work(struct work_struct *work)
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index 4084e926e284..a63256171a36 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -144,12 +144,12 @@ static bool valid_vma(struct vm_area_struct *vma, bool is_register)
+ 
+ static unsigned long offset_to_vaddr(struct vm_area_struct *vma, loff_t offset)
+ {
+-	return vma->vm_start + offset - ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
++	return vma->vm_start + offset - ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ }
+ 
+ static loff_t vaddr_to_offset(struct vm_area_struct *vma, unsigned long vaddr)
+ {
+-	return ((loff_t)vma->vm_pgoff << PAGE_SHIFT) + (vaddr - vma->vm_start);
++	return ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT) + (vaddr - vma->vm_start);
+ }
+ 
+ /**
+@@ -1482,7 +1482,7 @@ static int unapply_uprobe(struct uprobe *uprobe, struct mm_struct *mm)
+ 		    file_inode(vma->vm_file) != uprobe->inode)
+ 			continue;
+ 
+-		offset = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
++		offset = (loff_t)vma->vm_pgoff << MMUPAGE_SHIFT;
+ 		if (uprobe->offset <  offset ||
+ 		    uprobe->offset >= offset + vma->vm_end - vma->vm_start)
+ 			continue;
+@@ -2453,7 +2453,7 @@ static struct uprobe *find_active_uprobe_speculative(unsigned long bp_vaddr)
+ 	if (!vm_file)
+ 		return NULL;
+ 
+-	offset = (loff_t)(vma->vm_pgoff << PAGE_SHIFT) + (bp_vaddr - vma->vm_start);
++	offset = (loff_t)(vma->vm_pgoff << MMUPAGE_SHIFT) + (bp_vaddr - vma->vm_start);
+ 	uprobe = find_uprobe_rcu(vm_file->f_inode, offset);
+ 	if (!uprobe)
+ 		return NULL;
+diff --git a/kernel/relay.c b/kernel/relay.c
+index 62b059ff2759..4b415f682b71 100644
+--- a/kernel/relay.c
++++ b/kernel/relay.c
+@@ -38,7 +38,7 @@ static vm_fault_t relay_buf_fault(struct vm_fault *vmf)
+ 	if (!buf)
+ 		return VM_FAULT_OOM;
+ 
+-	page = vmalloc_to_page(buf->start + (pgoff << PAGE_SHIFT));
++	page = vmalloc_to_page(buf->start + (pgoff << MMUPAGE_SHIFT));
+ 	if (!page)
+ 		return VM_FAULT_SIGBUS;
+ 	get_page(page);
+diff --git a/lib/vdso/datastore.c b/lib/vdso/datastore.c
+index 17d37b82ebc6..caa3fe46ea61 100644
+--- a/lib/vdso/datastore.c
++++ b/lib/vdso/datastore.c
+@@ -127,7 +127,7 @@ const struct vm_special_mapping vdso_vvar_mapping = {
+ 
+ struct vm_area_struct *vdso_install_vvar_mapping(struct mm_struct *mm, unsigned long addr)
+ {
+-	return _install_special_mapping(mm, addr, VDSO_NR_PAGES * PAGE_SIZE,
++	return _install_special_mapping(mm, addr, VDSO_NR_PAGES * MMUPAGE_SIZE,
+ 					VM_READ | VM_MAYREAD | VM_IO | VM_DONTDUMP |
+ 					VM_MIXEDMAP | VM_SEALED_SYSMAP,
+ 					&vdso_vvar_mapping);
+diff --git a/mm/early_ioremap.c b/mm/early_ioremap.c
+index 96c29b9dc85d..fa8ee634cb47 100644
+--- a/mm/early_ioremap.c
++++ b/mm/early_ioremap.c
+@@ -134,16 +134,16 @@ __early_ioremap(resource_size_t phys_addr, unsigned long size, pgprot_t prot)
+ 
+ 	prev_size[slot] = size;
+ 	/*
+-	 * Mappings have to be page-aligned
++	 * Mappings have to be MMU-page-aligned (hardware page size)
+ 	 */
+-	offset = offset_in_page(phys_addr);
+-	phys_addr &= PAGE_MASK;
+-	size = PAGE_ALIGN(last_addr + 1) - phys_addr;
++	offset = phys_addr & ~MMUPAGE_MASK;
++	phys_addr &= MMUPAGE_MASK;
++	size = ALIGN(last_addr + 1, MMUPAGE_SIZE) - phys_addr;
+ 
+ 	/*
+ 	 * Mappings have to fit in the FIX_BTMAP area.
+ 	 */
+-	nrpages = size >> PAGE_SHIFT;
++	nrpages = size >> MMUPAGE_SHIFT;
+ 	if (WARN_ON(nrpages > NR_FIX_BTMAPS))
+ 		return NULL;
+ 
+@@ -159,7 +159,7 @@ __early_ioremap(resource_size_t phys_addr, unsigned long size, pgprot_t prot)
+ 			__late_set_fixmap(idx, phys_addr, prot);
+ 		else
+ 			__early_set_fixmap(idx, phys_addr, prot);
+-		phys_addr += PAGE_SIZE;
++		phys_addr += MMUPAGE_SIZE;
+ 		--idx;
+ 		--nrpages;
+ 	}
+@@ -199,8 +199,8 @@ void __init early_iounmap(void __iomem *addr, unsigned long size)
+ 	if (WARN_ON(virt_addr < fix_to_virt(FIX_BTMAP_BEGIN)))
+ 		return;
+ 
+-	offset = offset_in_page(virt_addr);
+-	nrpages = PAGE_ALIGN(offset + size) >> PAGE_SHIFT;
++	offset = virt_addr & ~MMUPAGE_MASK;
++	nrpages = ALIGN(offset + size, MMUPAGE_SIZE) >> MMUPAGE_SHIFT;
+ 
+ 	idx = FIX_BTMAP_BEGIN - NR_FIX_BTMAPS*slot;
+ 	while (nrpages > 0) {
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 4e636647100c..8b3cd21a2c6e 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3308,7 +3308,9 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+ 	struct file *file = vmf->vma->vm_file;
+ 	struct file_ra_state *ra = &file->f_ra;
+ 	struct address_space *mapping = file->f_mapping;
+-	DEFINE_READAHEAD(ractl, file, ra, mapping, vmf->pgoff);
++	/* vmf->pgoff is in MMUPAGE units; readahead uses PAGE-unit indices */
++	pgoff_t pgoff_pages = vmf->pgoff >> PAGE_MMUSHIFT;
++	DEFINE_READAHEAD(ractl, file, ra, mapping, pgoff_pages);
+ 	struct file *fpin = NULL;
+ 	vm_flags_t vm_flags = vmf->vma->vm_flags;
+ 	bool force_thp_readahead = false;
+@@ -3380,12 +3382,13 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+ 		 * of memory.
+ 		 */
+ 		struct vm_area_struct *vma = vmf->vma;
+-		unsigned long start = vma->vm_pgoff;
++		/* Convert MMUPAGE-unit vm_pgoff to PAGE units for readahead */
++		unsigned long start = vma->vm_pgoff >> PAGE_MMUSHIFT;
+ 		unsigned long end = start + vma_pages(vma);
+ 		unsigned long ra_end;
+ 
+ 		ra->order = exec_folio_order();
+-		ra->start = round_down(vmf->pgoff, 1UL << ra->order);
++		ra->start = round_down(pgoff_pages, 1UL << ra->order);
+ 		ra->start = max(ra->start, start);
+ 		ra_end = round_up(ra->start + ra->ra_pages, 1UL << ra->order);
+ 		ra_end = min(ra_end, end);
+@@ -3395,7 +3398,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+ 		/*
+ 		 * mmap read-around
+ 		 */
+-		ra->start = max_t(long, 0, vmf->pgoff - ra->ra_pages / 2);
++		ra->start = max_t(long, 0, pgoff_pages - ra->ra_pages / 2);
+ 		ra->size = ra->ra_pages;
+ 		ra->async_size = ra->ra_pages / 4;
+ 		ra->order = 0;
+@@ -3417,7 +3420,9 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
+ {
+ 	struct file *file = vmf->vma->vm_file;
+ 	struct file_ra_state *ra = &file->f_ra;
+-	DEFINE_READAHEAD(ractl, file, ra, file->f_mapping, vmf->pgoff);
++	/* vmf->pgoff is in MMUPAGE units; readahead uses PAGE-unit indices */
++	DEFINE_READAHEAD(ractl, file, ra, file->f_mapping,
++			 vmf->pgoff >> PAGE_MMUSHIFT);
+ 	struct file *fpin = NULL;
+ 	unsigned short mmap_miss;
+ 
+@@ -3517,7 +3522,12 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
+ 	struct file *fpin = NULL;
+ 	struct address_space *mapping = file->f_mapping;
+ 	struct inode *inode = mapping->host;
+-	pgoff_t max_idx, index = vmf->pgoff;
++	/*
++	 * vmf->pgoff is in MMUPAGE units.  Convert to PAGE units for
++	 * page cache lookups.  Keep the MMUPAGE pgoff for sub-page PTE
++	 * offset computation later.
++	 */
++	pgoff_t max_idx, index = vmf->pgoff >> PAGE_MMUSHIFT;
+ 	struct folio *folio;
+ 	vm_fault_t ret = 0;
+ 	bool mapping_locked = false;
+diff --git a/mm/gup.c b/mm/gup.c
+index ad9ded39609c..d32e0e28eb48 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -2894,7 +2894,7 @@ static int gup_fast_pte_range(pmd_t pmd, pmd_t *pmdp, unsigned long addr,
+ 		folio_set_referenced(folio);
+ 		pages[*nr] = page;
+ 		(*nr)++;
+-	} while (ptep++, addr += PAGE_SIZE, addr != end);
++	} while (ptep++, addr += MMUPAGE_SIZE, addr != end);
+ 
+ 	ret = 1;
+ 
+diff --git a/mm/internal.h b/mm/internal.h
+index 5a2ddcf68e0b..80b9fd964711 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -1144,8 +1144,9 @@ static inline bool
+ folio_within_range(struct folio *folio, struct vm_area_struct *vma,
+ 		unsigned long start, unsigned long end)
+ {
+-	pgoff_t pgoff, addr;
+-	unsigned long vma_pglen = vma_pages(vma);
++	pgoff_t pgoff;
++	unsigned long addr;
++	unsigned long vma_mmupagelen = (vma->vm_end - vma->vm_start) >> MMUPAGE_SHIFT;
+ 
+ 	VM_WARN_ON_FOLIO(folio_test_ksm(folio), folio);
+ 	if (start > end)
+@@ -1159,11 +1160,11 @@ folio_within_range(struct folio *folio, struct vm_area_struct *vma,
+ 
+ 	pgoff = folio_pgoff(folio);
+ 
+-	/* if folio start address is not in vma range */
+-	if (!in_range(pgoff, vma->vm_pgoff, vma_pglen))
++	/* if folio start address is not in vma range (MMUPAGE units) */
++	if (!in_range(pgoff_page_to_mmu(pgoff), vma->vm_pgoff, vma_mmupagelen))
+ 		return false;
+ 
+-	addr = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
++	addr = pgoff_to_vma_addr(vma, pgoff);
+ 
+ 	return !(addr < start || end - addr < folio_size(folio));
+ }
+@@ -1236,14 +1237,15 @@ static inline unsigned long vma_address(const struct vm_area_struct *vma,
+ 		pgoff_t pgoff, unsigned long nr_pages)
+ {
+ 	unsigned long address;
++	pgoff_t pgoff_mmu = pgoff_page_to_mmu(pgoff);
++	pgoff_t nr_mmupages = nr_pages << PAGE_MMUSHIFT;
+ 
+-	if (pgoff >= vma->vm_pgoff) {
+-		address = vma->vm_start +
+-			((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
++	if (pgoff_mmu >= vma->vm_pgoff) {
++		address = pgoff_to_vma_addr(vma, pgoff);
+ 		/* Check for address beyond vma (or wrapped through 0?) */
+ 		if (address < vma->vm_start || address >= vma->vm_end)
+ 			address = -EFAULT;
+-	} else if (pgoff + nr_pages - 1 >= vma->vm_pgoff) {
++	} else if (pgoff_mmu + nr_mmupages - 1 >= vma->vm_pgoff) {
+ 		/* Test above avoids possibility of wrap to 0 on 32-bit */
+ 		address = vma->vm_start;
+ 	} else {
+@@ -1267,7 +1269,7 @@ static inline unsigned long vma_address_end(struct page_vma_mapped_walk *pvmw)
+ 		return pvmw->address + PAGE_SIZE;
+ 
+ 	pgoff = pvmw->pgoff + pvmw->nr_pages;
+-	address = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
++	address = pgoff_to_vma_addr(vma, pgoff);
+ 	/* Check for address beyond vma (or wrapped through 0?) */
+ 	if (address < vma->vm_start || address > vma->vm_end)
+ 		address = vma->vm_end;
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 7d5b76478f0b..f8a4b2459d05 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -625,7 +625,7 @@ static int break_ksm_pmd_entry(pmd_t *pmdp, unsigned long addr, unsigned long en
+ 	if (!start_ptep)
+ 		return 0;
+ 
+-	for (ptep = start_ptep; addr < end; ptep++, addr += PAGE_SIZE) {
++	for (ptep = start_ptep; addr < end; ptep++, addr += MMUPAGE_SIZE) {
+ 		pte_t pte = ptep_get(ptep);
+ 		struct folio *folio = NULL;
+ 
+@@ -2537,7 +2537,7 @@ static int ksm_next_page_pmd_entry(pmd_t *pmdp, unsigned long addr, unsigned lon
+ 	if (!start_ptep)
+ 		return 0;
+ 
+-	for (ptep = start_ptep; addr < end; ptep++, addr += PAGE_SIZE) {
++	for (ptep = start_ptep; addr < end; ptep++, addr += MMUPAGE_SIZE) {
+ 		pte = ptep_get(ptep);
+ 
+ 		if (!pte_present(pte))
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 69708e953cf5..fd6066007bd0 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -193,7 +193,7 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
+ 	spinlock_t *ptl;
+ 	unsigned long addr;
+ 
+-	for (addr = start; addr < end; addr += PAGE_SIZE) {
++	for (addr = start; addr < end; addr += MMUPAGE_SIZE) {
+ 		pte_t pte;
+ 		softleaf_t entry;
+ 		struct folio *folio;
+@@ -318,7 +318,7 @@ static long madvise_willneed(struct madvise_behavior *madv_behavior)
+ 	mark_mmap_lock_dropped(madv_behavior);
+ 	get_file(file);
+ 	offset = (loff_t)(start - vma->vm_start)
+-			+ ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
++			+ ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ 	mmap_read_unlock(mm);
+ 	vfs_fadvise(file, offset, end - start, POSIX_FADV_WILLNEED);
+ 	fput(file);
+@@ -345,7 +345,7 @@ static inline int madvise_folio_pte_batch(unsigned long addr, unsigned long end,
+ 					  struct folio *folio, pte_t *ptep,
+ 					  pte_t *ptentp)
+ {
+-	int max_nr = (end - addr) / PAGE_SIZE;
++	int max_nr = (end - addr) / MMUPAGE_SIZE;
+ 
+ 	return folio_pte_batch_flags(folio, NULL, ptep, ptentp, max_nr,
+ 				     FPB_MERGE_YOUNG_DIRTY);
+@@ -447,14 +447,14 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+ 
+ regular_folio:
+ #endif
+-	tlb_change_page_size(tlb, PAGE_SIZE);
++	tlb_change_page_size(tlb, MMUPAGE_SIZE);
+ restart:
+ 	start_pte = pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+ 	if (!start_pte)
+ 		return 0;
+ 	flush_tlb_batched_pending(mm);
+ 	lazy_mmu_mode_enable();
+-	for (; addr < end; pte += nr, addr += nr * PAGE_SIZE) {
++	for (; addr < end; pte += nr, addr += nr * MMUPAGE_SIZE) {
+ 		nr = 1;
+ 		ptent = ptep_get(pte);
+ 
+@@ -670,13 +670,13 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+ 		if (madvise_free_huge_pmd(tlb, vma, pmd, addr, next))
+ 			return 0;
+ 
+-	tlb_change_page_size(tlb, PAGE_SIZE);
++	tlb_change_page_size(tlb, MMUPAGE_SIZE);
+ 	start_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+ 	if (!start_pte)
+ 		return 0;
+ 	flush_tlb_batched_pending(mm);
+ 	lazy_mmu_mode_enable();
+-	for (; addr != end; pte += nr, addr += PAGE_SIZE * nr) {
++	for (; addr != end; pte += nr, addr += MMUPAGE_SIZE * nr) {
+ 		nr = 1;
+ 		ptent = ptep_get(pte);
+ 
+@@ -691,7 +691,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
+ 			softleaf_t entry = softleaf_from_pte(ptent);
+ 
+ 			if (softleaf_is_swap(entry)) {
+-				max_nr = (end - addr) / PAGE_SIZE;
++				max_nr = (end - addr) / MMUPAGE_SIZE;
+ 				nr = swap_pte_batch(pte, max_nr, ptent);
+ 				nr_swap -= nr;
+ 				swap_put_entries_direct(entry, nr);
+@@ -1023,7 +1023,7 @@ static long madvise_remove(struct madvise_behavior *madv_behavior)
+ 		return -EACCES;
+ 
+ 	offset = (loff_t)(start - vma->vm_start)
+-			+ ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
++			+ ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ 
+ 	/*
+ 	 * Filesystem's fallocate may need to take i_rwsem.  We need to
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index d47aef256a32..6016e1b58677 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -759,8 +759,8 @@ static int hwpoison_pte_range(pmd_t *pmdp, unsigned long addr,
+ 	if (!ptep)
+ 		goto out;
+ 
+-	for (; addr != end; ptep++, addr += PAGE_SIZE) {
+-		ret = check_hwpoisoned_entry(ptep_get(ptep), addr, PAGE_SHIFT,
++	for (; addr != end; ptep++, addr += MMUPAGE_SIZE) {
++		ret = check_hwpoisoned_entry(ptep_get(ptep), addr, MMUPAGE_SHIFT,
+ 					     hwp->pfn, &hwp->tk);
+ 		if (ret == 1)
+ 			break;
+diff --git a/mm/memory.c b/mm/memory.c
+index 86a973119bd4..fba5139a8b32 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -89,6 +89,7 @@
+ #include "pgalloc-track.h"
+ #include "internal.h"
+ #include "swap.h"
++#include <linux/pte_cluster.h>
+ 
+ #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
+ #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
+@@ -1087,6 +1088,16 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 
+ 	/* All done, just insert the new page copy in the child */
+ 	pte = folio_mk_pte(new_folio, dst_vma->vm_page_prot);
++	/*
++	 * With PAGE_MMUSHIFT > 0, adjust PTE to the correct MMUPAGE
++	 * within the copied page.
++	 */
++	if (PAGE_MMUSHIFT > 0) {
++		pgoff_t pgoff = dst_vma->vm_pgoff +
++			((addr - dst_vma->vm_start) >> MMUPAGE_SHIFT);
++		unsigned int sub = pgoff_sub_page_index(pgoff);
++		pte = __pte(pte_val(pte) + sub * MMUPAGE_SIZE);
++	}
+ 	pte = maybe_mkwrite(pte_mkdirty(pte), dst_vma);
+ 	if (userfaultfd_pte_wp(dst_vma, ptep_get(src_pte)))
+ 		/* Uffd-wp needs to be delivered to dest pte as well */
+@@ -1316,7 +1327,7 @@ copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+ 			WARN_ON_ONCE(ret != -ENOENT);
+ 		}
+ 		/* copy_present_ptes() will clear `*prealloc' if consumed */
+-		max_nr = (end - addr) / PAGE_SIZE;
++		max_nr = (end - addr) / MMUPAGE_SIZE;
+ 		ret = copy_present_ptes(dst_vma, src_vma, dst_pte, src_pte,
+ 					ptent, addr, max_nr, rss, &prealloc);
+ 		/*
+@@ -1338,7 +1349,7 @@ copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+ 		}
+ 		nr = ret;
+ 		progress += 8 * nr;
+-	} while (dst_pte += nr, src_pte += nr, addr += PAGE_SIZE * nr,
++	} while (dst_pte += nr, src_pte += nr, addr += MMUPAGE_SIZE * nr,
+ 		 addr != end);
+ 
+ 	lazy_mmu_mode_disable();
+@@ -1629,7 +1640,7 @@ zap_install_uffd_wp_if_needed(struct vm_area_struct *vma,
+ 		if (--nr == 0)
+ 			break;
+ 		pte++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ 
+ 	return was_installed;
+@@ -1811,7 +1822,7 @@ static inline int do_zap_pte_range(struct mmu_gather *tlb,
+ 				   bool *any_skipped)
+ {
+ 	pte_t ptent = ptep_get(pte);
+-	int max_nr = (end - addr) / PAGE_SIZE;
++	int max_nr = (end - addr) / MMUPAGE_SIZE;
+ 	int nr = 0;
+ 
+ 	/* Skip all consecutive none ptes */
+@@ -1825,7 +1836,7 @@ static inline int do_zap_pte_range(struct mmu_gather *tlb,
+ 		if (!max_nr)
+ 			return nr;
+ 		pte += nr;
+-		addr += nr * PAGE_SIZE;
++		addr += nr * MMUPAGE_SIZE;
+ 	}
+ 
+ 	if (pte_present(ptent))
+@@ -1915,7 +1926,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 	int nr;
+ 
+ retry:
+-	tlb_change_page_size(tlb, PAGE_SIZE);
++	tlb_change_page_size(tlb, MMUPAGE_SIZE);
+ 	init_rss_vec(rss);
+ 	start_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+ 	if (!pte)
+@@ -1936,11 +1947,11 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 		if (any_skipped)
+ 			can_reclaim_pt = false;
+ 		if (unlikely(force_break)) {
+-			addr += nr * PAGE_SIZE;
++			addr += nr * MMUPAGE_SIZE;
+ 			direct_reclaim = false;
+ 			break;
+ 		}
+-	} while (pte += nr, addr += PAGE_SIZE * nr, addr != end);
++	} while (pte += nr, addr += MMUPAGE_SIZE * nr, addr != end);
+ 
+ 	/*
+ 	 * Fast path: try to hold the pmd lock and unmap the PTE page.
+@@ -3339,7 +3350,7 @@ static int apply_to_pte_range(struct mm_struct *mm, pmd_t *pmd,
+ 				if (err)
+ 					break;
+ 			}
+-		} while (pte++, addr += PAGE_SIZE, addr != end);
++		} while (pte++, addr += MMUPAGE_SIZE, addr != end);
+ 	}
+ 	*mask |= PGTBL_PTE_MODIFIED;
+ 
+@@ -3921,6 +3932,17 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 		}
+ 		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+ 		entry = folio_mk_pte(new_folio, vma->vm_page_prot);
++		/*
++		 * With PAGE_MMUSHIFT > 0, adjust PTE to point to the correct
++		 * MMUPAGE within the new page (same sub-page offset as the
++		 * original mapping).
++		 */
++		if (PAGE_MMUSHIFT > 0) {
++			pgoff_t pgoff = vma->vm_pgoff +
++				((vmf->address - vma->vm_start) >> MMUPAGE_SHIFT);
++			unsigned int sub = pgoff_sub_page_index(pgoff);
++			entry = __pte(pte_val(entry) + sub * MMUPAGE_SIZE);
++		}
+ 		entry = pte_sw_mkyoung(entry);
+ 		if (unlikely(unshare)) {
+ 			if (pte_soft_dirty(vmf->orig_pte))
+@@ -5396,7 +5418,10 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		goto oom;
+ 
+ 	nr_pages = folio_nr_pages(folio);
+-	addr = ALIGN_DOWN(vmf->address, nr_pages * PAGE_SIZE);
++	if (nr_pages == 1)
++		addr = ALIGN_DOWN(vmf->address, MMUPAGE_SIZE);
++	else
++		addr = ALIGN_DOWN(vmf->address, nr_pages * PAGE_SIZE);
+ 
+ 	/*
+ 	 * The memory barrier inside __folio_mark_uptodate makes sure that
+@@ -5615,6 +5640,20 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 	flush_icache_pages(vma, page, nr);
+ 	entry = mk_pte(page, vma->vm_page_prot);
+ 
++	/*
++	 * With PAGE_MMUSHIFT > 0, each PTE maps one MMUPAGE (sub-page).
++	 * Adjust the PTE to point to the correct MMUPAGE within the page.
++	 * Compute the effective pgoff from the actual address being mapped,
++	 * not vmf->pgoff, because during fault-around multiple pages are
++	 * mapped with different sub-page offsets.
++	 */
++	if (PAGE_MMUSHIFT > 0) {
++		pgoff_t effective_pgoff = vma->vm_pgoff +
++			((addr - vma->vm_start) >> MMUPAGE_SHIFT);
++		unsigned int sub = pgoff_sub_page_index(effective_pgoff);
++		entry = __pte(pte_val(entry) + sub * MMUPAGE_SIZE);
++	}
++
+ 	if (prefault && arch_wants_old_prefaulted_pte())
+ 		entry = pte_mkold(entry);
+ 	else
+@@ -5882,6 +5921,15 @@ static inline bool should_fault_around(struct vm_fault *vmf)
+ 	if (uffd_disable_fault_around(vmf->vma))
+ 		return false;
+ 
++	/*
++	 * Disable fault-around with PAGE_MMUSHIFT > 0 for now.
++	 * filemap_map_pages mixes MMUPAGE-unit pgoffs with PAGE-unit
++	 * page cache indices, causing wrong PTE mappings.  TODO: fix
++	 * filemap_map_pages to handle MMUPAGE-unit pgoffs properly.
++	 */
++	if (PAGE_MMUSHIFT > 0)
++		return false;
++
+ 	/* A single page implies no faulting 'around' at all. */
+ 	return fault_around_pages > 1;
+ }
+@@ -6130,10 +6178,10 @@ static void numa_rebuild_large_mapping(struct vm_fault *vmf, struct vm_area_stru
+ 	start = max3(addr_start, pt_start, vma->vm_start);
+ 	end = min3(addr_start + folio_size(folio), pt_start + PMD_SIZE,
+ 		   vma->vm_end);
+-	start_ptep = vmf->pte - ((addr - start) >> PAGE_SHIFT);
++	start_ptep = vmf->pte - ((addr - start) >> MMUPAGE_SHIFT);
+ 
+ 	/* Restore all PTEs' mapping of the large folio */
+-	for (addr = start; addr != end; start_ptep++, addr += PAGE_SIZE) {
++	for (addr = start; addr != end; start_ptep++, addr += MMUPAGE_SIZE) {
+ 		pte_t ptent = ptep_get(start_ptep);
+ 		bool writable = false;
+ 
+@@ -6467,7 +6515,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ {
+ 	struct vm_fault vmf = {
+ 		.vma = vma,
+-		.address = address & PAGE_MASK,
++		.address = address & MMUPAGE_MASK,
+ 		.real_address = address,
+ 		.flags = flags,
+ 		.pgoff = linear_page_index(vma, address),
+@@ -7322,7 +7370,7 @@ void print_vma_addr(char *prefix, unsigned long ip)
+ 	if (vma && vma->vm_file) {
+ 		struct file *f = vma->vm_file;
+ 		ip -= vma->vm_start;
+-		ip += vma->vm_pgoff << PAGE_SHIFT;
++		ip += vma->vm_pgoff << MMUPAGE_SHIFT;
+ 		printk("%s%pD[%lx,%lx+%lx]", prefix, f, ip,
+ 				vma->vm_start,
+ 				vma->vm_end - vma->vm_start);
+diff --git a/mm/migrate_device.c b/mm/migrate_device.c
+index 19cd14b34114..5961599bad01 100644
+--- a/mm/migrate_device.c
++++ b/mm/migrate_device.c
+@@ -266,9 +266,9 @@ static int migrate_vma_collect_pmd(pmd_t *pmdp,
+ 	if (!ptep)
+ 		goto again;
+ 	lazy_mmu_mode_enable();
+-	ptep += (addr - start) / PAGE_SIZE;
++	ptep += (addr - start) / MMUPAGE_SIZE;
+ 
+-	for (; addr < end; addr += PAGE_SIZE, ptep++) {
++	for (; addr < end; addr += MMUPAGE_SIZE, ptep++) {
+ 		struct dev_pagemap *pgmap;
+ 		unsigned long mpfn = 0, pfn;
+ 		struct folio *folio;
+diff --git a/mm/mincore.c b/mm/mincore.c
+index 296f2e3922b5..f86508f25965 100644
+--- a/mm/mincore.c
++++ b/mm/mincore.c
+@@ -48,7 +48,7 @@ static int mincore_hugetlb(pte_t *pte, unsigned long hmask, unsigned long addr,
+ 			present = 1;
+ 	}
+ 
+-	for (; addr != end; vec++, addr += PAGE_SIZE)
++	for (; addr != end; vec++, addr += MMUPAGE_SIZE)
+ 		*vec = present;
+ 	walk->private = vec;
+ 	spin_unlock(ptl);
+@@ -167,7 +167,7 @@ static int mincore_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 	struct vm_area_struct *vma = walk->vma;
+ 	pte_t *ptep;
+ 	unsigned char *vec = walk->private;
+-	int nr = (end - addr) >> PAGE_SHIFT;
++	int nr = (end - addr) >> MMUPAGE_SHIFT;
+ 	int step, i;
+ 
+ 	ptl = pmd_trans_huge_lock(pmd, vma);
+@@ -182,19 +182,19 @@ static int mincore_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 		walk->action = ACTION_AGAIN;
+ 		return 0;
+ 	}
+-	for (; addr != end; ptep += step, addr += step * PAGE_SIZE) {
++	for (; addr != end; ptep += step, addr += step * MMUPAGE_SIZE) {
+ 		pte_t pte = ptep_get(ptep);
+ 
+ 		step = 1;
+ 		/* We need to do cache lookup too for markers */
+ 		if (pte_none(pte) || pte_is_marker(pte))
+-			__mincore_unmapped_range(addr, addr + PAGE_SIZE,
++			__mincore_unmapped_range(addr, addr + MMUPAGE_SIZE,
+ 						 vma, vec);
+ 		else if (pte_present(pte)) {
+ 			unsigned int batch = pte_batch_hint(ptep, pte);
+ 
+ 			if (batch > 1) {
+-				unsigned int max_nr = (end - addr) >> PAGE_SHIFT;
++				unsigned int max_nr = (end - addr) >> MMUPAGE_SHIFT;
+ 
+ 				step = min_t(unsigned int, batch, max_nr);
+ 			}
+diff --git a/mm/mlock.c b/mm/mlock.c
+index 8c227fefa2df..d6800bb56767 100644
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -307,7 +307,7 @@ void munlock_folio(struct folio *folio)
+ static inline unsigned int folio_mlock_step(struct folio *folio,
+ 		pte_t *pte, unsigned long addr, unsigned long end)
+ {
+-	unsigned int count = (end - addr) >> PAGE_SHIFT;
++	unsigned int count = (end - addr) >> MMUPAGE_SHIFT;
+ 	pte_t ptent = ptep_get(pte);
+ 
+ 	if (!folio_test_large(folio))
+@@ -381,7 +381,7 @@ static int mlock_pte_range(pmd_t *pmd, unsigned long addr,
+ 		return 0;
+ 	}
+ 
+-	for (pte = start_pte; addr != end; pte++, addr += PAGE_SIZE) {
++	for (pte = start_pte; addr != end; pte++, addr += MMUPAGE_SIZE) {
+ 		ptent = ptep_get(pte);
+ 		if (!pte_present(ptent))
+ 			continue;
+@@ -400,7 +400,7 @@ static int mlock_pte_range(pmd_t *pmd, unsigned long addr,
+ 
+ next_entry:
+ 		pte += step - 1;
+-		addr += (step - 1) << PAGE_SHIFT;
++		addr += (step - 1) << MMUPAGE_SHIFT;
+ 	}
+ 	pte_unmap(start_pte);
+ out:
+@@ -524,8 +524,8 @@ static int apply_vma_lock_flags(unsigned long start, size_t len,
+ 	struct vm_area_struct *vma, *prev;
+ 	VMA_ITERATOR(vmi, current->mm, start);
+ 
+-	VM_BUG_ON(offset_in_page(start));
+-	VM_BUG_ON(len != PAGE_ALIGN(len));
++	VM_BUG_ON(start & ~MMUPAGE_MASK);
++	VM_BUG_ON(len != MMUPAGE_ALIGN(len));
+ 	end = start + len;
+ 	if (end < start)
+ 		return -EINVAL;
+@@ -626,8 +626,8 @@ static __must_check int do_mlock(unsigned long start, size_t len, vm_flags_t fla
+ 	if (!can_do_mlock())
+ 		return -EPERM;
+ 
+-	len = PAGE_ALIGN(len + (offset_in_page(start)));
+-	start &= PAGE_MASK;
++	len = MMUPAGE_ALIGN(len + (start & ~MMUPAGE_MASK));
++	start &= MMUPAGE_MASK;
+ 
+ 	lock_limit = rlimit(RLIMIT_MEMLOCK);
+ 	lock_limit >>= PAGE_SHIFT;
+@@ -686,8 +686,8 @@ SYSCALL_DEFINE2(munlock, unsigned long, start, size_t, len)
+ 
+ 	start = untagged_addr(start);
+ 
+-	len = PAGE_ALIGN(len + (offset_in_page(start)));
+-	start &= PAGE_MASK;
++	len = MMUPAGE_ALIGN(len + (start & ~MMUPAGE_MASK));
++	start &= MMUPAGE_MASK;
+ 
+ 	if (mmap_write_lock_killable(current->mm))
+ 		return -EINTR;
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 5754d1c36462..36c2f684c999 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -151,8 +151,8 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+ 			      mm->end_data, mm->start_data))
+ 		goto out;
+ 
+-	newbrk = PAGE_ALIGN(brk);
+-	oldbrk = PAGE_ALIGN(mm->brk);
++	newbrk = MMUPAGE_ALIGN(brk);
++	oldbrk = MMUPAGE_ALIGN(mm->brk);
+ 	if (oldbrk == newbrk) {
+ 		mm->brk = brk;
+ 		goto success;
+@@ -220,10 +220,10 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
+  */
+ static inline unsigned long round_hint_to_min(unsigned long hint)
+ {
+-	hint &= PAGE_MASK;
++	hint &= MMUPAGE_MASK;
+ 	if (((void *)hint != NULL) &&
+ 	    (hint < mmap_min_addr))
+-		return PAGE_ALIGN(mmap_min_addr);
++		return MMUPAGE_ALIGN(mmap_min_addr);
+ 	return hint;
+ }
+ 
+@@ -271,7 +271,7 @@ static inline bool file_mmap_ok(struct file *file, struct inode *inode,
+ 	if (maxsize && len > maxsize)
+ 		return false;
+ 	maxsize -= len;
+-	if (pgoff > maxsize >> PAGE_SHIFT)
++	if (pgoff > maxsize >> MMUPAGE_SHIFT)
+ 		return false;
+ 	return true;
+ }
+@@ -367,12 +367,12 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
+ 		addr = round_hint_to_min(addr);
+ 
+ 	/* Careful about overflows.. */
+-	len = PAGE_ALIGN(len);
++	len = ALIGN(len, MMUPAGE_SIZE);
+ 	if (!len)
+ 		return -ENOMEM;
+ 
+-	/* offset overflow? */
+-	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
++	/* offset overflow? pgoff is in MMUPAGE units */
++	if ((pgoff + (len >> MMUPAGE_SHIFT)) < pgoff)
+ 		return -EOVERFLOW;
+ 
+ 	/* Too many mappings? */
+@@ -536,7 +536,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
+ 			/*
+ 			 * Set pgoff according to addr for anon_vma.
+ 			 */
+-			pgoff = addr >> PAGE_SHIFT;
++			pgoff = addr >> MMUPAGE_SHIFT;
+ 			break;
+ 		default:
+ 			return -EINVAL;
+@@ -633,11 +633,11 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_arg_struct __user *, arg)
+ 
+ 	if (copy_from_user(&a, arg, sizeof(a)))
+ 		return -EFAULT;
+-	if (offset_in_page(a.offset))
++	if (a.offset & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	return ksys_mmap_pgoff(a.addr, a.len, a.prot, a.flags, a.fd,
+-			       a.offset >> PAGE_SHIFT);
++			       a.offset >> MMUPAGE_SHIFT);
+ }
+ #endif /* __ARCH_WANT_SYS_OLD_MMAP */
+ 
+@@ -703,7 +703,7 @@ generic_get_unmapped_area(struct file *filp, unsigned long addr,
+ 		return addr;
+ 
+ 	if (addr) {
+-		addr = PAGE_ALIGN(addr);
++		addr = MMUPAGE_ALIGN(addr);
+ 		vma = find_vma_prev(mm, addr, &prev);
+ 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+ 		    (!vma || addr + len <= vm_start_gap(vma)) &&
+@@ -754,7 +754,7 @@ generic_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 
+ 	/* requesting a specific address */
+ 	if (addr) {
+-		addr = PAGE_ALIGN(addr);
++		addr = MMUPAGE_ALIGN(addr);
+ 		vma = find_vma_prev(mm, addr, &prev);
+ 		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
+ 				(!vma || addr + len <= vm_start_gap(vma)) &&
+@@ -777,7 +777,7 @@ generic_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	if (offset_in_page(addr)) {
++	if (addr & ~MMUPAGE_MASK) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+@@ -857,7 +857,7 @@ __get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
+ 
+ 	if (addr > TASK_SIZE - len)
+ 		return -ENOMEM;
+-	if (offset_in_page(addr))
++	if (addr & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	error = security_mmap_addr(addr);
+@@ -962,7 +962,7 @@ struct vm_area_struct *find_extend_vma_locked(struct mm_struct *mm, unsigned lon
+ {
+ 	struct vm_area_struct *vma, *prev;
+ 
+-	addr &= PAGE_MASK;
++	addr &= MMUPAGE_MASK;
+ 	vma = find_vma_prev(mm, addr, &prev);
+ 	if (vma && (vma->vm_start <= addr))
+ 		return vma;
+@@ -985,7 +985,7 @@ struct vm_area_struct *find_extend_vma_locked(struct mm_struct *mm, unsigned lon
+ 	struct vm_area_struct *vma;
+ 	unsigned long start;
+ 
+-	addr &= PAGE_MASK;
++	addr &= MMUPAGE_MASK;
+ 	vma = find_vma(mm, addr);
+ 	if (!vma)
+ 		return NULL;
+@@ -1099,14 +1099,14 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
+ 
+ 	if (prot)
+ 		return ret;
+-	start = start & PAGE_MASK;
+-	size = size & PAGE_MASK;
++	start = start & MMUPAGE_MASK;
++	size = size & MMUPAGE_MASK;
+ 
+ 	if (start + size <= start)
+ 		return ret;
+ 
+ 	/* Does pgoff wrap? */
+-	if (pgoff + (size >> PAGE_SHIFT) < pgoff)
++	if (pgoff + (size >> MMUPAGE_SHIFT) < pgoff)
+ 		return ret;
+ 
+ 	if (mmap_read_lock_killable(mm))
+@@ -1214,7 +1214,7 @@ int vm_brk_flags(unsigned long addr, unsigned long request, bool is_exec)
+ 	LIST_HEAD(uf);
+ 	VMA_ITERATOR(vmi, mm, addr);
+ 
+-	len = PAGE_ALIGN(request);
++	len = ALIGN(request, MMUPAGE_SIZE);
+ 	if (len < request)
+ 		return -ENOMEM;
+ 	if (!len)
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 9cbf932b028c..9626e3322c1b 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -125,7 +125,7 @@ static __always_inline void prot_commit_flush_ptes(struct vm_area_struct *vma,
+ 	 * Advance the position in the batch by idx; note that if idx > 0,
+ 	 * then the nr_ptes passed here is <= batch size - idx.
+ 	 */
+-	addr += idx * PAGE_SIZE;
++	addr += idx * MMUPAGE_SIZE;
+ 	ptep += idx;
+ 	oldpte = pte_advance_pfn(oldpte, idx);
+ 	ptent = pte_advance_pfn(ptent, idx);
+@@ -135,7 +135,7 @@ static __always_inline void prot_commit_flush_ptes(struct vm_area_struct *vma,
+ 
+ 	modify_prot_commit_ptes(vma, addr, ptep, oldpte, ptent, nr_ptes);
+ 	if (pte_needs_flush(oldpte, ptent))
+-		tlb_flush_pte_range(tlb, addr, nr_ptes * PAGE_SIZE);
++		tlb_flush_pte_range(tlb, addr, nr_ptes * MMUPAGE_SIZE);
+ }
+ 
+ /*
+@@ -328,7 +328,7 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 	bool uffd_wp = cp_flags & MM_CP_UFFD_WP;
+ 	int nr_ptes;
+ 
+-	tlb_change_page_size(tlb, PAGE_SIZE);
++	tlb_change_page_size(tlb, MMUPAGE_SIZE);
+ 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+ 	if (!pte)
+ 		return -EAGAIN;
+@@ -343,7 +343,7 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 		oldpte = ptep_get(pte);
+ 		if (pte_present(oldpte)) {
+ 			const fpb_t flags = FPB_RESPECT_SOFT_DIRTY | FPB_RESPECT_WRITE;
+-			int max_nr_ptes = (end - addr) >> PAGE_SHIFT;
++			int max_nr_ptes = (end - addr) >> MMUPAGE_SHIFT;
+ 			struct folio *folio = NULL;
+ 			struct page *page;
+ 
+@@ -408,7 +408,7 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 		} else  {
+ 			pages += change_softleaf_pte(vma, addr, pte, oldpte, cp_flags);
+ 		}
+-	} while (pte += nr_ptes, addr += nr_ptes * PAGE_SIZE, addr != end);
++	} while (pte += nr_ptes, addr += nr_ptes * MMUPAGE_SIZE, addr != end);
+ 	lazy_mmu_mode_disable();
+ 	pte_unmap_unlock(pte - 1, ptl);
+ 
+@@ -851,11 +851,11 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+ 	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
+ 		return -EINVAL;
+ 
+-	if (start & ~PAGE_MASK)
++	if (start & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 	if (!len)
+ 		return 0;
+-	len = PAGE_ALIGN(len);
++	len = MMUPAGE_ALIGN(len);
+ 	end = start + len;
+ 	if (end <= start)
+ 		return -ENOMEM;
+diff --git a/mm/mremap.c b/mm/mremap.c
+index e9c8b1d05832..981c86788774 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -262,12 +262,12 @@ static int move_ptes(struct pagetable_move_control *pmc,
+ 	flush_tlb_batched_pending(vma->vm_mm);
+ 	lazy_mmu_mode_enable();
+ 
+-	for (; old_addr < old_end; old_ptep += nr_ptes, old_addr += nr_ptes * PAGE_SIZE,
+-		new_ptep += nr_ptes, new_addr += nr_ptes * PAGE_SIZE) {
++	for (; old_addr < old_end; old_ptep += nr_ptes, old_addr += nr_ptes * MMUPAGE_SIZE,
++		new_ptep += nr_ptes, new_addr += nr_ptes * MMUPAGE_SIZE) {
+ 		VM_WARN_ON_ONCE(!pte_none(*new_ptep));
+ 
+ 		nr_ptes = 1;
+-		max_nr_ptes = (old_end - old_addr) >> PAGE_SHIFT;
++		max_nr_ptes = (old_end - old_addr) >> MMUPAGE_SHIFT;
+ 		old_pte = ptep_get(old_ptep);
+ 		if (pte_none(old_pte))
+ 			continue;
+@@ -948,7 +948,7 @@ static unsigned long vrm_set_new_addr(struct vma_remap_struct *vrm)
+ 	struct vm_area_struct *vma = vrm->vma;
+ 	unsigned long map_flags = 0;
+ 	/* Page Offset _into_ the VMA. */
+-	pgoff_t internal_pgoff = (vrm->addr - vma->vm_start) >> PAGE_SHIFT;
++	pgoff_t internal_pgoff = (vrm->addr - vma->vm_start) >> MMUPAGE_SHIFT;
+ 	pgoff_t pgoff = vma->vm_pgoff + internal_pgoff;
+ 	unsigned long new_addr = vrm_implies_new_addr(vrm) ? vrm->new_addr : 0;
+ 	unsigned long res;
+@@ -1256,7 +1256,7 @@ static int copy_vma_and_data(struct vma_remap_struct *vrm,
+ 			     struct vm_area_struct **new_vma_ptr)
+ {
+ 	unsigned long internal_offset = vrm->addr - vrm->vma->vm_start;
+-	unsigned long internal_pgoff = internal_offset >> PAGE_SHIFT;
++	unsigned long internal_pgoff = internal_offset >> MMUPAGE_SHIFT;
+ 	unsigned long new_pgoff = vrm->vma->vm_pgoff + internal_pgoff;
+ 	unsigned long moved_len;
+ 	struct vm_area_struct *vma = vrm->vma;
+@@ -1495,7 +1495,7 @@ static int vma_expandable(struct vm_area_struct *vma, unsigned long delta)
+ 	if (find_vma_intersection(vma->vm_mm, vma->vm_end, end))
+ 		return 0;
+ 	if (get_unmapped_area(NULL, vma->vm_start, end - vma->vm_start,
+-			      0, MAP_FIXED) & ~PAGE_MASK)
++			      0, MAP_FIXED) & ~MMUPAGE_MASK)
+ 		return 0;
+ 	return 1;
+ }
+@@ -1802,9 +1802,9 @@ static int check_prep_vma(struct vma_remap_struct *vrm)
+ 		vrm->populate_expand = true;
+ 
+ 	/* Need to be careful about a growing mapping */
+-	pgoff = (addr - vma->vm_start) >> PAGE_SHIFT;
++	pgoff = (addr - vma->vm_start) >> MMUPAGE_SHIFT;
+ 	pgoff += vma->vm_pgoff;
+-	if (pgoff + (new_len >> PAGE_SHIFT) < pgoff)
++	if (pgoff + (new_len >> MMUPAGE_SHIFT) < pgoff)
+ 		return -EINVAL;
+ 
+ 	if (vma->vm_flags & (VM_DONTEXPAND | VM_PFNMAP))
+@@ -1971,8 +1971,8 @@ static unsigned long do_mremap(struct vma_remap_struct *vrm)
+ 	unsigned long res;
+ 	bool failed;
+ 
+-	vrm->old_len = PAGE_ALIGN(vrm->old_len);
+-	vrm->new_len = PAGE_ALIGN(vrm->new_len);
++	vrm->old_len = MMUPAGE_ALIGN(vrm->old_len);
++	vrm->new_len = MMUPAGE_ALIGN(vrm->new_len);
+ 
+ 	res = check_mremap_params(vrm);
+ 	if (res)
+diff --git a/mm/msync.c b/mm/msync.c
+index ac4c9bfea2e7..82012c6b9ff5 100644
+--- a/mm/msync.c
++++ b/mm/msync.c
+@@ -41,12 +41,12 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
+ 
+ 	if (flags & ~(MS_ASYNC | MS_INVALIDATE | MS_SYNC))
+ 		goto out;
+-	if (offset_in_page(start))
++	if (start & ~MMUPAGE_MASK)
+ 		goto out;
+ 	if ((flags & MS_ASYNC) && (flags & MS_SYNC))
+ 		goto out;
+ 	error = -ENOMEM;
+-	len = (len + ~PAGE_MASK) & PAGE_MASK;
++	len = (len + ~MMUPAGE_MASK) & MMUPAGE_MASK;
+ 	end = start + len;
+ 	if (end < start)
+ 		goto out;
+@@ -86,7 +86,7 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
+ 		}
+ 		file = vma->vm_file;
+ 		fstart = (start - vma->vm_start) +
+-			 ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
++			 ((loff_t)vma->vm_pgoff << MMUPAGE_SHIFT);
+ 		fend = fstart + (min(end, vma->vm_end) - start) - 1;
+ 		start = vma->vm_end;
+ 		if ((flags & MS_SYNC) && file &&
+diff --git a/mm/page_vma_mapped.c b/mm/page_vma_mapped.c
+index a4d52fdb3056..8eeb32cc6df4 100644
+--- a/mm/page_vma_mapped.c
++++ b/mm/page_vma_mapped.c
+@@ -295,11 +295,11 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
+ 			return true;
+ next_pte:
+ 		do {
+-			pvmw->address += PAGE_SIZE;
++			pvmw->address += MMUPAGE_SIZE;
+ 			if (pvmw->address >= end)
+ 				return not_found(pvmw);
+ 			/* Did we cross page table boundary? */
+-			if ((pvmw->address & (PMD_SIZE - PAGE_SIZE)) == 0) {
++			if ((pvmw->address & (PMD_SIZE - MMUPAGE_SIZE)) == 0) {
+ 				if (pvmw->ptl) {
+ 					spin_unlock(pvmw->ptl);
+ 					pvmw->ptl = NULL;
+diff --git a/mm/pagewalk.c b/mm/pagewalk.c
+index 3ae2586ff45b..37e4dba0c775 100644
+--- a/mm/pagewalk.c
++++ b/mm/pagewalk.c
+@@ -36,8 +36,8 @@ static int walk_pte_range_inner(pte_t *pte, unsigned long addr,
+ 		if (ops->install_pte && pte_none(ptep_get(pte))) {
+ 			pte_t new_pte;
+ 
+-			err = ops->install_pte(addr, addr + PAGE_SIZE, &new_pte,
+-					       walk);
++			err = ops->install_pte(addr, addr + MMUPAGE_SIZE,
++					       &new_pte, walk);
+ 			if (err)
+ 				break;
+ 
+@@ -46,13 +46,13 @@ static int walk_pte_range_inner(pte_t *pte, unsigned long addr,
+ 			if (!WARN_ON_ONCE(walk->no_vma))
+ 				update_mmu_cache(walk->vma, addr, pte);
+ 		} else {
+-			err = ops->pte_entry(pte, addr, addr + PAGE_SIZE, walk);
++			err = ops->pte_entry(pte, addr, addr + MMUPAGE_SIZE, walk);
+ 			if (err)
+ 				break;
+ 		}
+-		if (addr >= end - PAGE_SIZE)
++		if (addr >= end - MMUPAGE_SIZE)
+ 			break;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 		pte++;
+ 	}
+ 	return err;
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 99e1b3dc390b..ab2996a5d99f 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1956,7 +1956,7 @@ static inline unsigned int folio_unmap_pte_batch(struct folio *folio,
+ 
+ 	/* We may only batch within a single VMA and a single page table. */
+ 	end_addr = pmd_addr_end(addr, vma->vm_end);
+-	max_nr = (end_addr - addr) >> PAGE_SHIFT;
++	max_nr = (end_addr - addr) >> MMUPAGE_SHIFT;
+ 
+ 	/* We only support lazyfree or file folios batching for now ... */
+ 	if (folio_test_anon(folio) && folio_test_swapbacked(folio))
+@@ -2167,7 +2167,7 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 				folio_mark_dirty(folio);
+ 		} else if (likely(pte_present(pteval))) {
+ 			nr_pages = folio_unmap_pte_batch(folio, &pvmw, flags, pteval);
+-			end_addr = address + nr_pages * PAGE_SIZE;
++			end_addr = address + nr_pages * MMUPAGE_SIZE;
+ 			flush_cache_range(vma, address, end_addr);
+ 
+ 			/* Nuke the page table entry. */
+@@ -2586,7 +2586,7 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
+ 				 */
+ 				pteval = ptep_get_and_clear(mm, address, pvmw.pte);
+ 
+-				set_tlb_ubc_flush_pending(mm, pteval, address, address + PAGE_SIZE);
++				set_tlb_ubc_flush_pending(mm, pteval, address, address + MMUPAGE_SIZE);
+ 			} else {
+ 				pteval = ptep_clear_flush(vma, address, pvmw.pte);
+ 			}
+@@ -2862,7 +2862,7 @@ struct page *make_device_exclusive(struct mm_struct *mm, unsigned long addr,
+ 	 * caller must filter this event out to prevent livelocks.
+ 	 */
+ 	mmu_notifier_range_init_owner(&range, MMU_NOTIFY_EXCLUSIVE, 0,
+-				      mm, addr, addr + PAGE_SIZE, owner);
++				      mm, addr, addr + MMUPAGE_SIZE, owner);
+ 	mmu_notifier_invalidate_range_start(&range);
+ 
+ 	/*
+diff --git a/mm/secretmem.c b/mm/secretmem.c
+index 5f57ac4720d3..e2c0dd874241 100644
+--- a/mm/secretmem.c
++++ b/mm/secretmem.c
+@@ -58,7 +58,7 @@ static vm_fault_t secretmem_fault(struct vm_fault *vmf)
+ 	vm_fault_t ret;
+ 	int err;
+ 
+-	if (((loff_t)vmf->pgoff << PAGE_SHIFT) >= i_size_read(inode))
++	if (((loff_t)vmf->pgoff << MMUPAGE_SHIFT) >= i_size_read(inode))
+ 		return vmf_error(-EINVAL);
+ 
+ 	filemap_invalidate_lock_shared(mapping);
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 3b5dc21b323c..cebd81920e2a 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2748,6 +2748,11 @@ static vm_fault_t shmem_fault(struct vm_fault *vmf)
+ 	struct inode *inode = file_inode(vmf->vma->vm_file);
+ 	gfp_t gfp = mapping_gfp_mask(inode->i_mapping);
+ 	struct folio *folio = NULL;
++	/*
++	 * vmf->pgoff is in MMUPAGE units.  Convert to PAGE units for
++	 * page cache lookups.
++	 */
++	pgoff_t index = vmf->pgoff >> PAGE_MMUSHIFT;
+ 	vm_fault_t ret = 0;
+ 	int err;
+ 
+@@ -2762,12 +2767,12 @@ static vm_fault_t shmem_fault(struct vm_fault *vmf)
+ 	}
+ 
+ 	WARN_ON_ONCE(vmf->page != NULL);
+-	err = shmem_get_folio_gfp(inode, vmf->pgoff, 0, &folio, SGP_CACHE,
++	err = shmem_get_folio_gfp(inode, index, 0, &folio, SGP_CACHE,
+ 				  gfp, vmf, &ret);
+ 	if (err)
+ 		return vmf_error(err);
+ 	if (folio) {
+-		vmf->page = folio_file_page(folio, vmf->pgoff);
++		vmf->page = folio_file_page(folio, index);
+ 		ret |= VM_FAULT_LOCKED;
+ 	}
+ 	return ret;
+@@ -2901,7 +2906,7 @@ static struct mempolicy *shmem_get_policy(struct vm_area_struct *vma,
+ 	 * by page order, as in shmem_get_pgoff_policy() and get_vma_policy()).
+ 	 */
+ 	*ilx = inode->i_ino;
+-	index = ((addr - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
++	index = ((addr - vma->vm_start) >> MMUPAGE_SHIFT) + vma->vm_pgoff;
+ 	return mpol_shared_policy_lookup(&SHMEM_I(inode)->policy, index);
+ }
+ 
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 1415a5c54a43..380321b1857a 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -822,7 +822,7 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
+ 	ilx = targ_ilx - PFN_DOWN(vmf->address - start);
+ 
+ 	blk_start_plug(&plug);
+-	for (addr = start; addr < end; ilx++, addr += PAGE_SIZE) {
++	for (addr = start; addr < end; ilx++, addr += MMUPAGE_SIZE) {
+ 		struct swap_info_struct *si = NULL;
+ 		softleaf_t entry;
+ 
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 9174f1eeffb0..05dff497d62c 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -2413,7 +2413,7 @@ static int unuse_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 		folio_free_swap(folio);
+ 		folio_unlock(folio);
+ 		folio_put(folio);
+-	} while (addr += PAGE_SIZE, addr != end);
++	} while (addr += MMUPAGE_SIZE, addr != end);
+ 
+ 	if (pte)
+ 		pte_unmap(pte);
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index 80cc8be5725f..cf2b16a65a91 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -1278,10 +1278,10 @@ static long move_present_ptes(struct mm_struct *mm,
+ 		orig_dst_pte = pte_mkwrite(orig_dst_pte, dst_vma);
+ 		set_pte_at(mm, dst_addr, dst_pte, orig_dst_pte);
+ 
+-		src_addr += PAGE_SIZE;
++		src_addr += MMUPAGE_SIZE;
+ 		if (src_addr == src_end)
+ 			break;
+-		dst_addr += PAGE_SIZE;
++		dst_addr += MMUPAGE_SIZE;
+ 		dst_pte++;
+ 		src_pte++;
+ 
+@@ -1360,7 +1360,7 @@ static int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,
+ 	set_pte_at(mm, dst_addr, dst_pte, orig_src_pte);
+ 	double_pt_unlock(dst_ptl, src_ptl);
+ 
+-	return PAGE_SIZE;
++	return MMUPAGE_SIZE;
+ }
+ 
+ static int move_zeropage_pte(struct mm_struct *mm,
+@@ -1387,7 +1387,7 @@ static int move_zeropage_pte(struct mm_struct *mm,
+ 	set_pte_at(mm, dst_addr, dst_pte, zero_pte);
+ 	double_pt_unlock(dst_ptl, src_ptl);
+ 
+-	return PAGE_SIZE;
++	return MMUPAGE_SIZE;
+ }
+ 
+ 
+@@ -1474,7 +1474,7 @@ static long move_pages_ptes(struct mm_struct *mm, pmd_t *dst_pmd, pmd_t *src_pmd
+ 		if (!(mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES))
+ 			ret = -ENOENT;
+ 		else /* nothing to do to move a hole */
+-			ret = PAGE_SIZE;
++			ret = MMUPAGE_SIZE;
+ 		goto out;
+ 	}
+ 
+diff --git a/mm/util.c b/mm/util.c
+index 3cc949a0b7ed..40aae0c46676 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -566,7 +566,7 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+ 	unsigned long len, unsigned long prot,
+ 	unsigned long flag, unsigned long pgoff)
+ {
+-	loff_t off = (loff_t)pgoff << PAGE_SHIFT;
++	loff_t off = (loff_t)pgoff << MMUPAGE_SHIFT;
+ 	unsigned long ret;
+ 	struct mm_struct *mm = current->mm;
+ 	unsigned long populate;
+@@ -611,10 +611,10 @@ unsigned long vm_mmap(struct file *file, unsigned long addr,
+ {
+ 	if (unlikely(offset + PAGE_ALIGN(len) < offset))
+ 		return -EINVAL;
+-	if (unlikely(offset_in_page(offset)))
++	if (unlikely(offset & ~MMUPAGE_MASK))
+ 		return -EINVAL;
+ 
+-	return vm_mmap_pgoff(file, addr, len, prot, flag, offset >> PAGE_SHIFT);
++	return vm_mmap_pgoff(file, addr, len, prot, flag, offset >> MMUPAGE_SHIFT);
+ }
+ EXPORT_SYMBOL(vm_mmap);
+ 
+diff --git a/mm/vma.c b/mm/vma.c
+index d90791b00a7b..883fe5ca8eec 100644
+--- a/mm/vma.c
++++ b/mm/vma.c
+@@ -521,7 +521,7 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 		new->vm_end = addr;
+ 	} else {
+ 		new->vm_start = addr;
+-		new->vm_pgoff += ((addr - vma->vm_start) >> PAGE_SHIFT);
++		new->vm_pgoff += ((addr - vma->vm_start) >> MMUPAGE_SHIFT);
+ 	}
+ 
+ 	err = -ENOMEM;
+@@ -560,7 +560,7 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
+ 
+ 	if (new_below) {
+ 		vma->vm_start = addr;
+-		vma->vm_pgoff += (addr - new->vm_start) >> PAGE_SHIFT;
++		vma->vm_pgoff += (addr - new->vm_start) >> MMUPAGE_SHIFT;
+ 	} else {
+ 		vma->vm_end = addr;
+ 	}
+@@ -709,10 +709,10 @@ static void vmg_adjust_set_range(struct vma_merge_struct *vmg)
+ 
+ 	if (vmg->__adjust_middle_start) {
+ 		adjust = vmg->middle;
+-		pgoff = adjust->vm_pgoff + PHYS_PFN(vmg->end - adjust->vm_start);
++		pgoff = adjust->vm_pgoff + ((vmg->end - adjust->vm_start) >> MMUPAGE_SHIFT);
+ 	} else if (vmg->__adjust_next_start) {
+ 		adjust = vmg->next;
+-		pgoff = adjust->vm_pgoff - PHYS_PFN(adjust->vm_start - vmg->end);
++		pgoff = adjust->vm_pgoff - ((adjust->vm_start - vmg->end) >> MMUPAGE_SHIFT);
+ 	} else {
+ 		return;
+ 	}
+@@ -1634,10 +1634,10 @@ int do_vmi_munmap(struct vma_iterator *vmi, struct mm_struct *mm,
+ 	unsigned long end;
+ 	struct vm_area_struct *vma;
+ 
+-	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
++	if ((start & ~MMUPAGE_MASK) || start > TASK_SIZE || len > TASK_SIZE-start)
+ 		return -EINVAL;
+ 
+-	end = start + PAGE_ALIGN(len);
++	end = start + ALIGN(len, MMUPAGE_SIZE);
+ 	if (end == start)
+ 		return -EINVAL;
+ 
+@@ -1979,7 +1979,7 @@ static int anon_vma_compatible(struct vm_area_struct *a, struct vm_area_struct *
+ 		mpol_equal(vma_policy(a), vma_policy(b)) &&
+ 		a->vm_file == b->vm_file &&
+ 		vma_flags_empty(&diff) &&
+-		b->vm_pgoff == a->vm_pgoff + ((b->vm_start - a->vm_start) >> PAGE_SHIFT);
++		b->vm_pgoff == a->vm_pgoff + ((b->vm_start - a->vm_start) >> MMUPAGE_SHIFT);
+ }
+ 
+ /*
+@@ -3167,10 +3167,10 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
+ 		unsigned long size, grow;
+ 
+ 		size = address - vma->vm_start;
+-		grow = (address - vma->vm_end) >> PAGE_SHIFT;
++		grow = (address - vma->vm_end) >> MMUPAGE_SHIFT;
+ 
+ 		error = -ENOMEM;
+-		if (vma->vm_pgoff + (size >> PAGE_SHIFT) >= vma->vm_pgoff) {
++		if (vma->vm_pgoff + (size >> MMUPAGE_SHIFT) >= vma->vm_pgoff) {
+ 			error = acct_stack_growth(vma, size, grow);
+ 			if (!error) {
+ 				if (vma_test(vma, VMA_LOCKED_BIT))
+@@ -3246,7 +3246,7 @@ int expand_downwards(struct vm_area_struct *vma, unsigned long address)
+ 		unsigned long size, grow;
+ 
+ 		size = vma->vm_end - address;
+-		grow = (vma->vm_start - address) >> PAGE_SHIFT;
++		grow = (vma->vm_start - address) >> MMUPAGE_SHIFT;
+ 
+ 		error = -ENOMEM;
+ 		if (grow <= vma->vm_pgoff) {
+@@ -3319,7 +3319,7 @@ int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+ 	 */
+ 	if (vma_is_anonymous(vma)) {
+ 		BUG_ON(vma->anon_vma);
+-		vma->vm_pgoff = vma->vm_start >> PAGE_SHIFT;
++		vma->vm_pgoff = vma->vm_start >> MMUPAGE_SHIFT;
+ 	}
+ 
+ 	if (vma_link(mm, vma)) {
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index bb6ae08d18f5..934d198dc9bf 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -96,14 +96,10 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 			unsigned int max_page_shift, pgtbl_mod_mask *mask)
+ {
+ 	pte_t *pte;
+-	u64 pfn;
+ 	struct page *page;
+-	unsigned long size = PAGE_SIZE;
++	unsigned long size = MMUPAGE_SIZE;
++	phys_addr_t paddr = phys_addr;
+ 
+-	if (WARN_ON_ONCE(!PAGE_ALIGNED(end - addr)))
+-		return -EINVAL;
+-
+-	pfn = phys_addr >> PAGE_SHIFT;
+ 	pte = pte_alloc_kernel_track(pmd, addr, mask);
+ 	if (!pte)
+ 		return -ENOMEM;
+@@ -112,6 +108,8 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 
+ 	do {
+ 		if (unlikely(!pte_none(ptep_get(pte)))) {
++			u64 pfn = paddr >> PAGE_SHIFT;
++
+ 			if (pfn_valid(pfn)) {
+ 				page = pfn_to_page(pfn);
+ 				dump_page(page, "remapping already mapped page");
+@@ -120,19 +118,28 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 		}
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+-		size = arch_vmap_pte_range_map_size(addr, end, pfn, max_page_shift);
+-		if (size != PAGE_SIZE) {
+-			pte_t entry = pfn_pte(pfn, prot);
+-
+-			entry = arch_make_huge_pte(entry, ilog2(size), 0);
+-			set_huge_pte_at(&init_mm, addr, pte, entry, size);
+-			pfn += PFN_DOWN(size);
+-			continue;
++		{
++			u64 pfn = paddr >> PAGE_SHIFT;
++
++			size = arch_vmap_pte_range_map_size(addr, end, pfn,
++							    max_page_shift);
++			if (size != PAGE_SIZE && size != MMUPAGE_SIZE) {
++				pte_t entry = pfn_pte(pfn, prot);
++
++				entry = arch_make_huge_pte(entry, ilog2(size),
++							   0);
++				set_huge_pte_at(&init_mm, addr, pte, entry,
++						size);
++				paddr += size;
++				continue;
++			}
++			size = MMUPAGE_SIZE;
+ 		}
+ #endif
+-		set_pte_at(&init_mm, addr, pte, pfn_pte(pfn, prot));
+-		pfn++;
+-	} while (pte += PFN_DOWN(size), addr += size, addr != end);
++		set_pte_at(&init_mm, addr, pte,
++			   __pte((paddr & PTE_PFN_MASK) | pgprot_val(prot)));
++		paddr += MMUPAGE_SIZE;
++	} while (pte++, addr += MMUPAGE_SIZE, addr != end);
+ 
+ 	lazy_mmu_mode_disable();
+ 	*mask |= PGTBL_PTE_MODIFIED;
+@@ -368,7 +375,7 @@ static void vunmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ {
+ 	pte_t *pte;
+ 	pte_t ptent;
+-	unsigned long size = PAGE_SIZE;
++	unsigned long size = MMUPAGE_SIZE;
+ 
+ 	pte = pte_offset_kernel(pmd, addr);
+ 	lazy_mmu_mode_enable();
+@@ -376,19 +383,22 @@ static void vunmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 	do {
+ #ifdef CONFIG_HUGETLB_PAGE
+ 		size = arch_vmap_pte_range_unmap_size(addr, pte);
+-		if (size != PAGE_SIZE) {
++		if (size != PAGE_SIZE && size != MMUPAGE_SIZE) {
+ 			if (WARN_ON(!IS_ALIGNED(addr, size))) {
+ 				addr = ALIGN_DOWN(addr, size);
+-				pte = PTR_ALIGN_DOWN(pte, sizeof(*pte) * (size >> PAGE_SHIFT));
++				pte = PTR_ALIGN_DOWN(pte, sizeof(*pte) * (size >> MMUPAGE_SHIFT));
+ 			}
+ 			ptent = huge_ptep_get_and_clear(&init_mm, addr, pte, size);
+ 			if (WARN_ON(end - addr < size))
+ 				size = end - addr;
+ 		} else
+ #endif
++		{
++			size = MMUPAGE_SIZE;
+ 			ptent = ptep_get_and_clear(&init_mm, addr, pte);
++		}
+ 		WARN_ON(!pte_none(ptent) && !pte_present(ptent));
+-	} while (pte += (size >> PAGE_SHIFT), addr += size, addr != end);
++	} while (pte += (size >> MMUPAGE_SHIFT), addr += size, addr != end);
+ 
+ 	lazy_mmu_mode_disable();
+ 	*mask |= PGTBL_PTE_MODIFIED;
+@@ -542,6 +552,7 @@ static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
+ 
+ 	do {
+ 		struct page *page = pages[*nr];
++		int sub;
+ 
+ 		if (WARN_ON(!pte_none(ptep_get(pte)))) {
+ 			err = -EBUSY;
+@@ -556,9 +567,18 @@ static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
+ 			break;
+ 		}
+ 
+-		set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
++		for (sub = 0; sub < PAGE_MMUCOUNT; sub++) {
++			phys_addr_t pa = page_to_phys(page) + sub * MMUPAGE_SIZE;
++
++			set_pte_at(&init_mm, addr, pte,
++				   __pte((pa & PTE_PFN_MASK) | pgprot_val(prot)));
++			pte++;
++			addr += MMUPAGE_SIZE;
++			if (addr == end)
++				break;
++		}
+ 		(*nr)++;
+-	} while (pte++, addr += PAGE_SIZE, addr != end);
++	} while (addr != end);
+ 
+ 	lazy_mmu_mode_disable();
+ 	*mask |= PGTBL_PTE_MODIFIED;
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index bd1b1aa12581..5d24439548bb 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3495,7 +3495,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
+ 
+ 	lazy_mmu_mode_enable();
+ restart:
+-	for (i = pte_index(start), addr = start; addr != end; i += nr, addr += nr * PAGE_SIZE) {
++	for (i = pte_index(start), addr = start; addr != end; i += nr, addr += nr * MMUPAGE_SIZE) {
+ 		unsigned long pfn;
+ 		struct folio *folio;
+ 		pte_t *cur_pte = pte + i;
+@@ -4241,10 +4241,10 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
+ 
+ 	lazy_mmu_mode_enable();
+ 
+-	pte -= (addr - start) / PAGE_SIZE;
++	pte -= (addr - start) / MMUPAGE_SIZE;
+ 
+ 	for (i = 0, addr = start; addr != end;
+-	     i += nr, pte += nr, addr += nr * PAGE_SIZE) {
++	     i += nr, pte += nr, addr += nr * MMUPAGE_SIZE) {
+ 		unsigned long pfn;
+ 		pte_t ptent = ptep_get(pte);
+ 
+-- 
+2.54.0
+

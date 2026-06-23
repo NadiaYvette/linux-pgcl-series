@@ -1,0 +1,69 @@
+From 4d661eefc615f40f1cc2cb7b2b00a78d1173de1e Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 7 May 2026 22:40:36 +0200
+Subject: [PATCH 097/174] s390/mm: vmem modify_pagetable assertion uses MMUPAGE
+ alignment
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+modify_pagetable's WARN_ON_ONCE(!PAGE_ALIGNED(start | end)) at the
+entry rejected legitimate vmemmap setup ranges under page-clustering.
+
+vmemmap_populate is called with [start, end) covering one section's
+struct page array: end - start = PAGES_PER_SECTION * sizeof(struct
+page).  Under PGCL=6 with 4K MMU pages this is 1024 * 64 = 64KB —
+which is MMUPAGE-aligned but not PAGE_SIZE-aligned (256KB).  The
+WARN tripped, vmemmap_populate returned -EINVAL, sparse_init_nid
+reported "memory map backing failed", and the next free_area_init
+step took a NULL deref in __bitmap_set when it tried to walk the
+absent vmemmap.
+
+The kernel panic on this path resets the system on s390x; combined
+with QEMU's -no-reboot the cell exited rc=0 within 2 seconds and
+the matrix saw it as a "silent" boot — but the WARNING did print
+before the panic when earlyprintk was on.  External observers (the
+bootloader, QEMU) don't actually see PAGE_MMUSHIFT; the chain was
+just kernel WARN → kernel oops → kernel panic → system_reset →
+QEMU clean exit.
+
+modify_pagetable iterates at MMUPAGE granularity (it walks PUD/PMD/
+PTE levels), so accepting MMUPAGE-aligned start/end is correct.
+Switch the assertion to IS_ALIGNED(.., MMUPAGE_SIZE).  On non-PGCL
+builds MMUPAGE_SIZE == PAGE_SIZE so behavior is identical.
+
+Verified: s390x PGCL=6 standalone boot now runs through to a clean
+LTP completion: 74p/0f/27s — exact match to PGCL=4 baseline, no
+kernel BUG/Oops/WARNING/panic.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/s390/mm/vmem.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/arch/s390/mm/vmem.c b/arch/s390/mm/vmem.c
+index 9e2dc8856365..cf89d8a2c5f7 100644
+--- a/arch/s390/mm/vmem.c
++++ b/arch/s390/mm/vmem.c
+@@ -435,7 +435,15 @@ static int modify_pagetable(unsigned long start, unsigned long end, bool add,
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
+ 
+-	if (WARN_ON_ONCE(!PAGE_ALIGNED(start | end)))
++	/*
++	 * vmemmap chunk size = PAGES_PER_SECTION * sizeof(struct page).
++	 * Under page-clustering with high MMUSHIFT (PAGE_SIZE up to 1MB at
++	 * PGCL=6) PAGES_PER_SECTION shrinks faster than struct page grows,
++	 * making the chunk smaller than PAGE_SIZE and not PAGE_ALIGNED at
++	 * its end.  modify_pagetable iterates at MMUPAGE granularity, so
++	 * MMUPAGE alignment is sufficient.
++	 */
++	if (WARN_ON_ONCE(!IS_ALIGNED(start | end, MMUPAGE_SIZE)))
+ 		return -EINVAL;
+ 	/* Don't mess with any tables not fully in 1:1 mapping, vmemmap & kasan area */
+ #ifdef CONFIG_KASAN
+-- 
+2.54.0
+

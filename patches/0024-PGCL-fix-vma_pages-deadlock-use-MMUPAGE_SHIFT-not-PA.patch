@@ -1,0 +1,53 @@
+From 92b42e0fa2b8dc90c63047ad358548327d17ce9a Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 17 Mar 2026 13:32:34 +0100
+Subject: [PATCH 024/174] =?UTF-8?q?PGCL:=20fix=20vma=5Fpages()=20deadlock?=
+ =?UTF-8?q?=20=E2=80=94=20use=20MMUPAGE=5FSHIFT=20not=20PAGE=5FSHIFT?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+vma_pages() and vma_desc_pages() used PAGE_SHIFT to convert VMA byte
+size to page count. With PAGE_MMUSHIFT=4 (PAGE_SIZE=64KB), any VMA
+smaller than 64KB returns 0 pages. This causes
+vms_complete_munmap_vmas() to take an early return at line 1323
+(if (!vms->nr_pages) return) that skips the mmap_read_unlock() at
+line 1347, leaking the downgraded read lock. The next mmap operation
+then deadlocks acquiring the write lock.
+
+Fix: use MMUPAGE_SHIFT (hardware page size) for both functions,
+matching the userspace-visible page granularity.
+
+Verified: x86_64 PAGE_MMUSHIFT=4 boots with all 8 runtime tests
+passing (mmap, munmap, fork/COW, mprotect, brk).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ include/linux/mm.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 4fa51001603d..ca6edfa20f59 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -4306,7 +4306,7 @@ static inline unsigned long vm_end_gap(const struct vm_area_struct *vma)
+ 
+ static inline unsigned long vma_pages(const struct vm_area_struct *vma)
+ {
+-	return (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
++	return (vma->vm_end - vma->vm_start) >> MMUPAGE_SHIFT;
+ }
+ 
+ static inline unsigned long vma_last_pgoff(struct vm_area_struct *vma)
+@@ -4321,7 +4321,7 @@ static inline unsigned long vma_desc_size(const struct vm_area_desc *desc)
+ 
+ static inline unsigned long vma_desc_pages(const struct vm_area_desc *desc)
+ {
+-	return vma_desc_size(desc) >> PAGE_SHIFT;
++	return vma_desc_size(desc) >> MMUPAGE_SHIFT;
+ }
+ 
+ /**
+-- 
+2.54.0
+

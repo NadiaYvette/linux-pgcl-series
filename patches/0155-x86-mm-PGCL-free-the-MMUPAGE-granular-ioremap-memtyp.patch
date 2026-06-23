@@ -1,0 +1,81 @@
+From 8047a1de15639939942cc387dc8adc36f489cf11 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 17 Jun 2026 12:44:14 +0200
+Subject: [PATCH 155/174] x86/mm: PGCL: free the MMUPAGE-granular ioremap
+ memtype range in iounmap
+
+__ioremap_caller() reserves the PAT memtype over an MMUPAGE-granular
+range:
+
+    phys_addr &= MMUPAGE_MASK;
+    size = ALIGN(last_addr + 1, MMUPAGE_SIZE) - phys_addr;
+    memtype_reserve(phys_addr, phys_addr + size, ...);
+
+This is deliberate (see the comment there): the hardware page is
+MMUPAGE_SIZE, and rounding the reservation up to the cluster PAGE_SIZE
+would over-claim into adjacent MMIO BARs / RAM and either spuriously
+fail memtype_reserve() or collide with a neighbour's reservation.
+
+iounmap() freed the memtype over get_vm_area_size() instead:
+
+    memtype_free(p->phys_addr, p->phys_addr + get_vm_area_size(p));
+
+get_vm_area_size() returns the vm_area span, which __get_vm_area_node()
+rounded UP to PAGE_SIZE (the cluster).  Under PGCL (PAGE_SIZE >
+MMUPAGE_SIZE) that end exceeds the reserved end for any MMIO region that
+is not a whole cluster.  memtype_erase() requires an EXACT [start,end]
+match (arch/x86/mm/pat/memtype_interval.c), so the oversized free
+returns -EINVAL:
+
+    x86/PAT: <comm>:<pid> freeing invalid memtype [mem ...]
+
+and the struct memtype rbtree node is leaked.  On real hardware this is
+a storm: every iounmap() of a sub-cluster BAR (GPU/PCI MMIO around
+0xfd6xxxxx) warns, and over earlycon=efifb the flood inflates boot by
+many minutes and trips the soft-lockup detector.
+
+Free the exact range that was reserved by using area->requested_size --
+the unrounded size that __get_vm_area_node() records before its internal
+ALIGN() (mm/vmalloc.c).  p->phys_addr already holds the MMUPAGE-aligned
+start, so [p->phys_addr, p->phys_addr + p->requested_size] is byte-for-
+byte the range memtype_reserve() inserted.
+
+Newton (PAGE_MMUSHIFT==0): MMUPAGE_SIZE == PAGE_SIZE, so size is already
+PAGE-aligned and requested_size == get_vm_area_size(); the change is a
+behavioural no-op at shift 0 and reproduces mainline exactly.
+
+memtype.c / memtype_interval.c are unmodified by PGCL; the defect was
+purely the unit mismatch on the iounmap side of this caller.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/x86/mm/ioremap.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+index 9cadcefd1c2c..4196604ed21f 100644
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -497,7 +497,18 @@ void iounmap(volatile void __iomem *addr)
+ 
+ 	kmsan_iounmap_page_range((unsigned long)addr,
+ 		(unsigned long)addr + get_vm_area_size(p));
+-	memtype_free(p->phys_addr, p->phys_addr + get_vm_area_size(p));
++	/*
++	 * Free the exact memtype range that __ioremap_caller() reserved, which
++	 * is MMUPAGE-granular (area->requested_size, the unrounded size passed
++	 * to get_vm_area_caller()).  Do NOT use get_vm_area_size(): under PGCL
++	 * (PAGE_SIZE > MMUPAGE_SIZE) it rounds the span up to the cluster
++	 * PAGE_SIZE, so it would hand memtype_free() a larger end than was
++	 * reserved.  memtype_erase() requires an exact [start,end] match, so the
++	 * oversized free fails ("freeing invalid memtype") and leaks the memtype
++	 * rbtree node.  Identity at PAGE_MMUSHIFT==0, where requested_size and
++	 * get_vm_area_size() coincide (size is already PAGE/MMUPAGE-aligned).
++	 */
++	memtype_free(p->phys_addr, p->phys_addr + p->requested_size);
+ 
+ 	/* Finally remove it */
+ 	o = remove_vm_area((void __force *)addr);
+-- 
+2.54.0
+

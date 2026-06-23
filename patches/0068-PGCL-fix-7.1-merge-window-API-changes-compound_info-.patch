@@ -1,0 +1,50 @@
+From ede0b64da0f212203fce64d416ac85f50455ddde Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 26 Apr 2026 16:09:17 +0200
+Subject: [PATCH 068/174] =?UTF-8?q?PGCL:=20fix=207.1=20merge=20window=20AP?=
+ =?UTF-8?q?I=20changes=20=E2=80=94=20compound=5Finfo=20rename,=20unused=20?=
+ =?UTF-8?q?vars?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- struct page: compound_head renamed to compound_info in 7.1 merge window.
+  Update pgcl_page_folio() in mm/internal.h.
+- x86 set_memory.c: remove unused pfn/pfninc variables in __split_large_page
+  (upstream refactored PUD split path, making these dead code).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/x86/mm/pat/set_memory.c | 2 +-
+ mm/internal.h                | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/mm/pat/set_memory.c b/arch/x86/mm/pat/set_memory.c
+index 31b6c8f8f864..d4c5711c2df8 100644
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@ -1146,7 +1146,7 @@ static int
+ __split_large_page(struct cpa_data *cpa, pte_t *kpte, unsigned long address,
+ 		   struct ptdesc *ptdesc)
+ {
+-	unsigned long lpaddr, lpinc, ref_pfn, pfn, pfninc = 1;
++	unsigned long lpaddr, lpinc, ref_pfn;
+ 	struct page *base = ptdesc_page(ptdesc);
+ 	pte_t *pbase = (pte_t *)page_address(base);
+ 	unsigned int i, level;
+diff --git a/mm/internal.h b/mm/internal.h
+index 148a3679ec49..5225a9f74a16 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -408,7 +408,7 @@ unsigned int folio_pte_batch(struct folio *folio, pte_t *ptep, pte_t pte,
+  */
+ static inline struct folio *pgcl_page_folio(struct page *page)
+ {
+-	unsigned long head = READ_ONCE(page->compound_head);
++	unsigned long head = READ_ONCE(page->compound_info);
+ 
+ 	if (unlikely(head & 1))
+ 		return (struct folio *)(head - 1);
+-- 
+2.54.0
+

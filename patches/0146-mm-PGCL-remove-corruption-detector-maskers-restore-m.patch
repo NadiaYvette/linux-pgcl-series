@@ -1,0 +1,79 @@
+From fe0f10fca78b8e384b7c46dd884232eb83efa3b2 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 12 Jun 2026 16:32:43 +0200
+Subject: [PATCH 146/174] =?UTF-8?q?mm:=20PGCL=20=E2=80=94=20remove=20corru?=
+ =?UTF-8?q?ption-detector=20maskers=20(restore=20mainline=20checks)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The PGCL series had carried two band-aids that SILENCE the kernel's own
+corruption detectors instead of fixing the conditions that trip them:
+
+  - mm/swap.c __page_cache_release(): an else-branch that unconditionally
+    cleared PG_active/PG_unevictable on the non-LRU free path "to prevent
+    free_page_is_bad() from firing".
+  - mm/memory.c zap_present_folio_ptes(): dropped mainline's
+    `if (folio_mapcount(folio) < 0) print_bad_pte(...)` negative-mapcount
+    check after folio_remove_rmap_ptes().
+
+Both are upstream-unacceptable (no reviewer takes a series that quiets
+free_page_is_bad / print_bad_pte rather than fixing why a bad page is freed
+or why a mapcount went negative) and both blinded our own test matrix to the
+corrupt-free / bad-mapcount classes.
+
+Remove them.  Each restores the exact mainline code, so this is byte-identical
+to mainline at PAGE_MMUSHIFT==0 (Newton limit) and simply re-arms the
+detectors at PAGE_MMUSHIFT>0.  The cheap x86_64 PGCL=0/4 tier already runs
+clean with both removed (LTP 71p/0f/28s, no free_page_is_bad, no
+print_bad_pte); a per-arch un-silenced sweep follows to surface anything else
+that was masked.  Compile-verified x86_64 at PAGE_MMUSHIFT=0 and =4.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ mm/memory.c |  6 +++++-
+ mm/swap.c   | 10 ----------
+ 2 files changed, 5 insertions(+), 11 deletions(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index 7014e75e60b2..17a97029c95d 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1756,8 +1756,12 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
+ 		*any_skipped = zap_install_uffd_wp_if_needed(vma, addr, pte,
+ 							     nr, details, ptent);
+ 
+-	if (!delay_rmap)
++	if (!delay_rmap) {
+ 		folio_remove_rmap_ptes(folio, page, nr, vma);
++
++		if (unlikely(folio_mapcount(folio) < 0))
++			print_bad_pte(vma, addr, ptent, page);
++	}
+ 	if (unlikely(__tlb_remove_folio_pages(tlb, page, nr, delay_rmap))) {
+ 		*force_flush = true;
+ 		*force_break = true;
+diff --git a/mm/swap.c b/mm/swap.c
+index c322c66f4195..5cc44f0de987 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -77,16 +77,6 @@ static void __page_cache_release(struct folio *folio, struct lruvec **lruvecp,
+ 		folio_lruvec_relock_irqsave(folio, lruvecp, flagsp);
+ 		lruvec_del_folio(*lruvecp, folio);
+ 		__folio_clear_lru_flags(folio);
+-	} else {
+-		/*
+-		 * MGLRU may isolate a folio (clearing PG_lru) and set
+-		 * PG_active before the folio is freed.  Clear these flags
+-		 * unconditionally to prevent free_page_is_bad() from firing.
+-		 */
+-		if (folio_test_active(folio))
+-			__folio_clear_active(folio);
+-		if (folio_test_unevictable(folio))
+-			__folio_clear_unevictable(folio);
+ 	}
+ }
+ 
+-- 
+2.54.0
+

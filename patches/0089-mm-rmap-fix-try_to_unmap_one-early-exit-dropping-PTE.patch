@@ -1,0 +1,153 @@
+From db4a3a0edb19d828b34833d44b2aab337af3825b Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 16:42:39 +0200
+Subject: [PATCH 089/174] mm/rmap: fix try_to_unmap_one early-exit dropping
+ PTEs after partial yield
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Under PGCL the page_vma_mapped_walk yields one kernel page worth of
+consecutive same-PFN PTEs per yield (nr_mmupages, capped at
+PAGE_MMUCOUNT).  try_to_unmap_one's early walk_done check was
+
+  unsigned int batch_kpages = max(1U, nr_pages >> PAGE_MMUSHIFT);
+  if (batch_kpages == folio_nr_pages(folio))
+          goto walk_done;
+
+For a non-large folio (folio_nr_pages == 1), batch_kpages is always 1
+for any nr_mmupages in [1, PAGE_MMUCOUNT].  Any partial first yield
+therefore falsely triggered walk_done.
+
+The partial-yield case is real: when a non-large folio's sub-page PTEs
+in one kernel page have a gap (PTEs 0..3 present, 4..7 pte_none, 8..15
+present — easily produced by a partial munmap of a sub-page region),
+the walker yields nr_mmupages=4 first.  The buggy check fired, and
+PTEs 8..15 were never unmapped.  Refcount leaked, TLB entries leaked,
+and the folio looked unmapped to rmap (_mapcount went to 0 with PTEs
+still pointing at it).
+
+Replace the check with an apples-to-apples comparison in MMUPAGE
+units:
+
+  if (nr_pages == folio_nr_pages(folio) * PAGE_MMUCOUNT)
+          goto walk_done;
+
+Both sides are MMUPAGE-granular: nr_pages == pvmw.nr_mmupages, and
+folio_nr_pages * PAGE_MMUCOUNT is the MMUPAGE PTE count of a fully
+mapped folio.  A partial yield (nr_mmupages < PAGE_MMUCOUNT) no
+longer triggers the early exit; the walker continues past the gap
+and yields the remaining batches, which try_to_unmap_one drains
+correctly.
+
+For non-PGCL builds (PAGE_MMUCOUNT == 1) this collapses to
+`nr_pages == folio_nr_pages` — the legacy mainline check.
+
+Drop the now-stale pgcl_unmap_count diagnostic that pr_err'd when a
+non-large folio yielded more than once.  With the buggy early exit,
+that path was unreachable (the check fired after the first yield);
+with the fix in place, multi-yield is the correct behavior for
+gap-mapped folios and would make the diagnostic noisy.
+
+Verified on x86_64 PGCL=4 (LTP 71p/0f/28s — exact baseline match)
+and aarch64 PGCL=4 (cow selftest PASS, plus PGCL basic 19/19 +
+stress 12/12, zero kernel BUG/Oops/WARNING).
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/rmap.c | 57 ++++++++++++++++++++-----------------------------------
+ 1 file changed, 21 insertions(+), 36 deletions(-)
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 6bd694a70404..a27a99157be9 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1999,9 +1999,6 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 	unsigned long pfn;
+ 	unsigned long hsz = 0;
+ 	int ptes = 0;
+-	int pgcl_unmap_count = 0;
+-	unsigned long pgcl_addrs[4] = {};
+-	unsigned long pgcl_ptevals[4] = {};
+ 
+ 	/*
+ 	 * When racing against e.g. zap_pte_range() on another cpu,
+@@ -2360,11 +2357,6 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 			add_mm_counter(mm, mm_counter_file(folio), -nr_pages);
+ 		}
+ discard:
+-		if (pgcl_unmap_count < 4) {
+-			pgcl_addrs[pgcl_unmap_count] = address;
+-			pgcl_ptevals[pgcl_unmap_count] = (unsigned long)pte_val(pteval);
+-		}
+-		pgcl_unmap_count++;
+ 		if (unlikely(folio_test_hugetlb(folio))) {
+ 			hugetlb_remove_rmap(folio);
+ 		} else {
+@@ -2380,16 +2372,28 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 		folio_put_refs(folio, nr_pages);
+ 
+ 		/*
+-		 * If we are sure that we batched the entire folio and cleared
+-		 * all PTEs, we can just optimize and stop right here.  Under
+-		 * PGCL nr_pages is in MMUPAGE units while folio_nr_pages is
+-		 * in kernel-page units; convert to compare apples-to-apples.
++		 * If we are sure that this single yield covered the entire
++		 * folio (and therefore cleared all of its PTEs in this VMA),
++		 * we can stop right here.  Both sides of the comparison are
++		 * MMUPAGE-granular: nr_pages is the count of PTEs cleared in
++		 * this yield (== pvmw.nr_mmupages, capped at PAGE_MMUCOUNT
++		 * by the walker), and folio_nr_pages * PAGE_MMUCOUNT is the
++		 * MMUPAGE PTE count of a fully-mapped folio.
++		 *
++		 * Do NOT collapse this to the kernel-page form
++		 * (max(1U, nr_pages >> PAGE_MMUSHIFT) == folio_nr_pages):
++		 * for a non-large folio (folio_nr_pages == 1) under PGCL,
++		 * any partial yield (1 <= nr_pages < PAGE_MMUCOUNT, e.g.
++		 * caused by a sub-page gap left by a partial munmap) would
++		 * round up to 1 and falsely trigger the early exit, leaving
++		 * later PTEs of the same folio unmapped — refcount and TLB
++		 * leak, folio appears unmapped to rmap.
++		 *
++		 * For non-PGCL builds (PAGE_MMUCOUNT == 1) this collapses to
++		 * `nr_pages == folio_nr_pages` — the legacy mainline check.
+ 		 */
+-		{
+-			unsigned int batch_kpages = max(1U, nr_pages >> PAGE_MMUSHIFT);
+-			if (batch_kpages == folio_nr_pages(folio))
+-				goto walk_done;
+-		}
++		if (nr_pages == folio_nr_pages(folio) * PAGE_MMUCOUNT)
++			goto walk_done;
+ 		continue;
+ walk_abort:
+ 		ret = false;
+@@ -2398,25 +2402,6 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 		break;
+ 	}
+ 
+-	if (PAGE_MMUSHIFT && pgcl_unmap_count > 1 &&
+-	    !folio_test_large(folio)) {
+-		static int pgcl_multi_unmap_warn;
+-		if (pgcl_multi_unmap_warn < 10) {
+-			pgcl_multi_unmap_warn++;
+-			pr_err("PGCL try_to_unmap: folio=%px pfn=%lx anon=%d unmapped %d PTEs mc=%d rc=%d addrs=%lx/%lx/%lx/%lx ptes=%lx/%lx/%lx/%lx\n",
+-			       folio, folio_pfn(folio),
+-			       folio_test_anon(folio) ? 1 : 0,
+-			       pgcl_unmap_count,
+-			       folio_mapcount(folio), folio_ref_count(folio),
+-			       pgcl_addrs[0], pgcl_addrs[1],
+-			       pgcl_addrs[2], pgcl_addrs[3],
+-			       pgcl_ptevals[0], pgcl_ptevals[1],
+-			       pgcl_ptevals[2], pgcl_ptevals[3]);
+-			if (pgcl_multi_unmap_warn <= 3)
+-				dump_stack();
+-		}
+-	}
+-
+ 	mmu_notifier_invalidate_range_end(&range);
+ 
+ 	return ret;
+-- 
+2.54.0
+

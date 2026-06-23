@@ -1,0 +1,288 @@
+From 60865ef5ffce326d23bf15dc5baa8e4903eb629c Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 12 Mar 2026 05:40:39 +0100
+Subject: [PATCH 012/174] PGCL: fix pgcl_pte_batch for MMUPAGE-granular PFN
+ comparison
+
+pgcl_pte_batch() used pte_pfn() which returns PAGE-granular PFNs
+(>> PAGE_SHIFT).  For sub-pages within the same kernel page, pte_pfn()
+returns the SAME value for all 16 sub-pages, so the old comparison
+"pte_pfn(next) != base_pfn + nr" always failed within a page (returning
+1) but could match across different kernel pages with consecutive PFNs.
+
+Fix by comparing same-page identity via pte_pfn() and sub-page offset
+via pte_val's physical address bits between MMUPAGE_SHIFT and
+PAGE_SHIFT.  This correctly batches consecutive sub-pages within the
+same kernel page.
+
+Also fix callers that feed pgcl_pte_batch results into APIs with
+PGCL-incompatible PFN stride:
+- mremap set_ptes(nr>1): writes nr*PAGE_MMUCOUNT PTEs; use individual
+  set_pte with MMUPAGE_SIZE stride instead
+- mprotect pte_advance_pfn: advances by PAGE_SIZE per unit; use
+  MMUPAGE_SIZE for sub-page batches
+- mprotect modify_prot_commit_ptes: pte_next_pfn advances by PAGE_SIZE;
+  use MMUPAGE_SIZE for PGCL
+- copy_present_ptes __copy_present_ptes: same set_ptes(nr>1) overflow
+  for large folio batches
+
+Re-enable fork copy batch, zap batch, mremap batch, and mprotect batch
+that were previously disabled.
+
+Build #156: 20/20 clean boots, PAGE_MMUSHIFT=4, SMP=4.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ include/linux/pgtable.h |  11 ++++-
+ mm/internal.h           |  20 ++++++--
+ mm/memory.c             | 106 +++++++++++++++++++++++++++++++---------
+ mm/mprotect.c           |   6 +++
+ mm/mremap.c             |  17 +++++++
+ 5 files changed, 132 insertions(+), 28 deletions(-)
+
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index 9c23cf277187..b7bfb82230ef 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -1721,9 +1721,18 @@ static inline void modify_prot_commit_ptes(struct vm_area_struct *vma, unsigned
+ 	for (i = 0; i < nr; ++i, ++ptep, addr += MMUPAGE_SIZE) {
+ 		ptep_modify_prot_commit(vma, addr, ptep, old_pte, pte);
+ 
+-		/* Advance PFN only, set same prot */
++		/*
++		 * Advance PFN only, set same prot.
++		 * pte_next_pfn advances by PAGE_SIZE.  With PGCL, consecutive
++		 * sub-pages differ by MMUPAGE_SIZE, not PAGE_SIZE.
++		 */
++#if PAGE_MMUSHIFT
++		old_pte = __pte(pte_val(old_pte) + MMUPAGE_SIZE);
++		pte = __pte(pte_val(pte) + MMUPAGE_SIZE);
++#else
+ 		old_pte = pte_next_pfn(old_pte);
+ 		pte = pte_next_pfn(pte);
++#endif
+ 	}
+ }
+ #endif
+diff --git a/mm/internal.h b/mm/internal.h
+index 08485f96594d..71cbe2aa40c4 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -410,9 +410,16 @@ unsigned int folio_pte_batch(struct folio *folio, pte_t *ptep, pte_t pte,
+ static inline unsigned int pgcl_pte_batch(pte_t pte, pte_t *ptep,
+ 					  unsigned int max_nr)
+ {
+-	unsigned long base_pfn = pte_pfn(pte);
+-	/* How many sub-pages remain in this kernel page? */
+-	unsigned int remaining = PAGE_MMUCOUNT - (base_pfn & (PAGE_MMUCOUNT - 1));
++	/*
++	 * Use pte_pfn (PAGE-granular) for the kernel page identity,
++	 * and extract the MMUPAGE sub-offset from pte_val directly.
++	 * For present PTEs, protnone_mask is 0, so pte_val's physical
++	 * bits between MMUPAGE_SHIFT and PAGE_SHIFT give the sub-offset.
++	 */
++	unsigned long base_page_pfn = pte_pfn(pte);
++	unsigned int sub = (unsigned int)((pte_val(pte) >> MMUPAGE_SHIFT) &
++					  (PAGE_MMUCOUNT - 1));
++	unsigned int remaining = PAGE_MMUCOUNT - sub;
+ 	unsigned int nr;
+ 
+ 	max_nr = min(max_nr, remaining);
+@@ -421,7 +428,12 @@ static inline unsigned int pgcl_pte_batch(pte_t pte, pte_t *ptep,
+ 
+ 		if (!pte_present(next))
+ 			break;
+-		if (pte_pfn(next) != base_pfn + nr)
++		/* Must be same kernel page */
++		if (pte_pfn(next) != base_page_pfn)
++			break;
++		/* Must be next consecutive sub-page */
++		if (((pte_val(next) >> MMUPAGE_SHIFT) &
++		     (PAGE_MMUCOUNT - 1)) != sub + nr)
+ 			break;
+ 	}
+ 	return nr;
+diff --git a/mm/memory.c b/mm/memory.c
+index d349ff3ca33b..889ecfd41e0c 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1128,6 +1128,23 @@ static __always_inline void __copy_present_ptes(struct vm_area_struct *dst_vma,
+ 	if (!userfaultfd_wp(dst_vma))
+ 		pte = pte_clear_uffd_wp(pte);
+ 
++#if PAGE_MMUSHIFT
++	/*
++	 * With PGCL, set_ptes(nr>1) writes nr*PAGE_MMUCOUNT PTEs
++	 * (treating nr as kernel page count).  The large folio batch
++	 * path passes nr in MMUPAGE-granular units from folio_pte_batch,
++	 * so write individual PTEs with MMUPAGE_SIZE stride instead.
++	 */
++	if (nr > 1) {
++		int i;
++
++		for (i = 0; i < nr; i++) {
++			set_pte(dst_pte + i, pte);
++			pte = __pte(pte_val(pte) + MMUPAGE_SIZE);
++		}
++		return;
++	}
++#endif
+ 	set_ptes(dst_vma->vm_mm, addr, dst_pte, pte, nr);
+ }
+ 
+@@ -1187,20 +1204,47 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 
+ #if PAGE_MMUSHIFT
+ 	/*
+-	 * PGCL batch DISABLED: pgcl_pte_batch() uses pte_pfn() which
+-	 * returns PAGE-granular PFNs (shifted by PAGE_SHIFT).  Two PTEs
+-	 * pointing to DIFFERENT 64KB kernel pages with consecutive PFNs
+-	 * wrongly match as "contiguous", and set_ptes(nr>1) then writes
+-	 * nr * PAGE_MMUCOUNT PTEs — overflowing past VMA boundaries.
+-	 *
+-	 * Additionally, the rmap/refcount updates here assume all nr PTEs
+-	 * share the same folio, which is wrong when consecutive PAGE PFNs
+-	 * are different folios.
++	 * PGCL batch: batch-copy contiguous sub-page PTEs within the
++	 * same kernel page.  Write individual PTEs (not set_ptes nr>1
++	 * which multiplies by PAGE_MMUCOUNT) and batch rmap/refcount.
+ 	 *
+-	 * TODO: to re-enable, pgcl_pte_batch must use MMUPAGE-granular
+-	 * PFN comparison, and the copy loop must write individual PTEs
+-	 * (not set_ptes nr>1 which multiplies by PAGE_MMUCOUNT).
++	 * Check rmap FIRST so that if the page is pinned we fall through
++	 * to the single-PTE path without having modified any PTEs.
+ 	 */
++	if (max_nr > 1 && folio_test_anon(folio) && !folio_test_large(folio)) {
++		nr = pgcl_pte_batch(pte, src_pte, max_nr);
++		if (nr > 1) {
++			folio_ref_add(folio, nr);
++			if (!folio_try_dup_anon_rmap_ptes(folio, page,
++							  nr, dst_vma,
++							  src_vma)) {
++				int i;
++
++				for (i = 0; i < nr; i++) {
++					pte_t p = ptep_get(src_pte + i);
++
++					if (is_cow_mapping(src_vma->vm_flags)
++					    && pte_write(p)) {
++						ptep_set_wrprotect(
++							src_vma->vm_mm,
++							addr + i * MMUPAGE_SIZE,
++							src_pte + i);
++						p = pte_wrprotect(p);
++					}
++					if (src_vma->vm_flags & VM_SHARED)
++						p = pte_mkclean(p);
++					p = pte_mkold(p);
++					if (!userfaultfd_wp(dst_vma))
++						p = pte_clear_uffd_wp(p);
++					set_pte(dst_pte + i, p);
++				}
++				rss[MM_ANONPAGES] += nr;
++				return nr;
++			}
++			/* Pinned page — undo refcount, fall through */
++			folio_ref_sub(folio, nr);
++		}
++	}
+ #endif
+ 
+ 	folio_get(folio);
+@@ -1758,18 +1802,34 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
+ 	}
+ #if PAGE_MMUSHIFT
+ 	/*
+-	 * PGCL zap batch DISABLED: pgcl_pte_batch() uses pte_pfn() which
+-	 * returns PAGE-granular PFNs (shifted by PAGE_SHIFT).  Two PTEs
+-	 * pointing to DIFFERENT 64KB kernel pages with consecutive PAGE
+-	 * PFNs wrongly match as "contiguous within the same kernel page".
+-	 * The rmap/refcount updates then operate on only the first folio,
+-	 * causing mapcount underflow (Bad page state) on the first folio
+-	 * and a ref leak on the second.
+-	 *
+-	 * TODO: to re-enable, pgcl_pte_batch must compare MMUPAGE-granular
+-	 * PFNs (pte_val >> MMUPAGE_SHIFT) and verify all PTEs map into
+-	 * the same kernel page before batching.
++	 * PGCL batch: order-0 pages are not compound, so we can't use
++	 * folio_pte_batch.  Instead, batch PTE clearing and TLB flushing
++	 * for contiguous sub-pages within the same kernel page.
+ 	 */
++	if (max_nr > 1 && folio_test_anon(folio)) {
++		nr = pgcl_pte_batch(ptent, pte, max_nr);
++		if (nr > 1) {
++			int i;
++
++			clear_full_ptes(mm, addr, pte, nr, tlb->fullmm);
++			rss[MM_ANONPAGES] -= nr;
++			arch_check_zapped_pte(vma, ptent);
++			tlb_remove_tlb_entries(tlb, pte, nr, addr);
++
++			for (i = 0; i < nr; i++)
++				folio_remove_rmap_pte(folio, page, vma);
++
++			if (nr > 1)
++				folio_ref_sub(folio, nr - 1);
++			if (unlikely(__tlb_remove_page_size(tlb,
++					page, false,
++					MMUPAGE_SIZE))) {
++				*force_flush = true;
++				*force_break = true;
++			}
++			return nr;
++		}
++	}
+ #endif
+ 	zap_present_folio_ptes(tlb, vma, folio, page, pte, ptent, 1, addr,
+ 			       details, rss, force_flush, force_break, any_skipped);
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 5899e7a92d2e..eec7c54754ec 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -132,8 +132,14 @@ static __always_inline void prot_commit_flush_ptes(struct vm_area_struct *vma,
+ 	 */
+ 	addr += idx * MMUPAGE_SIZE;
+ 	ptep += idx;
++#if PAGE_MMUSHIFT
++	/* pte_advance_pfn advances by PAGE_SIZE per unit; sub-pages are MMUPAGE apart */
++	oldpte = __pte(pte_val(oldpte) + (unsigned long)idx * MMUPAGE_SIZE);
++	ptent = __pte(pte_val(ptent) + (unsigned long)idx * MMUPAGE_SIZE);
++#else
+ 	oldpte = pte_advance_pfn(oldpte, idx);
+ 	ptent = pte_advance_pfn(ptent, idx);
++#endif
+ 
+ 	if (set_write)
+ 		ptent = pte_mkwrite(ptent, vma);
+diff --git a/mm/mremap.c b/mm/mremap.c
+index d26b73b8f8ea..4a1187135fd0 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -307,6 +307,23 @@ static int move_ptes(struct pagetable_move_control *pmc,
+ 				else
+ 					pte = pte_swp_clear_uffd_wp(pte);
+ 			}
++#if PAGE_MMUSHIFT
++			/*
++			 * With PGCL, set_ptes(nr>1) treats nr as kernel
++			 * page count (writes nr*PAGE_MMUCOUNT PTEs).
++			 * When nr comes from pgcl_pte_batch (MMUPAGE
++			 * count), write individual PTEs instead.
++			 */
++			if (nr_ptes > 1) {
++				int j;
++
++				for (j = 0; j < nr_ptes; j++) {
++					set_pte(new_ptep + j, pte);
++					pte = __pte(pte_val(pte) +
++						    MMUPAGE_SIZE);
++				}
++			} else
++#endif
+ 			set_ptes(mm, new_addr, new_ptep, pte, nr_ptes);
+ 		}
+ 	}
+-- 
+2.54.0
+

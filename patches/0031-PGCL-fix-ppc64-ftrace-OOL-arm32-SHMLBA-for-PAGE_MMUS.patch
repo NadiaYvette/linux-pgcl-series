@@ -1,0 +1,117 @@
+From 5ce4e96ad831fb5ab51a1ced621882c0563a5d59 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 21 Mar 2026 04:48:32 +0100
+Subject: [PATCH 031/174] PGCL: fix ppc64 ftrace OOL + arm32 SHMLBA for
+ PAGE_MMUSHIFT=4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ppc64 code-patching.c: pfn_pte(pfn, PAGE_KERNEL) shifts pfn by PAGE_SHIFT
+(20 with MMUSHIFT=4) but get_patch_pfn() returns MMUPAGE-granular PFNs
+(pa >> 16). The resulting PTE encodes pa<<4 instead of pa, causing ftrace
+OOL stub writes to corrupt unrelated kernel text. Symptoms: ftrace_init_nop
+reads wrong instruction (mtlr r0 instead of NOP), and the memory corruption
+also triggered DEBUG_LOCKS_WARN_ON in shmem_init via selinux.
+
+Fix: bypass pfn_pte() and construct PTEs directly with (pfn << MMUPAGE_SHIFT)
+to preserve full MMUPAGE-granular physical address. Also fix get_patch_pfn()
+vmalloc path to return MMUPAGE-granular PFN (vmalloc_to_pfn returns
+PAGE-granular, losing sub-page offset).
+
+arm32 shmparam.h: SHMLBA = 4*PAGE_SIZE exceeds the 16384 limit enforced
+by copypage-v6.c when PAGE_MMUSHIFT=4 (4*64KB=256KB). SHMLBA is a
+shared memory attach alignment — should use hardware page size, not
+kernel page size. Fix: 4*MMUPAGE_SIZE.
+
+Result: ppc64 MMUSHIFT=4 with ftrace OOL enabled — 23/23 PASS, zero
+kernel warnings. arm32 MMUSHIFT=4 cross-compile PASS.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm/include/asm/shmparam.h  |  2 +-
+ arch/powerpc/lib/code-patching.c | 24 +++++++++++++++++-------
+ 2 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm/include/asm/shmparam.h b/arch/arm/include/asm/shmparam.h
+index 367a9dac6150..333ee76294ae 100644
+--- a/arch/arm/include/asm/shmparam.h
++++ b/arch/arm/include/asm/shmparam.h
+@@ -7,7 +7,7 @@
+  * or page size, whichever is greater since the cache aliases
+  * every size/ways bytes.
+  */
+-#define	SHMLBA	(4 * PAGE_SIZE)		 /* attach addr a multiple of this */
++#define	SHMLBA	(4 * MMUPAGE_SIZE)	 /* attach addr a multiple of this */
+ 
+ /*
+  * Enforce SHMLBA in shmat
+diff --git a/arch/powerpc/lib/code-patching.c b/arch/powerpc/lib/code-patching.c
+index 307915b0758a..b8a034cdb11a 100644
+--- a/arch/powerpc/lib/code-patching.c
++++ b/arch/powerpc/lib/code-patching.c
+@@ -225,12 +225,22 @@ void __init poking_init(void)
+ 	static_branch_enable(&poking_init_done);
+ }
+ 
++/*
++ * Return MMUPAGE-granular PFN for the hardware page containing addr.
++ * pfn_pte() expects PAGE-granular PFNs, but code-patching maps a single
++ * MMUPAGE via __set_pte_at, so we construct the PTE directly using
++ * (pfn << MMUPAGE_SHIFT) to get the correct physical address.
++ */
+ static unsigned long get_patch_pfn(void *addr)
+ {
+-	if (IS_ENABLED(CONFIG_EXECMEM) && is_vmalloc_or_module_addr(addr))
+-		return vmalloc_to_pfn(addr);
+-	else
++	if (IS_ENABLED(CONFIG_EXECMEM) && is_vmalloc_or_module_addr(addr)) {
++		struct page *page = vmalloc_to_page(addr);
++		unsigned long pa = page_to_phys(page) +
++			offset_in_page((unsigned long)addr);
++		return pa >> MMUPAGE_SHIFT;
++	} else {
+ 		return __pa_symbol(addr) >> MMUPAGE_SHIFT;
++	}
+ }
+ 
+ /*
+@@ -297,7 +307,7 @@ static int __do_patch_mem_mm(void *addr, unsigned long val, bool is_dword)
+ 	if (!pte)
+ 		return -ENOMEM;
+ 
+-	__set_pte_at(patching_mm, text_poke_addr, pte, pfn_pte(pfn, PAGE_KERNEL), 0);
++	__set_pte_at(patching_mm, text_poke_addr, pte, __pte(((pte_basic_t)pfn << MMUPAGE_SHIFT) | pgprot_val(PAGE_KERNEL) | _PAGE_PTE), 0);
+ 
+ 	/* order PTE update before use, also serves as the hwsync */
+ 	asm volatile("ptesync": : :"memory");
+@@ -336,7 +346,7 @@ static int __do_patch_mem(void *addr, unsigned long val, bool is_dword)
+ 	patch_addr = (u32 *)(text_poke_addr + ((unsigned long)(addr) & ~MMUPAGE_MASK));
+ 
+ 	pte = __this_cpu_read(cpu_patching_context.pte);
+-	__set_pte_at(&init_mm, text_poke_addr, pte, pfn_pte(pfn, PAGE_KERNEL), 0);
++	__set_pte_at(&init_mm, text_poke_addr, pte, __pte(((pte_basic_t)pfn << MMUPAGE_SHIFT) | pgprot_val(PAGE_KERNEL) | _PAGE_PTE), 0);
+ 	/* See ptesync comment in radix__set_pte_at() */
+ 	if (radix_enabled())
+ 		asm volatile("ptesync": : :"memory");
+@@ -483,7 +493,7 @@ static int __do_patch_instructions_mm(u32 *addr, u32 *code, size_t len, bool rep
+ 	if (!pte)
+ 		return -ENOMEM;
+ 
+-	__set_pte_at(patching_mm, text_poke_addr, pte, pfn_pte(pfn, PAGE_KERNEL), 0);
++	__set_pte_at(patching_mm, text_poke_addr, pte, __pte(((pte_basic_t)pfn << MMUPAGE_SHIFT) | pgprot_val(PAGE_KERNEL) | _PAGE_PTE), 0);
+ 
+ 	/* order PTE update before use, also serves as the hwsync */
+ 	asm volatile("ptesync" ::: "memory");
+@@ -528,7 +538,7 @@ static int __do_patch_instructions(u32 *addr, u32 *code, size_t len, bool repeat
+ 	patch_addr = (u32 *)(text_poke_addr + ((unsigned long)(addr) & ~MMUPAGE_MASK));
+ 
+ 	pte = __this_cpu_read(cpu_patching_context.pte);
+-	__set_pte_at(&init_mm, text_poke_addr, pte, pfn_pte(pfn, PAGE_KERNEL), 0);
++	__set_pte_at(&init_mm, text_poke_addr, pte, __pte(((pte_basic_t)pfn << MMUPAGE_SHIFT) | pgprot_val(PAGE_KERNEL) | _PAGE_PTE), 0);
+ 	/* See ptesync comment in radix__set_pte_at() */
+ 	if (radix_enabled())
+ 		asm volatile("ptesync" ::: "memory");
+-- 
+2.54.0
+

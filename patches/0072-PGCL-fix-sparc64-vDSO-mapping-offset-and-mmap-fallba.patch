@@ -1,0 +1,93 @@
+From eb23771777c5d3e875968be109f97ac7badc780a Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Mon, 27 Apr 2026 04:30:16 +0200
+Subject: [PATCH 072/174] PGCL: fix sparc64 vDSO mapping offset and mmap
+ fallback alignment
+
+sparc64 vDSO: map_vdso() used VDSO_NR_PAGES * PAGE_SIZE (512KB with
+MMUSHIFT=4) to offset the vDSO text from the vvar base, but
+vdso_install_vvar_mapping() and the vDSO linker script both use
+MMUPAGE_SIZE (32KB total).  The vDSO clock_gettime code reads vvar at
+text - 32KB, but the vvar VMA was 512KB below text, leaving a 480KB
+unmapped gap.  Every clock_gettime call hit SEGV_MAPERR.
+
+Fix: use MMUPAGE_SIZE in area_size and text_start calculations.
+Tested: sparc64 72p/2f/27s LTP (was 34p/40f before fix).
+
+sparc64 mmap: arch_get_unmapped_area and topdown fallback checks used
+PAGE_MASK instead of MMUPAGE_MASK, rejecting valid MMUPAGE-aligned
+addresses as allocation failures.
+
+MIPS stack_top: vDSO and GIC page reservations used PAGE_SIZE but the
+actual vDSO mapping uses MMUPAGE_SIZE.  Over-reserved stack space by
+(PAGE_SIZE - MMUPAGE_SIZE) * (VDSO_NR_PAGES + 1).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/mips/kernel/process.c       | 4 ++--
+ arch/sparc/kernel/sys_sparc_64.c | 4 ++--
+ arch/sparc/vdso/vma.c            | 4 ++--
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index a3101f2268c6..1519846c2ca0 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -692,8 +692,8 @@ unsigned long mips_stack_top(void)
+ 	/* Space for the VDSO, data page & GIC user page */
+ 	if (current->thread.abi) {
+ 		top -= PAGE_ALIGN(current->thread.abi->vdso->size);
+-		top -= VDSO_NR_PAGES * PAGE_SIZE;
+-		top -= mips_gic_present() ? PAGE_SIZE : 0;
++		top -= VDSO_NR_PAGES * MMUPAGE_SIZE;
++		top -= mips_gic_present() ? MMUPAGE_SIZE : 0;
+ 
+ 		/* Space to randomize the VDSO base */
+ 		if (current->flags & PF_RANDOMIZE)
+diff --git a/arch/sparc/kernel/sys_sparc_64.c b/arch/sparc/kernel/sys_sparc_64.c
+index b835b5f6cf36..76637c00556f 100644
+--- a/arch/sparc/kernel/sys_sparc_64.c
++++ b/arch/sparc/kernel/sys_sparc_64.c
+@@ -149,7 +149,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+-	if ((addr & ~PAGE_MASK) && task_size > VA_EXCLUDE_END) {
++	if ((addr & ~MMUPAGE_MASK) && task_size > VA_EXCLUDE_END) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.low_limit = VA_EXCLUDE_END;
+ 		info.high_limit = task_size;
+@@ -223,7 +223,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	if (addr & ~PAGE_MASK) {
++	if (addr & ~MMUPAGE_MASK) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+diff --git a/arch/sparc/vdso/vma.c b/arch/sparc/vdso/vma.c
+index 76846e58ebbd..afe83fe64c4c 100644
+--- a/arch/sparc/vdso/vma.c
++++ b/arch/sparc/vdso/vma.c
+@@ -144,7 +144,7 @@ static_assert(VDSO_NR_PAGES == __VDSO_PAGES);
+ static int map_vdso(const struct vdso_image *image,
+ 		struct vm_special_mapping *vdso_mapping)
+ {
+-	const size_t area_size = image->size + VDSO_NR_PAGES * PAGE_SIZE;
++	const size_t area_size = image->size + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
+ 	unsigned long text_start, addr = 0;
+@@ -170,7 +170,7 @@ static int map_vdso(const struct vdso_image *image,
+ 		goto up_fail;
+ 	}
+ 
+-	text_start = addr + VDSO_NR_PAGES * PAGE_SIZE;
++	text_start = addr + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 	current->mm->context.vdso = (void __user *)text_start;
+ 
+ 	/*
+-- 
+2.54.0
+

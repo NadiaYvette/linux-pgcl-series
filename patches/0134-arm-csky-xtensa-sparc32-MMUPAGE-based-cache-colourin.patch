@@ -1,0 +1,219 @@
+From 0336518d3c50e87630935b9b167e6b17c426ccc4 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 10 Jun 2026 16:39:17 +0200
+Subject: [PATCH 134/174] arm, csky, xtensa, sparc32: MMUPAGE-based cache
+ colouring under PGCL
+
+These VIPT cache-colouring get_unmapped_area implementations compute the
+mmap colour from the file pgoff and align shared/file mappings to SHMLBA
+using PAGE_SHIFT / PAGE_MASK:
+
+  COLOUR_ALIGN:  (pgoff << PAGE_SHIFT) & (SHMLBA - 1)
+  MAP_FIXED chk: (addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1)
+  align_mask:    PAGE_MASK & (SHMLBA - 1)
+  align_offset:  pgoff << PAGE_SHIFT
+
+pgoff is in MMUPAGE units, and the colour bits live between MMUPAGE_SHIFT
+and SHMLBA. Under page clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE can exceed
+SHMLBA, so PAGE_MASK & (SHMLBA - 1) collapses to 0 (no colour alignment)
+and pgoff << PAGE_SHIFT overshoots the colour by PAGE_MMUCOUNT. A shared
+file mapping then comes back only MMUPAGE-aligned rather than colour-
+aligned, and a later MREMAP_FIXED of it fails the MAP_FIXED colour check
+with -EINVAL -- the same failure fixed for sparc64 in the preceding commit
+(LTP mremap06). Convert all colour arithmetic to MMUPAGE units; identical
+to the existing behaviour when PAGE_MMUSHIFT == 0.
+
+arm also uses ~PAGE_MASK to detect a vm_unmapped_area() error return in
+the topdown path; vm_unmapped_area() yields MMUPAGE-aligned addresses
+under PGCL, so use ~MMUPAGE_MASK there too.
+
+These paths are only active on VIPT-aliasing CPUs (do_align), which the
+QEMU models used in matrix testing are not, so this is a correctness fix
+for real aliasing hardware rather than something exercised in CI.
+Compile-tested arm/sparc32/xtensa; csky has no cross-toolchain here but
+the change is mechanical and identical.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/arm/mm/mmap.c               | 22 ++++++++++++++--------
+ arch/csky/abiv1/mmap.c           | 13 +++++++++----
+ arch/sparc/kernel/sys_sparc_32.c |  9 ++++++---
+ arch/xtensa/kernel/syscall.c     |  9 +++++++--
+ 4 files changed, 36 insertions(+), 17 deletions(-)
+
+diff --git a/arch/arm/mm/mmap.c b/arch/arm/mm/mmap.c
+index 3dbb383c26d5..691bf9491de1 100644
+--- a/arch/arm/mm/mmap.c
++++ b/arch/arm/mm/mmap.c
+@@ -13,9 +13,15 @@
+ #include <linux/random.h>
+ #include <asm/cachetype.h>
+ 
++/*
++ * pgoff is in MMUPAGE units (hardware base pages), so the byte offset used
++ * for cache colouring is pgoff << MMUPAGE_SHIFT, not PAGE_SHIFT.  Under page
++ * clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE > MMUPAGE_SIZE and using PAGE_SHIFT
++ * miscomputes the colour.
++ */
+ #define COLOUR_ALIGN(addr,pgoff)		\
+ 	((((addr)+SHMLBA-1)&~(SHMLBA-1)) +	\
+-	 (((pgoff)<<PAGE_SHIFT) & (SHMLBA-1)))
++	 (((pgoff)<<MMUPAGE_SHIFT) & (SHMLBA-1)))
+ 
+ /*
+  * We need to ensure that shared mappings are correctly aligned to
+@@ -49,7 +55,7 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	 */
+ 	if (flags & MAP_FIXED) {
+ 		if (aliasing && flags & MAP_SHARED &&
+-		    (addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1))
++		    (addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -72,8 +78,8 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	info.length = len;
+ 	info.low_limit = mm->mmap_base;
+ 	info.high_limit = TASK_SIZE;
+-	info.align_mask = do_align ? (PAGE_MASK & (SHMLBA - 1)) : 0;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_mask = do_align ? (MMUPAGE_MASK & (SHMLBA - 1)) : 0;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	return vm_unmapped_area(&info);
+ }
+ 
+@@ -102,7 +108,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 
+ 	if (flags & MAP_FIXED) {
+ 		if (aliasing && flags & MAP_SHARED &&
+-		    (addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1))
++		    (addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -123,8 +129,8 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	info.length = len;
+ 	info.low_limit = FIRST_USER_ADDRESS;
+ 	info.high_limit = mm->mmap_base;
+-	info.align_mask = do_align ? (PAGE_MASK & (SHMLBA - 1)) : 0;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_mask = do_align ? (MMUPAGE_MASK & (SHMLBA - 1)) : 0;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	/*
+@@ -133,7 +139,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	if (addr & ~PAGE_MASK) {
++	if (addr & ~MMUPAGE_MASK) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = mm->mmap_base;
+diff --git a/arch/csky/abiv1/mmap.c b/arch/csky/abiv1/mmap.c
+index 1047865e82a9..e840181bed60 100644
+--- a/arch/csky/abiv1/mmap.c
++++ b/arch/csky/abiv1/mmap.c
+@@ -9,9 +9,14 @@
+ #include <linux/random.h>
+ #include <linux/io.h>
+ 
++/*
++ * pgoff is in MMUPAGE units; colour byte offset is pgoff << MMUPAGE_SHIFT.
++ * Under page clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE > MMUPAGE_SIZE, so
++ * PAGE_SHIFT would miscompute the colour.
++ */
+ #define COLOUR_ALIGN(addr,pgoff)		\
+ 	((((addr)+SHMLBA-1)&~(SHMLBA-1)) +	\
+-	 (((pgoff)<<PAGE_SHIFT) & (SHMLBA-1)))
++	 (((pgoff)<<MMUPAGE_SHIFT) & (SHMLBA-1)))
+ 
+ /*
+  * We need to ensure that shared mappings are correctly aligned to
+@@ -33,7 +38,7 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 		.length = len,
+ 		.low_limit = mm->mmap_base,
+ 		.high_limit = TASK_SIZE,
+-		.align_offset = pgoff << PAGE_SHIFT
++		.align_offset = pgoff << MMUPAGE_SHIFT
+ 	};
+ 
+ 	/*
+@@ -47,7 +52,7 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	 */
+ 	if (flags & MAP_FIXED) {
+ 		if (flags & MAP_SHARED &&
+-		    (addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1))
++		    (addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -67,6 +72,6 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 			return addr;
+ 	}
+ 
+-	info.align_mask = do_align ? (PAGE_MASK & (SHMLBA - 1)) : 0;
++	info.align_mask = do_align ? (MMUPAGE_MASK & (SHMLBA - 1)) : 0;
+ 	return vm_unmapped_area(&info);
+ }
+diff --git a/arch/sparc/kernel/sys_sparc_32.c b/arch/sparc/kernel/sys_sparc_32.c
+index fe433ce5d386..ab22c9ad4890 100644
+--- a/arch/sparc/kernel/sys_sparc_32.c
++++ b/arch/sparc/kernel/sys_sparc_32.c
+@@ -53,7 +53,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if (!file_hugepage && (flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1)))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1)))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -68,9 +68,12 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
+ 	info.low_limit = addr;
+ 	info.high_limit = TASK_SIZE;
+ 	if (!file_hugepage) {
++		/* Colour bits live between MMUPAGE_SHIFT and SHMLBA; under page
++		 * clustering PAGE_SIZE can exceed SHMLBA so PAGE_MASK would
++		 * collapse the mask. pgoff is MMUPAGE-granular. */
+ 		info.align_mask = (flags & MAP_SHARED) ?
+-			(PAGE_MASK & (SHMLBA - 1)) : 0;
+-		info.align_offset = pgoff << PAGE_SHIFT;
++			(MMUPAGE_MASK & (SHMLBA - 1)) : 0;
++		info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	} else {
+ 		info.align_mask = huge_page_mask_align(filp);
+ 	}
+diff --git a/arch/xtensa/kernel/syscall.c b/arch/xtensa/kernel/syscall.c
+index dc54f854c2f5..3632af2cf8fb 100644
+--- a/arch/xtensa/kernel/syscall.c
++++ b/arch/xtensa/kernel/syscall.c
+@@ -32,9 +32,14 @@ syscall_t sys_call_table[] /* FIXME __cacheline_aligned */= {
+ #include <asm/syscall_table.h>
+ };
+ 
++/*
++ * pgoff is in MMUPAGE units; colour byte offset is pgoff << MMUPAGE_SHIFT.
++ * Under page clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE > MMUPAGE_SIZE, so
++ * PAGE_SHIFT would miscompute the colour.
++ */
+ #define COLOUR_ALIGN(addr, pgoff) \
+ 	((((addr) + SHMLBA - 1) & ~(SHMLBA - 1)) + \
+-	 (((pgoff) << PAGE_SHIFT) & (SHMLBA - 1)))
++	 (((pgoff) << MMUPAGE_SHIFT) & (SHMLBA - 1)))
+ 
+ asmlinkage long xtensa_shmat(int shmid, char __user *shmaddr, int shmflg)
+ {
+@@ -66,7 +71,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if ((flags & MAP_SHARED) &&
+-				((addr - (pgoff << PAGE_SHIFT)) & (SHMLBA - 1)))
++				((addr - (pgoff << MMUPAGE_SHIFT)) & (SHMLBA - 1)))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+-- 
+2.54.0
+

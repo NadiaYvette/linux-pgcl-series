@@ -1,0 +1,54 @@
+From 439ef9a058e19ae1abbc7032155459249300b091 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 27 May 2026 18:06:40 +0200
+Subject: [PATCH 126/174] alpha: define __pte_val_to_phys (inverse of
+ __phys_to_pte_val)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Alpha stores the hardware PFN in PTE bits[63:32], and defines
+__phys_to_pte_val(phys) = ((phys >> MMUPAGE_SHIFT) << 32) but never
+provided the inverse.  The generic identity fallback in
+include/linux/pgtable.h returns the raw PTE value, so pte_suboffset()
+extracts garbage on alpha (flag bits 12..17 rather than the actual
+sub-PAGE bits that live up at bits 12..17 of the *physical* address
+encoded in PFN bits[63:32]).
+
+PGCL's COW path (e.g. do_wp_page → wp_page_copy after commit
+0e8705ff95d8) calls pte_suboffset(orig_pte) to preserve the source
+PTE's sub-PAGE offset when remapping a COWed page; on alpha the wrong
+sub-PAGE was being used, so the new PTE pointed at the wrong MMUPAGE
+of the new folio and userspace read uninitialised content from the
+fresh copy.  At PGCL=6 with init(1) starting from a glibc/busybox
+binary this manifests as an endless userspace unaligned-access trap
+loop with the trap PC pinned to one instruction — the loaded code is
+zeroes and the instruction at the entry point decodes to an aligned
+load of an unaligned operand.
+
+The inverse: mask out flag bits with _PFN_MASK, then shift down by
+(32 - MMUPAGE_SHIFT) so the MMUPAGE-PFN lands at bit position
+MMUPAGE_SHIFT and the result reads as a normal physical byte address.
+
+Verified clean on alpha PGCL=6: pgcl-stress 12/0, LTP 74p/0f/27s.
+
+Signed-off-by: Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
+---
+ arch/alpha/include/asm/pgtable.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/alpha/include/asm/pgtable.h b/arch/alpha/include/asm/pgtable.h
+index 20c79f48fc4c..0664308899c6 100644
+--- a/arch/alpha/include/asm/pgtable.h
++++ b/arch/alpha/include/asm/pgtable.h
+@@ -197,6 +197,7 @@ extern struct page *empty_zero_page_struct;
+ #define PFN_PTE_SHIFT		32
+ #define pte_pfn(pte)		((pte_val(pte) >> PFN_PTE_SHIFT) >> PAGE_MMUSHIFT)
+ #define __phys_to_pte_val(phys)	(((phys) >> MMUPAGE_SHIFT) << 32)
++#define __pte_val_to_phys(val)	(((val) & _PFN_MASK) >> (32 - MMUPAGE_SHIFT))
+ 
+ #define pte_page(pte)	pfn_to_page(pte_pfn(pte))
+ 
+-- 
+2.54.0
+

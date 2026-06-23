@@ -1,0 +1,84 @@
+From 2a0c6f9842f1b8aa104524163bf0062753400231 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 26 Mar 2026 01:29:52 +0100
+Subject: [PATCH 045/174] PGCL: fix alpha pmd_page/pud_page hardware-vs-kernel
+ PFN and CRB console remap
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two bugs in alpha page table code when PAGE_MMUSHIFT > 0:
+
+1. pmd_pfn/pmd_page/pud_page passed hardware PFNs (pa >> MMUPAGE_SHIFT)
+   to pfn_to_page() which expects kernel PFNs (pa >> PAGE_SHIFT). This
+   returned struct pages 16x too far into mem_map. When free_pte_range
+   called pmd_page() to find the page table page to free, it freed the
+   wrong page. After enough mmap/munmap cycles, kernel text pages were
+   freed and reallocated for data, causing instruction stream corruption
+   (opDEC faults in _copy_from_iter, 0xffffffff in code dump).
+
+   Fix: add >> PAGE_MMUSHIFT to convert hardware PFN to kernel PFN,
+   matching the existing pte_pfn() which already had this conversion.
+
+2. CRB console callback page remapping used pfn_pte() with kernel-page
+   PFN granularity but iterated at MMUPAGE stride. Each pfn++ stepped
+   128KB instead of 8KB, mapping 16x more physical space than intended.
+
+   Fix: use physical address directly with __phys_to_pte_val() and
+   step by MMUPAGE_SIZE.
+
+Alpha now passes 19/19 pgcl-test + 11/11 pgcl-stress (2 SKIP) at
+PAGE_MMUSHIFT=4 with zero kernel warnings. The previous "vmsplice
+EFAULT" was never a vmsplice bug — the test was blocked by the
+pmd_page corruption causing OOM/crashes before reaching that test.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/alpha/include/asm/pgtable.h | 6 +++---
+ arch/alpha/mm/init.c             | 6 +++---
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/arch/alpha/include/asm/pgtable.h b/arch/alpha/include/asm/pgtable.h
+index 1b42d64f6f7a..83486711db20 100644
+--- a/arch/alpha/include/asm/pgtable.h
++++ b/arch/alpha/include/asm/pgtable.h
+@@ -218,9 +218,9 @@ pmd_page_vaddr(pmd_t pmd)
+ 	return ((pmd_val(pmd) & _PFN_MASK) >> (32-MMUPAGE_SHIFT)) + PAGE_OFFSET;
+ }
+ 
+-#define pmd_pfn(pmd)	(pmd_val(pmd) >> 32)
+-#define pmd_page(pmd)	(pfn_to_page(pmd_val(pmd) >> 32))
+-#define pud_page(pud)	(pfn_to_page(pud_val(pud) >> 32))
++#define pmd_pfn(pmd)	((pmd_val(pmd) >> 32) >> PAGE_MMUSHIFT)
++#define pmd_page(pmd)	(pfn_to_page(pmd_pfn(pmd)))
++#define pud_page(pud)	(pfn_to_page((pud_val(pud) >> 32) >> PAGE_MMUSHIFT))
+ 
+ extern inline pmd_t *pud_pgtable(pud_t pgd)
+ {
+diff --git a/arch/alpha/mm/init.c b/arch/alpha/mm/init.c
+index 99b860cb316d..20c891fa4464 100644
+--- a/arch/alpha/mm/init.c
++++ b/arch/alpha/mm/init.c
+@@ -186,7 +186,7 @@ callback_init(void * kernel_end)
+ 		/* Set up the third level PTEs and update the virtual
+ 		   addresses of the CRB entries.  */
+ 		for (i = 0; i < crb->map_entries; ++i) {
+-			unsigned long pfn = crb->map[i].pa >> PAGE_SHIFT;
++			unsigned long pa = crb->map[i].pa;
+ 			crb->map[i].va = vaddr;
+ 			for (j = 0; j < crb->map[i].count; ++j) {
+ 				/* Newer consoles (especially on larger
+@@ -199,8 +199,8 @@ callback_init(void * kernel_end)
+ 					kernel_end += MMUPAGE_SIZE;
+ 				}
+ 				set_pte(pte_offset_kernel(pmd, vaddr),
+-					pfn_pte(pfn, PAGE_KERNEL));
+-				pfn++;
++					__pte(__phys_to_pte_val(pa) | pgprot_val(PAGE_KERNEL)));
++				pa += MMUPAGE_SIZE;
+ 				vaddr += MMUPAGE_SIZE;
+ 			}
+ 		}
+-- 
+2.54.0
+

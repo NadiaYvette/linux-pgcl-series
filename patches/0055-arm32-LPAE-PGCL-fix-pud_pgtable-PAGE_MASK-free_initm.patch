@@ -1,0 +1,207 @@
+From ad76cafba52a0e04902fafad94a395676c0672fb Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 28 Mar 2026 17:03:54 +0100
+Subject: [PATCH 055/174] arm32 LPAE+PGCL: fix pud_pgtable PAGE_MASK,
+ free_initmem, SWAPPER_PG_DIR_SIZE, linker script
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three fixes to enable ARM32 LPAE boot with PAGE_MMUSHIFT=4:
+
+1. pgtable-3level.h: pud_pgtable() used PAGE_MASK to extract PMD table
+   physical address from PGD entries. With PGCL PAGE_SHIFT=16, this
+   clears bits [15:12] of the 4KB-aligned PMD table address, corrupting
+   page table walks. Use MMUPAGE_MASK instead.
+
+2. init.c: free_initmem() PGCL path scanned raw 32-bit L1 descriptors
+   (non-LPAE format). With LPAE, page tables use 64-bit descriptors in
+   a PGD→PMD→PTE hierarchy. The old code couldn't find PTE tables in
+   LPAE entries, so it freed init pages containing PTE tables (including
+   the vectors page at 0xffff0000), causing prefetch abort loops when
+   userspace started. Add CONFIG_ARM_LPAE path that walks PGD→PMD
+   entries using proper 64-bit LPAE format.
+
+3. mmu.c: SWAPPER_PG_DIR_SIZE used PAGE_SIZE for the PGD reservation.
+   The PGD is one hardware page (4KB), not one kernel page (64KB with
+   PGCL). Use MMUPAGE_SIZE.
+
+4. vmlinux.lds.S: Use MMUPAGE_SIZE for RO_DATA, init alignment, and
+   RW_DATA to avoid 64KB alignment bloat in non-STRICT_KERNEL_RWX
+   configurations.
+
+Tested: arm32 LPAE + PAGE_MMUSHIFT=4 boots on QEMU virt (cortex-a15),
+19/19 pgcl-test + 11/11 pgcl-stress PASS, zero kernel warnings.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm/include/asm/pgtable-3level.h |  2 +-
+ arch/arm/kernel/vmlinux.lds.S         |  6 +--
+ arch/arm/mm/init.c                    | 76 +++++++++++++++++++--------
+ arch/arm/mm/mmu.c                     |  4 +-
+ 4 files changed, 59 insertions(+), 29 deletions(-)
+
+diff --git a/arch/arm/include/asm/pgtable-3level.h b/arch/arm/include/asm/pgtable-3level.h
+index 7b71a3d414b7..3206d3dcaf82 100644
+--- a/arch/arm/include/asm/pgtable-3level.h
++++ b/arch/arm/include/asm/pgtable-3level.h
+@@ -134,7 +134,7 @@
+ 
+ static inline pmd_t *pud_pgtable(pud_t pud)
+ {
+-	return __va(pud_val(pud) & PHYS_MASK & (s32)PAGE_MASK);
++	return __va(pud_val(pud) & PHYS_MASK & (s32)MMUPAGE_MASK);
+ }
+ 
+ #define pmd_bad(pmd)		(!(pmd_val(pmd) & PMD_TABLE_BIT))
+diff --git a/arch/arm/kernel/vmlinux.lds.S b/arch/arm/kernel/vmlinux.lds.S
+index c07843c3c53d..3a03e1d8e533 100644
+--- a/arch/arm/kernel/vmlinux.lds.S
++++ b/arch/arm/kernel/vmlinux.lds.S
+@@ -69,7 +69,7 @@ SECTIONS
+ #endif
+ 	_etext = .;			/* End of text section */
+ 
+-	RO_DATA(PAGE_SIZE)
++	RO_DATA(MMUPAGE_SIZE)
+ 
+ 	. = ALIGN(4);
+ 	__ex_table : AT(ADDR(__ex_table) - LOAD_OFFSET) {
+@@ -85,7 +85,7 @@ SECTIONS
+ #ifdef CONFIG_STRICT_KERNEL_RWX
+ 	. = ALIGN(1<<SECTION_SHIFT);
+ #else
+-	. = ALIGN(PAGE_SIZE);
++	. = ALIGN(MMUPAGE_SIZE);
+ #endif
+ 	__init_begin = .;
+ 
+@@ -142,7 +142,7 @@ SECTIONS
+ 	__init_end = .;
+ 
+ 	_sdata = .;
+-	RW_DATA(L1_CACHE_BYTES, PAGE_SIZE, THREAD_ALIGN)
++	RW_DATA(L1_CACHE_BYTES, MMUPAGE_SIZE, THREAD_ALIGN)
+ 	_edata = .;
+ 
+ 	BSS_SECTION(0, 0, 0)
+diff --git a/arch/arm/mm/init.c b/arch/arm/mm/init.c
+index e9c231a34407..70e65d867497 100644
+--- a/arch/arm/mm/init.c
++++ b/arch/arm/mm/init.c
+@@ -431,44 +431,74 @@ void free_initmem(void)
+ 			free_initmem_default(-1);
+ 		} else {
+ 			/*
+-			 * PGCL: scan ALL 4096 ARM hardware L1 page table
+-			 * entries directly (not via Linux PGD abstraction,
+-			 * which only exposes the first L1 desc per 2MB pair).
++			 * PGCL: scan page table entries to find PTE tables.
+ 			 * Skip any init page containing a PTE table.
++			 *
++			 * LPAE: 4 PGD entries × 512 PMD entries (64-bit each).
++			 *   PMD TABLE entry: bits[39:12] = PTE table phys addr.
++			 * Non-LPAE: 4096 L1 entries (32-bit each).
++			 *   Coarse PT entry: bits[31:10] = PTE table phys addr.
+ 			 */
+ 			unsigned long pos;
+ 			unsigned long start = PAGE_ALIGN((unsigned long)__init_begin);
+ 			unsigned long end = (unsigned long)__init_end & PAGE_MASK;
+ 			unsigned long freed = 0;
+-			u32 *l1 = (u32 *)init_mm.pgd;
+-			int i;
+ 
+ 			for (pos = start; pos < end; pos += PAGE_SIZE) {
+ 				unsigned long page_phys = __pa(pos);
+ 				unsigned long page_phys_end = page_phys + PAGE_SIZE;
+ 				bool has_pgtable = false;
+ 
+-				/*
+-				 * Scan all 4096 L1 descriptors.  Each covers 1MB.
+-				 * Type bits [1:0]: 01 = coarse page table.
+-				 * PTE table phys addr in bits [31:10].
+-				 */
+-				for (i = 0; i < 4096; i++) {
+-					u32 desc = l1[i];
+-					unsigned long pte_phys;
+-
+-					if ((desc & PMD_TYPE_MASK) != PMD_TYPE_TABLE)
+-						continue;
+-					pte_phys = (unsigned long)(desc & ~0x3FFU) & PAGE_MASK;
+-					if (pte_phys >= page_phys && pte_phys < page_phys_end) {
+-						has_pgtable = true;
+-						break;
++#ifdef CONFIG_ARM_LPAE
++				{
++					pgd_t *pgd;
++					pud_t *pud;
++					pmd_t *pmd;
++					int gi, pi;
++
++					for (gi = 0; gi < PTRS_PER_PGD && !has_pgtable; gi++) {
++						pgd = init_mm.pgd + gi;
++						if (pgd_none(*pgd))
++							continue;
++						pud = pud_offset(p4d_offset(pgd, 0), 0);
++						pmd = (pmd_t *)pud_pgtable(*pud);
++						for (pi = 0; pi < PTRS_PER_PMD; pi++) {
++							pmdval_t val = pmd_val(pmd[pi]);
++							unsigned long pte_phys;
++
++							if ((val & PMD_TYPE_MASK) != PMD_TYPE_TABLE)
++								continue;
++							pte_phys = val & PHYS_MASK & MMUPAGE_MASK;
++							if (pte_phys >= page_phys &&
++							    pte_phys < page_phys_end) {
++								has_pgtable = true;
++								break;
++							}
++						}
+ 					}
+ 				}
+-
+-				if (has_pgtable) {
+-					continue;
++#else
++				{
++					u32 *l1 = (u32 *)init_mm.pgd;
++					int i;
++
++					for (i = 0; i < 4096; i++) {
++						u32 desc = l1[i];
++						unsigned long pte_phys;
++
++						if ((desc & PMD_TYPE_MASK) != PMD_TYPE_TABLE)
++							continue;
++						pte_phys = (unsigned long)(desc & ~0x3FFU) & PAGE_MASK;
++						if (pte_phys >= page_phys &&
++						    pte_phys < page_phys_end) {
++							has_pgtable = true;
++							break;
++						}
++					}
+ 				}
++#endif
++				if (has_pgtable)
++					continue;
+ 				free_reserved_page(virt_to_page((void *)pos));
+ 				freed++;
+ 			}
+diff --git a/arch/arm/mm/mmu.c b/arch/arm/mm/mmu.c
+index a702a801b370..3c0ec72d3246 100644
+--- a/arch/arm/mm/mmu.c
++++ b/arch/arm/mm/mmu.c
+@@ -1322,8 +1322,8 @@ static __init void prepare_page_table(void)
+ }
+ 
+ #ifdef CONFIG_ARM_LPAE
+-/* the first page is reserved for pgd */
+-#define SWAPPER_PG_DIR_SIZE	(PAGE_SIZE + \
++/* the first page is reserved for pgd (hardware page, not kernel page) */
++#define SWAPPER_PG_DIR_SIZE	(MMUPAGE_SIZE + \
+ 				 PTRS_PER_PGD * PTRS_PER_PMD * sizeof(pmd_t))
+ #else
+ #define SWAPPER_PG_DIR_SIZE	(PTRS_PER_PGD * sizeof(pgd_t))
+-- 
+2.54.0
+

@@ -1,0 +1,49 @@
+From f9d7d5de2cd3765e619c0eddb37667b5804def29 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 10 May 2026 12:41:47 +0200
+Subject: [PATCH 105/174] parisc: bump SECTION_SIZE_BITS to 28 so PGCL=6 builds
+
+mmzone.h enforces (MAX_PAGE_ORDER + PAGE_SHIFT) <= SECTION_SIZE_BITS.
+At PGCL=6 with the 4 KiB MMU page that parisc 64-bit defaults to,
+PAGE_SHIFT is 18 and MAX_PAGE_ORDER is 10, so the check needs >= 28
+bits of section size; the previous 27 (128 MiB) was just barely big
+enough at PGCL=4 (10 + 16 = 26 <= 27) but breaks at PGCL=6 with:
+
+  include/linux/mmzone.h: error: #error Allocator MAX_PAGE_ORDER
+                          exceeds SECTION_SIZE
+
+Bumping to 28 (256 MiB sections) covers PGCL=6 and is harmless on
+non-PGCL parisc builds (still well within MAX_PHYSMEM_BITS=39).
+
+With this plus building hppa64 with ARCH=parisc64 (not the
+mismatched ARCH=parisc + hppa64 toolchain combination the matrix had
+been using), hppa64 boots successfully at PGCL=4 and PGCL=6:
+pgcl-test 12p/0f, LTP runs.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/parisc/include/asm/sparsemem.h | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/arch/parisc/include/asm/sparsemem.h b/arch/parisc/include/asm/sparsemem.h
+index b5c3a79045b4..54a0a748e6d4 100644
+--- a/arch/parisc/include/asm/sparsemem.h
++++ b/arch/parisc/include/asm/sparsemem.h
+@@ -9,6 +9,13 @@
+  */
+ 
+ #define MAX_PHYSMEM_BITS	39	/* 512 GB */
+-#define SECTION_SIZE_BITS	27	/* 128 MB */
++/*
++ * SECTION_SIZE_BITS must be >= MAX_PAGE_ORDER + PAGE_SHIFT.  Under PGCL,
++ * PAGE_SHIFT can grow well beyond the bare MMU page; at PGCL=6 with
++ * a 4 KiB MMU page it is 18, and MAX_PAGE_ORDER is 10, so we need at
++ * least 28 bits (256 MiB sections).  Bumping unconditionally is harmless
++ * for non-PGCL builds (still 256 MiB sections).
++ */
++#define SECTION_SIZE_BITS	28	/* 256 MB */
+ 
+ #endif
+-- 
+2.54.0
+

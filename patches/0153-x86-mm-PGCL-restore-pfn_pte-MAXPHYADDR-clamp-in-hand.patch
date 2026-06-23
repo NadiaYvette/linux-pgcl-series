@@ -1,0 +1,143 @@
+From a927746c773e4bbf51141366ed8cb794bddfb1a6 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 16 Jun 2026 21:58:00 +0200
+Subject: [PATCH 153/174] x86/mm: PGCL: restore pfn_pte() MAXPHYADDR clamp in
+ hand-rolled PTEs
+
+The page-clustering forward-port hand-rolls the 4K leaf PTE in
+phys_pte_init() as
+
+    __pte((paddr & MMUPAGE_MASK) | pgprot_val(prot))
+
+instead of mainline's pfn_pte(paddr >> PAGE_SHIFT, prot).  pfn_pte()
+masks the frame with PTE_PFN_MASK (== PHYSICAL_PAGE_MASK); the
+hand-rolled form used MMUPAGE_MASK, which clears only the low
+MMUPAGE_SHIFT bits and never the bits above the CPU's physical-address
+width.  The same dropped-clamp pattern is present at four sibling
+direct-paddr PTE sites: cpu_entry_area.c (cea_set_pte), ioremap.c,
+pgtable.c (__native_set_fixmap) and pti.c.
+
+This is a Newton-limit violation.  At CONFIG_PAGE_MMUSHIFT==0,
+MMUPAGE_MASK == PAGE_MASK, so for any paddr carrying bits above
+MAXPHYADDR the result differs from mainline, which masks them off.
+The fix is identity at shift 0 and correct at PGCL>0 because PGCL
+defines
+
+    PHYSICAL_PAGE_MASK = ((signed long)MMUPAGE_MASK) & __PHYSICAL_MASK
+
+i.e. MMUPAGE-granular (preserves the sub-PAGE offset needed at PGCL>0)
+AND MAXPHYADDR-clamped (matches mainline pfn_pte at shift 0).  The
+2M/1G paths already use the clamped pfn_pmd()/pfn_pud(); only the 4K
+leaf and the four direct-paddr sites had dropped it.
+
+Proof this is NOT the origin of the #106 laptop reserved-bit fault (a
+corrupt free page handed out by the buddy allocator; faulting PFN
+~0xfffeedd38, i.e. ~bit 48): phys_pte_init()'s paddr is bounded by the
+mapped RAM/ACPI ranges -- every init_memory_mapping() /
+kernel_physical_mapping_init() caller passes a range
+<= max_pfn << PAGE_SHIFT, and this laptop's top of RAM is 0x105f7fffff
+(~bit 36).  The PTE is built by AND/OR only: AND can merely clear bits,
+and pgprot_val(PAGE_KERNEL) sets nothing in the PFN field (bits
+12..51).  A bit-36-bounded paddr therefore cannot yield a bit-48 PFN
+at this site, so it did not write the faulting entry.  This is fixed
+as a genuine latent Newton bug, not as the #106 root cause (which
+remains a corrupt buddy free-page originating elsewhere).
+
+A WARN_ONCE() is added at the 4K leaf asserting paddr stays within
+MAXPHYADDR: a permanent invariant tripwire and an empirical check on
+the bound above -- it must never fire, and if it does the bound
+reasoning is wrong.
+
+Verified: builds at PAGE_MMUSHIFT=0 and =4; PGCL=4 boots clean
+(LTP 71p/0f/28s) with the WARN_ONCE silent, as predicted.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/x86/mm/cpu_entry_area.c |  2 +-
+ arch/x86/mm/init_64.c        | 15 ++++++++++++++-
+ arch/x86/mm/ioremap.c        |  2 +-
+ arch/x86/mm/pgtable.c        |  2 +-
+ arch/x86/mm/pti.c            |  2 +-
+ 5 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/mm/cpu_entry_area.c b/arch/x86/mm/cpu_entry_area.c
+index a981efc2f764..5eac08174dd2 100644
+--- a/arch/x86/mm/cpu_entry_area.c
++++ b/arch/x86/mm/cpu_entry_area.c
+@@ -87,7 +87,7 @@ EXPORT_SYMBOL(get_cpu_entry_area);
+ void cea_set_pte(void *cea_vaddr, phys_addr_t pa, pgprot_t flags)
+ {
+ 	unsigned long va = (unsigned long) cea_vaddr;
+-	pte_t pte = __pte((pa & MMUPAGE_MASK) | pgprot_val(flags));
++	pte_t pte = __pte((pa & PHYSICAL_PAGE_MASK) | pgprot_val(flags));
+ 
+ 	/*
+ 	 * The cpu_entry_area is shared between the user and kernel
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 87df4b9a0e38..c815fe5adb4d 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -505,7 +505,20 @@ phys_pte_init(pte_t *pte_page, unsigned long paddr, unsigned long paddr_end,
+ 		}
+ 
+ 		pages++;
+-		set_pte_init(pte, __pte((paddr & MMUPAGE_MASK) | pgprot_val(prot)), init);
++		/*
++		 * #106 diagnostic + Newton fix: the 4K leaf is reached only for
++		 * sub-2MB RAM fragments (laptop's fragmented UEFI map; never on
++		 * QEMU's contiguous map).  PHYSICAL_PAGE_MASK (== MMUPAGE_MASK &
++		 * __PHYSICAL_MASK) restores the MAXPHYADDR clamp that pfn_pte()
++		 * applies in mainline and that the hand-rolled PGCL PTE dropped;
++		 * identity at PAGE_MMUSHIFT==0.  The WARN_ONCE fires iff paddr
++		 * carries bits above MAXPHYADDR before we build the PTE — i.e. the
++		 * suspected #106 trigger actually reaches this leaf.
++		 */
++		WARN_ONCE(paddr & ~PHYSICAL_PAGE_MASK & ~(MMUPAGE_SIZE - 1),
++			  "PGCL #106: phys_pte_init paddr %lx above MAXPHYADDR (prot %lx)\n",
++			  paddr, (unsigned long)pgprot_val(prot));
++		set_pte_init(pte, __pte((paddr & PHYSICAL_PAGE_MASK) | pgprot_val(prot)), init);
+ 		paddr_last = (paddr & MMUPAGE_MASK) + MMUPAGE_SIZE;
+ 	}
+ 
+diff --git a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+index 28771569dbea..9cadcefd1c2c 100644
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -904,7 +904,7 @@ void __init __early_set_fixmap(enum fixed_addresses idx,
+ 	pgprot_val(flags) &= __supported_pte_mask;
+ 
+ 	if (pgprot_val(flags))
+-		set_pte(pte, __pte((phys & MMUPAGE_MASK) | pgprot_val(flags)));
++		set_pte(pte, __pte((phys & PHYSICAL_PAGE_MASK) | pgprot_val(flags)));
+ 	else
+ 		pte_clear(&init_mm, addr, pte);
+ 	flush_tlb_one_kernel(addr);
+diff --git a/arch/x86/mm/pgtable.c b/arch/x86/mm/pgtable.c
+index 68acdee8a6c3..ca5473b96e39 100644
+--- a/arch/x86/mm/pgtable.c
++++ b/arch/x86/mm/pgtable.c
+@@ -588,7 +588,7 @@ void native_set_fixmap(unsigned /* enum fixed_addresses */ idx,
+ 	/* Sanitize 'prot' against any unsupported bits: */
+ 	pgprot_val(flags) &= __default_kernel_pte_mask;
+ 
+-	__native_set_fixmap(idx, __pte((phys & MMUPAGE_MASK) | pgprot_val(flags)));
++	__native_set_fixmap(idx, __pte((phys & PHYSICAL_PAGE_MASK) | pgprot_val(flags)));
+ }
+ 
+ #ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
+diff --git a/arch/x86/mm/pti.c b/arch/x86/mm/pti.c
+index c83961900633..080c8f08d938 100644
+--- a/arch/x86/mm/pti.c
++++ b/arch/x86/mm/pti.c
+@@ -473,7 +473,7 @@ static void __init pti_clone_user_shared(void)
+ 		if (WARN_ON(!target_pte))
+ 			return;
+ 
+-		*target_pte = __pte((pa & MMUPAGE_MASK) | pgprot_val(PAGE_KERNEL));
++		*target_pte = __pte((pa & PHYSICAL_PAGE_MASK) | pgprot_val(PAGE_KERNEL));
+ 	}
+ }
+ 
+-- 
+2.54.0
+

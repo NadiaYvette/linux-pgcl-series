@@ -1,0 +1,113 @@
+From 6d0765a6e0d63c7351b68c4f52f8c4075e63cbf0 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 12 Jun 2026 14:22:00 +0200
+Subject: [PATCH 143/174] sh, fork: PGCL: fix sh4 early-fork panic at
+ PAGE_MMUSHIFT>0
+
+Three stacked bugs prevented the first fork/execve at PAGE_MMUSHIFT=4 on sh
+(qemu-system-sh4 -M r2d); fixed and verified to userspace (mmap-touch +
+fork-COW + execve PASS, AT_PAGESZ=0x1000). All three are identity at
+PAGE_MMUSHIFT==0.
+
+1. kernel/fork.c: the page-allocator thread-stack branch was gated on
+   THREAD_SIZE >= MMUPAGE_SIZE; restore THREAD_SIZE >= PAGE_SIZE (3 sites).
+   sh has no VMAP_STACK and 8K (THREAD_SHIFT=13) stacks; at PGCL=4
+   THREAD_SIZE_ORDER = THREAD_SHIFT - PAGE_SHIFT = -3, so alloc_pages(order=-3)
+   returns NULL (WARN at mm/page_alloc.c) and the first fork fails, then
+   rest_init() derefs the NULL task ("Attempted to kill the idle task"). A
+   stack smaller than a kernel PAGE must use the kmem_cache path. (Generic;
+   warrants a matrix re-check for other non-VMAP_STACK arches with
+   MMUPAGE_SIZE <= THREAD_SIZE < PAGE_SIZE.)
+2. arch/sh pgtable-2level.h/-3level.h: PTE_SHIFT/PMD_SHIFT keyed on PAGE_SHIFT
+   -> generic pte_index() (MMUPAGE-granular) ran off the end of a PTE table
+   (table maps 64MiB, PGD boundary at 1GiB). Key PTE_SHIFT on MMUPAGE_SHIFT,
+   PTE_BITS = PAGE_SHIFT - PTE_MAGNITUDE.
+3. arch/sh/include/asm/elf.h: ELF_EXEC_PAGESIZE PAGE_SIZE -> MMUPAGE_SIZE
+   (matches ce35ccd75ca0 for the other PGCL arches), else execve fails -14.
+
+sh needs no __phys_to_pte_val override (pte_val holds raw phys; SH4 bit-10 PPN
+applied at TLB load). Found+verified via the sh4-smoke harness.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/sh/include/asm/elf.h            | 2 +-
+ arch/sh/include/asm/pgtable-2level.h | 4 ++--
+ arch/sh/include/asm/pgtable-3level.h | 2 +-
+ kernel/fork.c                        | 6 +++---
+ 4 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/arch/sh/include/asm/elf.h b/arch/sh/include/asm/elf.h
+index 2862d6d1cb64..fb45a442ae4c 100644
+--- a/arch/sh/include/asm/elf.h
++++ b/arch/sh/include/asm/elf.h
+@@ -104,7 +104,7 @@ typedef struct user_fpu_struct elf_fpregset_t;
+ #define CORE_DUMP_USE_REGSET
+ 
+ #define ELF_FDPIC_CORE_EFLAGS	EF_SH_FDPIC
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+    use of this is to invoke "./ld.so someprog" to test out a new version of
+diff --git a/arch/sh/include/asm/pgtable-2level.h b/arch/sh/include/asm/pgtable-2level.h
+index 08bff93927ff..edda1c9b2cee 100644
+--- a/arch/sh/include/asm/pgtable-2level.h
++++ b/arch/sh/include/asm/pgtable-2level.h
+@@ -12,8 +12,8 @@
+ /* PTE bits */
+ #define PTE_MAGNITUDE		2	/* 32-bit PTEs */
+ 
+-#define PTE_SHIFT		PAGE_SHIFT
+-#define PTE_BITS		(PTE_SHIFT - PTE_MAGNITUDE)
++#define PTE_SHIFT		MMUPAGE_SHIFT
++#define PTE_BITS		(PAGE_SHIFT - PTE_MAGNITUDE)
+ 
+ /* PGD bits */
+ #define PGDIR_SHIFT		(PTE_SHIFT + PTE_BITS)
+diff --git a/arch/sh/include/asm/pgtable-3level.h b/arch/sh/include/asm/pgtable-3level.h
+index d1ce73f3bd85..549480a093cf 100644
+--- a/arch/sh/include/asm/pgtable-3level.h
++++ b/arch/sh/include/asm/pgtable-3level.h
+@@ -19,7 +19,7 @@
+ #define USER_PTRS_PER_PGD	2
+ 
+ /* PMD bits */
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - PTE_MAGNITUDE))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (PAGE_SHIFT - PTE_MAGNITUDE))
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index de777b6ef9bc..cfa61579090b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -391,7 +391,7 @@ static void free_thread_stack(struct task_struct *tsk)
+  * Allocate pages if THREAD_SIZE is >= PAGE_SIZE, otherwise use a
+  * kmemcache based allocator.
+  */
+-#if THREAD_SIZE >= MMUPAGE_SIZE
++#if THREAD_SIZE >= PAGE_SIZE
+ 
+ static void thread_stack_free_rcu(struct rcu_head *rh)
+ {
+@@ -423,7 +423,7 @@ static void free_thread_stack(struct task_struct *tsk)
+ 	tsk->stack = NULL;
+ }
+ 
+-#else /* !(THREAD_SIZE >= MMUPAGE_SIZE) */
++#else /* !(THREAD_SIZE >= PAGE_SIZE) */
+ 
+ static struct kmem_cache *thread_stack_cache;
+ 
+@@ -462,7 +462,7 @@ void thread_stack_cache_init(void)
+ 	BUG_ON(thread_stack_cache == NULL);
+ }
+ 
+-#endif /* THREAD_SIZE >= MMUPAGE_SIZE */
++#endif /* THREAD_SIZE >= PAGE_SIZE */
+ #endif /* CONFIG_VMAP_STACK */
+ 
+ /* SLAB cache for signal_struct structures (tsk->signal) */
+-- 
+2.54.0
+

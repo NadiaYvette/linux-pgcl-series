@@ -1,0 +1,79 @@
+From 95962451130c391638d430f2e06b15aef4bfc29d Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 26 Mar 2026 02:08:27 +0100
+Subject: [PATCH 046/174] PGCL: fix alpha osf_sys getpagesize and pci-sysfs
+ vm_pgoff granularity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+osf_sys getpagesize() must return MMUPAGE_SIZE (hardware page size visible
+to userspace), not PAGE_SIZE (kernel allocation granularity).
+
+pci-sysfs.c vm_pgoff calculations use PAGE_SHIFT but vm_pgoff is in
+MMUPAGE units — use MMUPAGE_SHIFT for correct PCI BAR mmap offsets.
+
+Alpha 19/19 pgcl-test + 11/11 pgcl-stress PASS.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/alpha/kernel/osf_sys.c   | 2 +-
+ arch/alpha/kernel/pci-sysfs.c | 8 ++++----
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/arch/alpha/kernel/osf_sys.c b/arch/alpha/kernel/osf_sys.c
+index fb4884cbd313..b1d754670278 100644
+--- a/arch/alpha/kernel/osf_sys.c
++++ b/arch/alpha/kernel/osf_sys.c
+@@ -534,7 +534,7 @@ SYSCALL_DEFINE1(osf_utsname, char __user *, name)
+ 
+ SYSCALL_DEFINE0(getpagesize)
+ {
+-	return PAGE_SIZE;
++	return MMUPAGE_SIZE;
+ }
+ 
+ SYSCALL_DEFINE0(getdtablesize)
+diff --git a/arch/alpha/kernel/pci-sysfs.c b/arch/alpha/kernel/pci-sysfs.c
+index 3048758304b5..d0d098d0f3ac 100644
+--- a/arch/alpha/kernel/pci-sysfs.c
++++ b/arch/alpha/kernel/pci-sysfs.c
+@@ -26,7 +26,7 @@ static int hose_mmap_page_range(struct pci_controller *hose,
+ 	else
+ 		base = sparse ? hose->sparse_io_base : hose->dense_io_base;
+ 
+-	vma->vm_pgoff += base >> PAGE_SHIFT;
++	vma->vm_pgoff += base >> MMUPAGE_SHIFT;
+ 
+ 	return io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+ 				  vma->vm_end - vma->vm_start,
+@@ -41,7 +41,7 @@ static int __pci_mmap_fits(struct pci_dev *pdev, int num,
+ 
+ 	nr = vma_pages(vma);
+ 	start = vma->vm_pgoff;
+-	size = ((pci_resource_len(pdev, num) - 1) >> (PAGE_SHIFT - shift)) + 1;
++	size = ((pci_resource_len(pdev, num) - 1) >> (MMUPAGE_SHIFT - shift)) + 1;
+ 
+ 	if (start < size && size - start >= nr)
+ 		return 1;
+@@ -86,7 +86,7 @@ static int pci_mmap_resource(struct kobject *kobj,
+ 		return -EINVAL;
+ 
+ 	pcibios_resource_to_bus(pdev->bus, &bar, res);
+-	vma->vm_pgoff += bar.start >> (PAGE_SHIFT - (sparse ? 5 : 0));
++	vma->vm_pgoff += bar.start >> (MMUPAGE_SHIFT - (sparse ? 5 : 0));
+ 	mmap_type = res->flags & IORESOURCE_MEM ? pci_mmap_mem : pci_mmap_io;
+ 
+ 	return hose_mmap_page_range(pdev->sysdata, vma, mmap_type, sparse);
+@@ -261,7 +261,7 @@ static int __legacy_mmap_fits(struct pci_controller *hose,
+ 
+ 	nr = vma_pages(vma);
+ 	start = vma->vm_pgoff;
+-	size = ((res_size - 1) >> PAGE_SHIFT) + 1;
++	size = ((res_size - 1) >> MMUPAGE_SHIFT) + 1;
+ 
+ 	if (start < size && size - start >= nr)
+ 		return 1;
+-- 
+2.54.0
+

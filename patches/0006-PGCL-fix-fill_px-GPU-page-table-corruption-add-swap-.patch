@@ -1,0 +1,213 @@
+From 70702628e2d9686b87ed10db03c32c267e584a8c Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Mon, 9 Mar 2026 06:17:24 +0100
+Subject: [PATCH 006/174] PGCL: fix fill_px GPU page table corruption, add
+ swap-in prefetch
+
+fix fill_px macro: used PAGE_SIZE/sizeof(u64) to compute entry count
+for GPU page table pages, writing 64KB (8192 entries) into 4KB GPU PT
+pages when PAGE_MMUSHIFT>0.  This corrupts adjacent memory within the
+compound page.  Fix: use I915_GTT_PAGE_SIZE (4096) for all GPU page
+table operations.
+
+Also fix fill_page_dma clflush and all 6 drm_clflush_virt_range calls
+in gen8_ppgtt.c that used PAGE_SIZE to flush GPU PT pages.  Change
+gen8_init_rsvd scratch allocation from PAGE_SIZE to I915_GTT_PAGE_SIZE.
+
+Add PGCL swap-in prefetch: after mapping a faulting sub-page from
+swap, scan neighbor PTEs within the same kernel page for swap entries
+and issue async read_swap_cache_async prefetches.  This eliminates
+I/O stalls on subsequent sub-page faults without changing the swap
+allocation model (each sub-page keeps its own swap slot).
+
+Tested: PAGE_MMUSHIFT=4 boots with SMP=4, all clustering and fork
+tests pass.  PAGE_MMUSHIFT=0 compiles clean (prefetch is no-op).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/i915/gt/gen8_ppgtt.c | 16 ++++----
+ drivers/gpu/drm/i915/gt/intel_gtt.c  |  2 +-
+ drivers/gpu/drm/i915/gt/intel_gtt.h  |  2 +-
+ mm/memory.c                          | 58 ++++++++++++++++++++++++++++
+ 4 files changed, 68 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/gen8_ppgtt.c b/drivers/gpu/drm/i915/gt/gen8_ppgtt.c
+index cfa09b250a1b..2023fb2fc85f 100644
+--- a/drivers/gpu/drm/i915/gt/gen8_ppgtt.c
++++ b/drivers/gpu/drm/i915/gt/gen8_ppgtt.c
+@@ -490,11 +490,11 @@ gen8_ppgtt_insert_pte(struct i915_ppgtt *ppgtt,
+ 				pd = pdp->entry[gen8_pd_index(idx, 2)];
+ 			}
+ 
+-			drm_clflush_virt_range(vaddr, PAGE_SIZE);
++			drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 			vaddr = px_vaddr(i915_pt_entry(pd, gen8_pd_index(idx, 1)));
+ 		}
+ 	} while (1);
+-	drm_clflush_virt_range(vaddr, PAGE_SIZE);
++	drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 
+ 	return idx;
+ }
+@@ -603,7 +603,7 @@ xehp_ppgtt_insert_huge(struct i915_address_space *vm,
+ 			}
+ 		} while (rem >= page_size && index < max);
+ 
+-		drm_clflush_virt_range(vaddr, PAGE_SIZE);
++		drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 		vma_res->page_sizes_gtt |= page_size;
+ 	} while (iter->sg && sg_dma_len(iter->sg));
+ }
+@@ -687,7 +687,7 @@ static void gen8_ppgtt_insert_huge(struct i915_address_space *vm,
+ 			}
+ 		} while (rem >= page_size && index < I915_PDES);
+ 
+-		drm_clflush_virt_range(vaddr, PAGE_SIZE);
++		drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 
+ 		/*
+ 		 * Is it safe to mark the 2M block as 64K? -- Either we have
+@@ -703,7 +703,7 @@ static void gen8_ppgtt_insert_huge(struct i915_address_space *vm,
+ 					      I915_GTT_PAGE_SIZE_2M)))) {
+ 			vaddr = px_vaddr(pd);
+ 			vaddr[maybe_64K] |= GEN8_PDE_IPS_64K;
+-			drm_clflush_virt_range(vaddr, PAGE_SIZE);
++			drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 			page_size = I915_GTT_PAGE_SIZE_64K;
+ 
+ 			/*
+@@ -724,7 +724,7 @@ static void gen8_ppgtt_insert_huge(struct i915_address_space *vm,
+ 				for (i = 1; i < index; i += 16)
+ 					memset64(vaddr + i, encode, 15);
+ 
+-				drm_clflush_virt_range(vaddr, PAGE_SIZE);
++				drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ 			}
+ 		}
+ 
+@@ -965,11 +965,11 @@ static int gen8_init_rsvd(struct i915_address_space *vm)
+ 		return 0;
+ 
+ 	/* The memory will be used only by GPU. */
+-	obj = i915_gem_object_create_lmem(i915, PAGE_SIZE,
++	obj = i915_gem_object_create_lmem(i915, I915_GTT_PAGE_SIZE,
+ 					  I915_BO_ALLOC_VOLATILE |
+ 					  I915_BO_ALLOC_GPU_ONLY);
+ 	if (IS_ERR(obj))
+-		obj = i915_gem_object_create_internal(i915, PAGE_SIZE);
++		obj = i915_gem_object_create_internal(i915, I915_GTT_PAGE_SIZE);
+ 	if (IS_ERR(obj))
+ 		return PTR_ERR(obj);
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.c b/drivers/gpu/drm/i915/gt/intel_gtt.c
+index afbc5c769308..3f601ac9817f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.c
+@@ -340,7 +340,7 @@ fill_page_dma(struct drm_i915_gem_object *p, const u64 val, unsigned int count)
+ 	void *vaddr = __px_vaddr(p);
+ 
+ 	memset64(vaddr, val, count);
+-	drm_clflush_virt_range(vaddr, PAGE_SIZE);
++	drm_clflush_virt_range(vaddr, I915_GTT_PAGE_SIZE);
+ }
+ 
+ static void poison_scratch_page(struct drm_i915_gem_object *scratch)
+diff --git a/drivers/gpu/drm/i915/gt/intel_gtt.h b/drivers/gpu/drm/i915/gt/intel_gtt.h
+index b54ee4f25af1..8817e8a5d17a 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gtt.h
++++ b/drivers/gpu/drm/i915/gt/intel_gtt.h
+@@ -622,7 +622,7 @@ void i915_ggtt_resume(struct i915_ggtt *ggtt);
+ void
+ fill_page_dma(struct drm_i915_gem_object *p, const u64 val, unsigned int count);
+ 
+-#define fill_px(px, v) fill_page_dma(px_base(px), (v), PAGE_SIZE / sizeof(u64))
++#define fill_px(px, v) fill_page_dma(px_base(px), (v), I915_GTT_PAGE_SIZE / sizeof(u64))
+ #define fill32_px(px, v) do {						\
+ 	u64 v__ = lower_32_bits(v);					\
+ 	fill_px((px), v__ << 32 | v__);					\
+diff --git a/mm/memory.c b/mm/memory.c
+index 2c38d03b7c49..d17930bf65c3 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4954,6 +4954,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	unsigned long page_idx;
+ 	unsigned long address;
+ 	pte_t *ptep;
++	swp_entry_t swap_prefetch[PAGE_MMUCOUNT > 1 ? PAGE_MMUCOUNT - 1 : 1];
++	int swap_prefetch_nr = 0;
+ 
+ 	if (!pte_unmap_same(vmf))
+ 		goto out;
+@@ -5307,6 +5309,43 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	if (should_try_to_free_swap(si, folio, vma, nr_pages, vmf->flags))
+ 		folio_free_swap(folio);
+ 
++	/*
++	 * PGCL swap-in prefetch: with PAGE_MMUSHIFT>0, each sub-page within
++	 * a kernel page gets its own swap slot.  After mapping the faulting
++	 * sub-page, scan neighbor PTEs within the same kernel page for swap
++	 * entries and prefetch them into the swap cache asynchronously.
++	 * This avoids I/O stalls on subsequent sub-page faults.
++	 */
++	if (PAGE_MMUSHIFT && nr_pages == 1 && !folio_test_large(folio)) {
++		unsigned long cluster_start = address & PAGE_MASK;
++		unsigned long sub_idx = (address - cluster_start) >> MMUPAGE_SHIFT;
++		pte_t *cluster_ptep = ptep - sub_idx;
++		unsigned long neighbor_addr;
++		int i;
++
++		for (i = 0; i < PAGE_MMUCOUNT; i++) {
++			pte_t neighbor;
++			softleaf_t sl;
++
++			if (i == (int)sub_idx)
++				continue;
++
++			neighbor_addr = cluster_start + ((unsigned long)i << MMUPAGE_SHIFT);
++			if (neighbor_addr < vma->vm_start ||
++			    neighbor_addr >= vma->vm_end)
++				continue;
++
++			neighbor = ptep_get(cluster_ptep + i);
++			sl = softleaf_from_pte(neighbor);
++			if (!softleaf_is_swap(sl))
++				continue;
++
++			swap_prefetch[swap_prefetch_nr++] = sl;
++			if (swap_prefetch_nr >= PAGE_MMUCOUNT - 1)
++				break;
++		}
++	}
++
+ 	folio_unlock(folio);
+ 	if (unlikely(folio != swapcache)) {
+ 		/*
+@@ -5336,6 +5375,25 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ out:
+ 	if (si)
+ 		put_swap_device(si);
++
++	/* Issue PGCL swap-in prefetch reads after releasing all locks */
++	if (swap_prefetch_nr) {
++		struct swap_iocb *splug = NULL;
++		int i;
++
++		for (i = 0; i < swap_prefetch_nr; i++) {
++			struct folio *f;
++
++			f = read_swap_cache_async(swap_prefetch[i],
++					GFP_HIGHUSER_MOVABLE, vma,
++					vmf->address, &splug);
++			if (f)
++				folio_put(f);
++		}
++		if (splug)
++			swap_read_unplug(splug);
++	}
++
+ 	return ret;
+ out_nomap:
+ 	if (vmf->pte)
+-- 
+2.54.0
+

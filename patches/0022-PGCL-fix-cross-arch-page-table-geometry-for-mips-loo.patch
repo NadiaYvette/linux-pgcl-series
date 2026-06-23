@@ -1,0 +1,325 @@
+From 77cc9d02a7ceed9d8368b685be0a5e9f23979771 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 15 Mar 2026 00:04:13 +0100
+Subject: [PATCH 022/174] PGCL: fix cross-arch page table geometry for mips,
+ loongarch, powerpc, arm32, m68k
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fix PAGE_MMUSHIFT>0 compilation across 5 architectures, verified by
+clean 11-arch OOT cross-compile sweep with CONFIG_PAGE_MMUSHIFT=4.
+
+mips: Page table shift formulas used 2*PAGE_SHIFT which overflows on
+32-bit (PGDIR_SHIFT=34 > 32 bits, causing division by zero in
+PTRS_PER_PGD). Split into PAGE_SHIFT + MMUPAGE_SHIFT — the first term
+is the PTE table allocation size, the second is the VA range each PTE
+covers. Also fix HPAGE_SHIFT, FTLB page_size_ftlb() to use hardware
+page size, add MMUPAGE_SHIFT/SIZE to asm-offsets for assembly, and fix
+genex.S TLB probe EPC alignment to use hardware page granularity.
+
+loongarch: Identical page table geometry bug — PMD_SHIFT and 2-level
+PGDIR_SHIFT used PAGE_SHIFT for PTE coverage instead of MMUPAGE_SHIFT.
+Also fix HPAGE_SHIFT.
+
+powerpc64: Widen PTE_RPN_MASK from PAGE_MASK to MMUPAGE_MASK to
+preserve sub-page physical address bits. Fix H_PGTABLE_EADDR_SIZE and
+RADIX_PGTABLE_EADDR_SIZE to use MMUPAGE_SHIFT (prevents paca_struct
+bloat past 16-bit displacement limit). Scale SECTION_SIZE_BITS by
+PAGE_MMUSHIFT so PFN_SECTION_SHIFT remains sufficient for section flags.
+
+arm32: PKMAP entries map individual hardware pages — use MMUPAGE_SHIFT
+and MMUPAGE_SIZE instead of PAGE_SHIFT/PAGE_SIZE in highmem.h and the
+BUILD_BUG_ON/BUG_ON size checks in init.c.
+
+m68k: PAGE_MASK with PAGE_SHIFT=16 is 0xFFFF0000, which overflows
+movew's 16-bit immediate. Change to movel and andw→andl in
+relocate_kernel.S.
+
+All 11 architectures pass: x86_64, arm64, riscv64, arm32, powerpc64,
+s390x, mips, sparc64, alpha, m68k, loongarch.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm/include/asm/highmem.h               |  4 ++--
+ arch/arm/mm/init.c                           |  4 ++--
+ arch/loongarch/include/asm/page.h            |  2 +-
+ arch/loongarch/include/asm/pgtable.h         |  6 +++---
+ arch/m68k/kernel/relocate_kernel.S           |  8 ++++----
+ arch/mips/include/asm/page.h                 | 10 +++++-----
+ arch/mips/include/asm/pgtable-32.h           |  8 ++++----
+ arch/mips/include/asm/pgtable-64.h           |  4 ++--
+ arch/mips/kernel/asm-offsets.c               |  2 ++
+ arch/mips/kernel/genex.S                     |  4 ++--
+ arch/powerpc/include/asm/book3s/64/hash.h    |  2 +-
+ arch/powerpc/include/asm/book3s/64/pgtable.h |  2 +-
+ arch/powerpc/include/asm/book3s/64/radix.h   |  2 +-
+ arch/powerpc/include/asm/sparsemem.h         |  2 +-
+ 14 files changed, 31 insertions(+), 29 deletions(-)
+
+diff --git a/arch/arm/include/asm/highmem.h b/arch/arm/include/asm/highmem.h
+index bdb209e002a4..3a2df9815521 100644
+--- a/arch/arm/include/asm/highmem.h
++++ b/arch/arm/include/asm/highmem.h
+@@ -8,8 +8,8 @@
+ #define PKMAP_BASE		(PAGE_OFFSET - PMD_SIZE)
+ #define LAST_PKMAP		PTRS_PER_PTE
+ #define LAST_PKMAP_MASK		(LAST_PKMAP - 1)
+-#define PKMAP_NR(virt)		(((virt) - PKMAP_BASE) >> PAGE_SHIFT)
+-#define PKMAP_ADDR(nr)		(PKMAP_BASE + ((nr) << PAGE_SHIFT))
++#define PKMAP_NR(virt)		(((virt) - PKMAP_BASE) >> MMUPAGE_SHIFT)
++#define PKMAP_ADDR(nr)		(PKMAP_BASE + ((nr) << MMUPAGE_SHIFT))
+ 
+ #define flush_cache_kmaps() \
+ 	do { \
+diff --git a/arch/arm/mm/init.c b/arch/arm/mm/init.c
+index 0cc1bf04686d..a0123e76ca4a 100644
+--- a/arch/arm/mm/init.c
++++ b/arch/arm/mm/init.c
+@@ -241,8 +241,8 @@ void __init arch_mm_preinit(void)
+ #endif
+ 
+ #ifdef CONFIG_HIGHMEM
+-	BUILD_BUG_ON(PKMAP_BASE + LAST_PKMAP * PAGE_SIZE > PAGE_OFFSET);
+-	BUG_ON(PKMAP_BASE + LAST_PKMAP * PAGE_SIZE	> PAGE_OFFSET);
++	BUILD_BUG_ON(PKMAP_BASE + LAST_PKMAP * MMUPAGE_SIZE > PAGE_OFFSET);
++	BUG_ON(PKMAP_BASE + LAST_PKMAP * MMUPAGE_SIZE	> PAGE_OFFSET);
+ #endif
+ }
+ 
+diff --git a/arch/loongarch/include/asm/page.h b/arch/loongarch/include/asm/page.h
+index b9d61f7c032c..459f8b179a7a 100644
+--- a/arch/loongarch/include/asm/page.h
++++ b/arch/loongarch/include/asm/page.h
+@@ -10,7 +10,7 @@
+ 
+ #include <vdso/page.h>
+ 
+-#define HPAGE_SHIFT	(PAGE_SHIFT + PAGE_SHIFT - PTRLOG)
++#define HPAGE_SHIFT	(MMUPAGE_SHIFT + PAGE_SHIFT - PTRLOG)
+ #define HPAGE_SIZE	(_AC(1, UL) << HPAGE_SHIFT)
+ #define HPAGE_MASK	(~(HPAGE_SIZE - 1))
+ #define HUGETLB_PAGE_ORDER	(HPAGE_SHIFT - PAGE_SHIFT)
+diff --git a/arch/loongarch/include/asm/pgtable.h b/arch/loongarch/include/asm/pgtable.h
+index 2a0b63ae421f..741cf54d5ddc 100644
+--- a/arch/loongarch/include/asm/pgtable.h
++++ b/arch/loongarch/include/asm/pgtable.h
+@@ -28,14 +28,14 @@
+ #endif
+ 
+ #if CONFIG_PGTABLE_LEVELS == 2
+-#define PGDIR_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PGDIR_SHIFT	(MMUPAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
+ #elif CONFIG_PGTABLE_LEVELS == 3
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ #define PGDIR_SHIFT	(PMD_SHIFT + (PAGE_SHIFT - PTRLOG))
+ #elif CONFIG_PGTABLE_LEVELS == 4
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (PAGE_SHIFT - PTRLOG))
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ #define PUD_SHIFT	(PMD_SHIFT + (PAGE_SHIFT - PTRLOG))
+diff --git a/arch/m68k/kernel/relocate_kernel.S b/arch/m68k/kernel/relocate_kernel.S
+index f7667079e08e..ce202a9ab170 100644
+--- a/arch/m68k/kernel/relocate_kernel.S
++++ b/arch/m68k/kernel/relocate_kernel.S
+@@ -14,7 +14,7 @@ ENTRY(relocate_new_kernel)
+ 	movel %sp@(4),%a0		/* a0 = ptr */
+ 	movel %sp@(8),%a1		/* a1 = start */
+ 	movel %sp@(12),%d1		/* d1 = cpu_mmu_flags */
+-	movew #PAGE_MASK,%d2		/* d2 = PAGE_MASK */
++	movel #PAGE_MASK,%d2		/* d2 = PAGE_MASK */
+ 
+ 	/* Disable MMU */
+ 
+@@ -86,14 +86,14 @@ ENTRY(relocate_new_kernel)
+ 
+ 	btst #1,%d0			/* entry & IND_INDIRECTION? */
+ 	jeq 1f
+-	andw %d2,%d0
++	andl %d2,%d0
+ 	movel %d0,%a0			/* ptr = entry & PAGE_MASK */
+ 	jra .Lcopy
+ 
+ 1:
+ 	btst #0,%d0			/* entry & IND_DESTINATION? */
+ 	jeq 2f
+-	andw %d2,%d0
++	andl %d2,%d0
+ 	movel %d0,%a2			/* a2 = dst = entry & PAGE_MASK */
+ 	jra .Lcopy
+ 
+@@ -101,7 +101,7 @@ ENTRY(relocate_new_kernel)
+ 	btst #3,%d0			/* entry & IND_SOURCE? */
+ 	jeq .Lcopy
+ 
+-	andw %d2,%d0
++	andl %d2,%d0
+ 	movel %d0,%a3			/* a3 = src = entry & PAGE_MASK */
+ 	movew #PAGE_SIZE/32 - 1,%d0	/* d0 = PAGE_SIZE/32 - 1 */
+ 3:
+diff --git a/arch/mips/include/asm/page.h b/arch/mips/include/asm/page.h
+index 50a382a0d8f6..de1a79120248 100644
+--- a/arch/mips/include/asm/page.h
++++ b/arch/mips/include/asm/page.h
+@@ -24,15 +24,15 @@ static inline unsigned int page_size_ftlb(unsigned int mmuextdef)
+ {
+ 	switch (mmuextdef) {
+ 	case MIPS_CONF4_MMUEXTDEF_FTLBSIZEEXT:
+-		if (PAGE_SIZE == (1 << 30))
++		if (MMUPAGE_SIZE == (1 << 30))
+ 			return 5;
+-		if (PAGE_SIZE == (1llu << 32))
++		if (MMUPAGE_SIZE == (1llu << 32))
+ 			return 6;
+-		if (PAGE_SIZE > (256 << 10))
++		if (MMUPAGE_SIZE > (256 << 10))
+ 			return 7; /* reserved */
+ 		fallthrough;
+ 	case MIPS_CONF4_MMUEXTDEF_VTLBSIZEEXT:
+-		return (PAGE_SHIFT - 10) / 2;
++		return (MMUPAGE_SHIFT - 10) / 2;
+ 	default:
+ 		panic("Invalid FTLB configuration with Conf4_mmuextdef=%d value\n",
+ 		      mmuextdef >> 14);
+@@ -40,7 +40,7 @@ static inline unsigned int page_size_ftlb(unsigned int mmuextdef)
+ }
+ 
+ #ifdef CONFIG_MIPS_HUGE_TLB_SUPPORT
+-#define HPAGE_SHIFT	(PAGE_SHIFT + PAGE_SHIFT - 3)
++#define HPAGE_SHIFT	(PAGE_SHIFT + MMUPAGE_SHIFT - 3)
+ #define HPAGE_SIZE	(_AC(1,UL) << HPAGE_SHIFT)
+ #define HPAGE_MASK	(~(HPAGE_SIZE - 1))
+ #define HUGETLB_PAGE_ORDER	(HPAGE_SHIFT - PAGE_SHIFT)
+diff --git a/arch/mips/include/asm/pgtable-32.h b/arch/mips/include/asm/pgtable-32.h
+index 92b7591aac2a..fc0aed982624 100644
+--- a/arch/mips/include/asm/pgtable-32.h
++++ b/arch/mips/include/asm/pgtable-32.h
+@@ -62,9 +62,9 @@ extern int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
+ 
+ /* PGDIR_SHIFT determines what a third-level page table entry can map */
+ #if defined(CONFIG_MIPS_HUGE_TLB_SUPPORT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+-# define PGDIR_SHIFT	(2 * PAGE_SHIFT - PTE_T_LOG2 - 1)
++# define PGDIR_SHIFT	(PAGE_SHIFT + MMUPAGE_SHIFT - PTE_T_LOG2 - 1)
+ #else
+-# define PGDIR_SHIFT	(2 * PAGE_SHIFT - PTE_T_LOG2)
++# define PGDIR_SHIFT	(PAGE_SHIFT + MMUPAGE_SHIFT - PTE_T_LOG2)
+ #endif
+ 
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+@@ -75,9 +75,9 @@ extern int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
+  * we don't really have any PUD/PMD directory physically.
+  */
+ #if defined(CONFIG_MIPS_HUGE_TLB_SUPPORT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+-# define __PGD_TABLE_ORDER (32 - 3 * PAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2 + 1)
++# define __PGD_TABLE_ORDER (32 - 2 * PAGE_SHIFT - MMUPAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2 + 1)
+ #else
+-# define __PGD_TABLE_ORDER (32 - 3 * PAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2)
++# define __PGD_TABLE_ORDER (32 - 2 * PAGE_SHIFT - MMUPAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2)
+ #endif
+ 
+ #define PGD_TABLE_ORDER	(__PGD_TABLE_ORDER >= 0 ? __PGD_TABLE_ORDER : 0)
+diff --git a/arch/mips/include/asm/pgtable-64.h b/arch/mips/include/asm/pgtable-64.h
+index 6e854bb11f37..0135652f2f36 100644
+--- a/arch/mips/include/asm/pgtable-64.h
++++ b/arch/mips/include/asm/pgtable-64.h
+@@ -42,11 +42,11 @@
+ 
+ /* PGDIR_SHIFT determines what a third-level page table entry can map */
+ #ifdef __PAGETABLE_PMD_FOLDED
+-#define PGDIR_SHIFT	(PAGE_SHIFT + PAGE_SHIFT - 3)
++#define PGDIR_SHIFT	(MMUPAGE_SHIFT + PAGE_SHIFT - 3)
+ #else
+ 
+ /* PMD_SHIFT determines the size of the area a second-level page table can map */
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT - 3))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (PAGE_SHIFT - 3))
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ 
+diff --git a/arch/mips/kernel/asm-offsets.c b/arch/mips/kernel/asm-offsets.c
+index 5debd9a3854a..59afef3d4f42 100644
+--- a/arch/mips/kernel/asm-offsets.c
++++ b/arch/mips/kernel/asm-offsets.c
+@@ -221,6 +221,8 @@ void output_mm_defines(void)
+ 	BLANK();
+ 	DEFINE(_PAGE_SHIFT, PAGE_SHIFT);
+ 	DEFINE(_PAGE_SIZE, PAGE_SIZE);
++	DEFINE(_MMUPAGE_SHIFT, MMUPAGE_SHIFT);
++	DEFINE(_MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 	BLANK();
+ }
+ 
+diff --git a/arch/mips/kernel/genex.S b/arch/mips/kernel/genex.S
+index 89d97d563a26..2306499308fd 100644
+--- a/arch/mips/kernel/genex.S
++++ b/arch/mips/kernel/genex.S
+@@ -605,8 +605,8 @@ NESTED(nmi_handler, PT_SIZE, sp)
+ 	MFC0	k1, CP0_ENTRYHI
+ 	andi	k1, MIPS_ENTRYHI_ASID | MIPS_ENTRYHI_ASIDX
+ 	MFC0	k0, CP0_EPC
+-	PTR_SRL	k0, _PAGE_SHIFT + 1
+-	PTR_SLL	k0, _PAGE_SHIFT + 1
++	PTR_SRL	k0, _MMUPAGE_SHIFT + 1
++	PTR_SLL	k0, _MMUPAGE_SHIFT + 1
+ 	or	k1, k0
+ 	MTC0	k1, CP0_ENTRYHI
+ 	mtc0_tlbw_hazard
+diff --git a/arch/powerpc/include/asm/book3s/64/hash.h b/arch/powerpc/include/asm/book3s/64/hash.h
+index 5a8cbd496731..5d10e6a9c8d1 100644
+--- a/arch/powerpc/include/asm/book3s/64/hash.h
++++ b/arch/powerpc/include/asm/book3s/64/hash.h
+@@ -32,7 +32,7 @@
+  * Size of EA range mapped by our pagetables.
+  */
+ #define H_PGTABLE_EADDR_SIZE	(H_PTE_INDEX_SIZE + H_PMD_INDEX_SIZE + \
+-				 H_PUD_INDEX_SIZE + H_PGD_INDEX_SIZE + PAGE_SHIFT)
++				 H_PUD_INDEX_SIZE + H_PGD_INDEX_SIZE + MMUPAGE_SHIFT)
+ #define H_PGTABLE_RANGE		(ASM_CONST(1) << H_PGTABLE_EADDR_SIZE)
+ /*
+  * Top 2 bits are ignored in page table walk.
+diff --git a/arch/powerpc/include/asm/book3s/64/pgtable.h b/arch/powerpc/include/asm/book3s/64/pgtable.h
+index e67e64ac6e8c..026447d236b9 100644
+--- a/arch/powerpc/include/asm/book3s/64/pgtable.h
++++ b/arch/powerpc/include/asm/book3s/64/pgtable.h
+@@ -100,7 +100,7 @@
+  * we are limited by _PAGE_PA_MAX. Clear everything above _PAGE_PA_MAX
+  * and every thing below PAGE_SHIFT;
+  */
+-#define PTE_RPN_MASK	(((1UL << _PAGE_PA_MAX) - 1) & (PAGE_MASK))
++#define PTE_RPN_MASK	(((1UL << _PAGE_PA_MAX) - 1) & (MMUPAGE_MASK))
+ #define PTE_RPN_SHIFT	PAGE_SHIFT
+ /*
+  * set of bits not changed in pmd_modify. Even though we have hash specific bits
+diff --git a/arch/powerpc/include/asm/book3s/64/radix.h b/arch/powerpc/include/asm/book3s/64/radix.h
+index da954e779744..45850f2698ee 100644
+--- a/arch/powerpc/include/asm/book3s/64/radix.h
++++ b/arch/powerpc/include/asm/book3s/64/radix.h
+@@ -44,7 +44,7 @@
+  * Size of EA range mapped by our pagetables.
+  */
+ #define RADIX_PGTABLE_EADDR_SIZE (RADIX_PTE_INDEX_SIZE + RADIX_PMD_INDEX_SIZE +	\
+-			      RADIX_PUD_INDEX_SIZE + RADIX_PGD_INDEX_SIZE + PAGE_SHIFT)
++			      RADIX_PUD_INDEX_SIZE + RADIX_PGD_INDEX_SIZE + MMUPAGE_SHIFT)
+ #define RADIX_PGTABLE_RANGE (ASM_CONST(1) << RADIX_PGTABLE_EADDR_SIZE)
+ 
+ /*
+diff --git a/arch/powerpc/include/asm/sparsemem.h b/arch/powerpc/include/asm/sparsemem.h
+index d072866842e4..e0a202fb8db5 100644
+--- a/arch/powerpc/include/asm/sparsemem.h
++++ b/arch/powerpc/include/asm/sparsemem.h
+@@ -8,7 +8,7 @@
+  * SECTION_SIZE_BITS		2^N: how big each section will be
+  * MAX_PHYSMEM_BITS		2^N: how much memory we can have in that space
+  */
+-#define SECTION_SIZE_BITS       24
++#define SECTION_SIZE_BITS       (24 + PAGE_MMUSHIFT)
+ 
+ #endif /* CONFIG_SPARSEMEM */
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,113 @@
+From edd93b42778522159308e22cd35248ab9a7b66f5 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 27 Mar 2026 13:40:19 +0100
+Subject: [PATCH 053/174] PGCL: fix sparc64 THP TSB over-insertion in
+ update_mmu_cache_range
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+update_mmu_cache_range() multiplied nr by PAGE_MMUCOUNT to compute the
+number of TSB entries to insert. However, callers already pass the PTE
+count (MMUPAGE-granular), so this double-multiplication caused 16x
+over-insertion of bogus TSB entries.
+
+For a 512KB mTHP (nr_ptes=64), the function inserted 1024 TSB entries
+covering 8MB instead of the correct 64 entries for 512KB. The bogus
+entries satisfied TLB misses for addresses without page table PTEs,
+preventing demand-zero faults. Writes went to wrong physical pages,
+and on TSB eviction the page table walk found no PTE, allocating a
+fresh zero page — causing silent data loss in COW tests.
+
+Remove the PAGE_MMUCOUNT multiplication. This matches the MIPS
+convention where update_mmu_cache_range iterates nr times stepping
+by MMUPAGE_SIZE.
+
+Also clean up cow.c debug instrumentation from S57 and add mismatch
+detail logging to do_test_vmsplice_in_parent.
+
+Tested: sparc64 THP=y cow 136/136 PASS (previously crashed).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/sparc/mm/init_64.c          | 10 +++++---
+ tools/testing/selftests/mm/cow.c | 41 ++++++++++++++++++++++++--------
+ 2 files changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
+index f386a2e62340..4f79dfa2c06f 100644
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -446,9 +446,13 @@ void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
+ 			__update_mmu_tsb_insert(mm, MM_TSB_BASE, MMUPAGE_SHIFT,
+ 						address, pte_val(pte));
+ 		} else {
+-			unsigned int total = nr * PAGE_MMUCOUNT;
+-
+-			for (i = 0; i < total; i++) {
++			/*
++			 * nr is the number of PTEs (MMUPAGE-granular) that
++			 * exist in the page table.  Insert one TSB entry per
++			 * PTE.  Do NOT multiply by PAGE_MMUCOUNT — callers
++			 * already pass the MMUPAGE count.
++			 */
++			for (i = 0; i < nr; i++) {
+ 				__update_mmu_tsb_insert(mm, MM_TSB_BASE,
+ 							MMUPAGE_SHIFT,
+ 							address, pte_val(pte));
+diff --git a/tools/testing/selftests/mm/cow.c b/tools/testing/selftests/mm/cow.c
+index d9c69c04b67d..aa7b9f015a69 100644
+--- a/tools/testing/selftests/mm/cow.c
++++ b/tools/testing/selftests/mm/cow.c
+@@ -375,17 +375,38 @@ static void do_test_vmsplice_in_parent(char *mem, size_t size,
+ 
+ 	if (!memcmp(old, new, transferred)) {
+ 		log_test_result(KSFT_PASS);
+-	} else if (xfail) {
+-		/*
+-		 * With hugetlb, some vmsplice() tests are currently expected to
+-		 * fail because (a) harder to fix and (b) nobody really cares.
+-		 * Flag them as expected failure for now.
+-		 */
+-		ksft_print_msg("Leak from child into parent\n");
+-		log_test_result(KSFT_XFAIL);
+ 	} else {
+-		ksft_print_msg("Leak from child into parent\n");
+-		log_test_result(KSFT_FAIL);
++		ssize_t i;
++		int count_ff = 0, count_00 = 0, count_other = 0;
++		ssize_t first_off = -1;
++
++		for (i = 0; i < transferred; i++) {
++			if (old[i] != new[i]) {
++				if (first_off < 0)
++					first_off = i;
++				if ((unsigned char)new[i] == 0xff)
++					count_ff++;
++				else if ((unsigned char)new[i] == 0x00)
++					count_00++;
++				else
++					count_other++;
++			}
++		}
++		ksft_print_msg("DIAG: first_mismatch=%zd/%zd old=0x%02x new=0x%02x "
++			       "ff_count=%d zero_count=%d other_count=%d "
++			       "transferred=%zd size=%zu\n",
++			       first_off, transferred,
++			       first_off >= 0 ? (unsigned char)old[first_off] : 0,
++			       first_off >= 0 ? (unsigned char)new[first_off] : 0,
++			       count_ff, count_00, count_other,
++			       transferred, size);
++		if (xfail) {
++			ksft_print_msg("Leak from child into parent\n");
++			log_test_result(KSFT_XFAIL);
++		} else {
++			ksft_print_msg("Leak from child into parent\n");
++			log_test_result(KSFT_FAIL);
++		}
+ 	}
+ close_pipe:
+ 	close(fds[0]);
+-- 
+2.54.0
+

@@ -1,0 +1,79 @@
+From 21151f2f21241604d5440d314739180fc7744e9e Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 1 Apr 2026 16:19:18 +0200
+Subject: [PATCH 061/174] ARM: DMA: Fix HighMem kmap overflow with PGCL
+
+With PGCL (PAGE_MMUSHIFT > 0), kmap_atomic() maps only MMUPAGE_SIZE
+(one hardware PTE = 4KB) per call, but __dma_clear_buffer's HighMem
+path was clearing PAGE_SIZE (64KB) bytes through each mapping. This
+caused a page fault at 0xfff00000 during atomic_pool_init when CMA
+memory landed in HighMem.
+
+Fix the HighMem path to iterate at MMUPAGE_SIZE granularity using
+set_fixmap() directly, which correctly handles MMUPAGE-granular
+physical addresses via __pte(phys | prot).
+
+Also fix gen_pool_create() alignment from PAGE_SHIFT to MMUPAGE_SHIFT
+since DMA hardware operates at hardware page granularity.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm/mm/dma-mapping.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm/mm/dma-mapping.c b/arch/arm/mm/dma-mapping.c
+index f304037d1c34..aee3954b751e 100644
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@ -28,6 +28,7 @@
+ #include <asm/page.h>
+ #include <asm/highmem.h>
+ #include <asm/cacheflush.h>
++#include <asm/fixmap.h>
+ #include <asm/tlbflush.h>
+ #include <asm/mach/arch.h>
+ #include <asm/dma-iommu.h>
+@@ -113,6 +114,23 @@ static void __dma_clear_buffer(struct page *page, size_t size, int coherent_flag
+ 	if (PageHighMem(page)) {
+ 		phys_addr_t base = __pfn_to_phys(page_to_pfn(page));
+ 		phys_addr_t end = base + size;
++#if PAGE_MMUSHIFT > 0
++		/*
++		 * With PGCL, kmap_atomic() maps only MMUPAGE_SIZE per
++		 * call (one hardware PTE).  Use set_fixmap() directly
++		 * to supply MMUPAGE-granular physical addresses.
++		 */
++		phys_addr_t pa;
++		for (pa = base; pa < end; pa += MMUPAGE_SIZE) {
++			void *ptr;
++			set_fixmap(FIX_KMAP_BEGIN, pa);
++			ptr = (void *)__fix_to_virt(FIX_KMAP_BEGIN);
++			memset(ptr, 0, MMUPAGE_SIZE);
++			if (coherent_flag != COHERENT)
++				dmac_flush_range(ptr, ptr + MMUPAGE_SIZE);
++			clear_fixmap(FIX_KMAP_BEGIN);
++		}
++#else
+ 		while (size > 0) {
+ 			void *ptr = kmap_atomic(page);
+ 			memset(ptr, 0, PAGE_SIZE);
+@@ -122,6 +140,7 @@ static void __dma_clear_buffer(struct page *page, size_t size, int coherent_flag
+ 			page++;
+ 			size -= PAGE_SIZE;
+ 		}
++#endif
+ 		if (coherent_flag != COHERENT)
+ 			outer_flush_range(base, end);
+ 	} else {
+@@ -204,7 +223,7 @@ static int __init atomic_pool_init(void)
+ 	struct page *page;
+ 	void *ptr;
+ 
+-	atomic_pool = gen_pool_create(PAGE_SHIFT, -1);
++	atomic_pool = gen_pool_create(MMUPAGE_SHIFT, -1);
+ 	if (!atomic_pool)
+ 		goto out;
+ 	/*
+-- 
+2.54.0
+

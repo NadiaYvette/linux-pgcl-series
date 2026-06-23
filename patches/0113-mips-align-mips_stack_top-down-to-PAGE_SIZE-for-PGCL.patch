@@ -1,0 +1,80 @@
+From 443398583377c2a758557055f128b3d256ebdf0f Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 13 May 2026 01:35:47 +0200
+Subject: [PATCH 113/174] mips: align mips_stack_top() down to PAGE_SIZE for
+ PGCL safety
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The intermediate subtractions inside mips_stack_top() are MMUPAGE-sized
+(VDSO_NR_PAGES * MMUPAGE_SIZE, optional GIC MMUPAGE, shm_align_mask + 1
+which is also MMUPAGE-sized).  Without PGCL these are equivalent to
+PAGE-sized subtractions, so the result is always PAGE-aligned.  Under
+PGCL (PAGE_SIZE > MMUPAGE_SIZE), `top` can end up MMUPAGE-aligned but
+not PAGE-aligned.
+
+That matters because arch_setup_additional_pages() shortly afterwards
+does:
+
+    do_mmap(NULL, STACK_TOP, PAGE_SIZE,
+            PROT_READ | PROT_EXEC,
+            MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED, 0, 0, ...)
+
+for the FP-emu delay-slot page.  When STACK_TOP is sub-PAGE-aligned, the
+MAP_FIXED mapping at length PAGE_SIZE silently overlaps the upper
+kernel-page of the user stack — exactly the kernel-page where
+copy_strings just placed argv/env.  The new anonymous mapping's
+page-table install zeroes that kernel-page, busybox-as-init sees
+argv[0]="" and exits 127, the kernel panics with "Attempted to kill
+init! exitcode=0x00007f00".
+
+The failure rate at PAGE_MMUSHIFT=6 was about 12-25 % per boot.
+Aligning STACK_TOP down to PAGE_SIZE fixes it deterministically
+(25/25 boots clean in stress testing).
+
+Tracked down by stepping copy_from_user(bprm->p, ...) probes through
+begin_new_exec → relocate_vma_down → expand_stack_locked → each
+elf_load → arch_setup_additional_pages → create_elf_tables →
+mips/start_thread; the argv bytes were intact at every probe up to
+"before arch_setup_additional_pages" and zero at every probe from
+"after arch_setup_additional_pages" onward.  Bisecting the inside of
+arch_setup_additional_pages with `if (0 && IS_ENABLED(CONFIG_MIPS_FP_SUPPORT))`
+took the failure rate from 12 % to 0/30, isolating the FP-emu
+do_mmap as the corrupting step.
+
+The cost of this alignment is at most PAGE_SIZE - MMUPAGE_SIZE bytes
+of unused virtual address space at the top of every user mm — about
+1 MB out of TASK_SIZE = 1 TB on mips64 PGCL=6.  Invisible.
+
+Signed-off-by: Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
+---
+ arch/mips/kernel/process.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index 1519846c2ca0..1ddcfca99ad6 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -704,7 +704,17 @@ unsigned long mips_stack_top(void)
+ 	if (cpu_has_dc_aliases)
+ 		top -= shm_align_mask + 1;
+ 
+-	return top;
++	/*
++	 * Under PGCL the intermediate subtractions above are MMUPAGE-sized
++	 * (e.g. 16 KB at PAGE_MMUSHIFT=6), so `top` may end up MMUPAGE-aligned
++	 * but not PAGE-aligned.  arch_setup_additional_pages later does
++	 * do_mmap(STACK_TOP, PAGE_SIZE, MAP_FIXED) for the FP-emu delay-slot
++	 * page; with a non-PAGE-aligned start that mapping clobbers the
++	 * kernel-page that holds the upper end of the user stack — exactly
++	 * where copy_strings just placed argv/env.  Round down so STACK_TOP
++	 * is always PAGE-aligned.
++	 */
++	return top & PAGE_MASK;
+ }
+ 
+ /*
+-- 
+2.54.0
+

@@ -1,0 +1,85 @@
+From 42ef9e79d4bd6023b468d9053078735566cd417a Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 2 Apr 2026 13:44:52 +0200
+Subject: [PATCH 066/174] LoongArch vDSO: fix PGCL sub-page mapping for special
+ mappings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With PAGE_MMUSHIFT > 0, the vDSO binary is MMUPAGE-aligned (16KB) in
+the kernel image but not necessarily PAGE-aligned (256KB).  When
+_install_special_mapping maps the vDSO pages into userspace,
+set_pte_range computes the PTE sub-page offset from the vm_pgoff-based
+effective pgoff.  For special mappings with vm_pgoff=0, sub-page 0 of
+the struct page is always mapped to the first MMUPAGE of the VMA.
+
+If the vDSO code resides at sub-page N (N != 0) within its kernel page,
+the mapping serves the wrong data — typically zeros from the kernel
+image padding.  This causes SIGILL when signal handlers return through
+the vDSO sigreturn trampoline (opcode 0x00000000 = reserved instruction).
+
+Fix by detecting when the vDSO is not PAGE-aligned and copying it to a
+freshly allocated PAGE-aligned page, ensuring the code starts at
+sub-page 0.
+
+This resolved 54 LTP test SIGILL failures on LoongArch64 with
+PAGE_MMUSHIFT=4.
+
+Signed-off-by: William Irwin <wli@holomorphy.com>
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/loongarch/kernel/vdso.c | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/arch/loongarch/kernel/vdso.c b/arch/loongarch/kernel/vdso.c
+index cfd23b6453d4..aae853330d0f 100644
+--- a/arch/loongarch/kernel/vdso.c
++++ b/arch/loongarch/kernel/vdso.c
+@@ -7,6 +7,7 @@
+ #include <linux/binfmts.h>
+ #include <linux/elf.h>
+ #include <linux/err.h>
++#include <linux/gfp.h>
+ #include <linux/init.h>
+ #include <linux/ioport.h>
+ #include <linux/kernel.h>
+@@ -14,6 +15,7 @@
+ #include <linux/random.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/vdso_datastore.h>
+ 
+ #include <asm/page.h>
+@@ -58,7 +60,26 @@ static int __init init_vdso(void)
+ 	if (!vdso_info.code_mapping.pages)
+ 		return -ENOMEM;
+ 
+-	pfn = __phys_to_pfn(__pa_symbol(vdso_info.vdso));
++	/*
++	 * With PGCL (PAGE_MMUSHIFT > 0), the vDSO binary is only
++	 * MMUPAGE-aligned in the kernel image, not PAGE-aligned.
++	 * Special mappings create PTEs using vm_pgoff-based sub-page
++	 * indexing, so sub-page 0 of the struct page is always mapped
++	 * first.  Copy the vDSO to a fresh PAGE-aligned allocation so
++	 * the code starts at sub-page 0.
++	 */
++	if (PAGE_MMUSHIFT > 0 && !PAGE_ALIGNED(__pa_symbol(vdso_info.vdso))) {
++		unsigned int order = get_order(vdso_info.size);
++		struct page *p = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
++
++		if (!p)
++			return -ENOMEM;
++		memcpy(page_address(p), vdso_info.vdso, vdso_end - vdso_start);
++		pfn = page_to_pfn(p);
++	} else {
++		pfn = __phys_to_pfn(__pa_symbol(vdso_info.vdso));
++	}
++
+ 	for (i = 0; i < vdso_info.size / MMUPAGE_SIZE; i++)
+ 		vdso_info.code_mapping.pages[i] = pfn_to_page(pfn + i / PAGE_MMUCOUNT);
+ 
+-- 
+2.54.0
+

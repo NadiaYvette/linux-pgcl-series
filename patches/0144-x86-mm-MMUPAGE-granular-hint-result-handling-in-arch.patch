@@ -1,0 +1,85 @@
+From fa4f9ff8cc888b85e76cb9c39849d7886aaa1db8 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 12 Jun 2026 15:37:19 +0200
+Subject: [PATCH 144/174] x86/mm: MMUPAGE-granular hint + result handling in
+ arch_get_unmapped_area
+
+Under PGCL the mmap address space is MMUPAGE-granular: vm_unmapped_area()
+returns an address aligned to MMUPAGE_SIZE (the hardware page), which need
+not be PAGE_SIZE-aligned, and mmap hint addresses arrive in MMUPAGE units
+(mmap2 offset is MMUPAGE-granular, and info.align_offset is already built
+with MMUPAGE_SHIFT here).
+
+Three sites in arch/x86/kernel/sys_x86_64.c still used PAGE_ granularity:
+
+  - arch_get_unmapped_area() rounded the hint up with PAGE_ALIGN(),
+    over-aligning a valid MMUPAGE hint.
+  - arch_get_unmapped_area_topdown() masked the hint with PAGE_MASK,
+    discarding sub-PAGE-but-MMUPAGE-aligned bits.
+  - arch_get_unmapped_area_topdown() validated the vm_unmapped_area()
+    result with `!(addr & ~PAGE_MASK)`.  A legitimate MMUPAGE-aligned
+    result then looked like an error: the function fell through to the
+    bottom-up path (or hit VM_BUG_ON(addr != -ENOMEM) under DEBUG_VM).
+
+The DEBUG_VM crash reproduced as
+
+  kernel BUG at arch/x86/kernel/sys_x86_64.c:230!
+  arch_get_unmapped_area_topdown+0x356
+  __get_unmapped_area <- map_vdso <- load_elf_binary <- kernel_execve
+
+during PID 1's first execve at PAGE_MMUSHIFT=4.  With DEBUG_VM off the
+same path silently fell back to bottom-up, masking the bug in matrix runs.
+
+Switch all three to MMUPAGE_ALIGN/MMUPAGE_MASK.  Each is identity at
+PAGE_MMUSHIFT==0 (MMUPAGE_SHIFT==PAGE_SHIFT==CONFIG_PAGE_SHIFT), so the
+Newton-limit baseline is unchanged.  Compile-verified at PAGE_MMUSHIFT=0
+and =4.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/x86/kernel/sys_x86_64.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kernel/sys_x86_64.c b/arch/x86/kernel/sys_x86_64.c
+index c8b2f330811c..07f77c7a660c 100644
+--- a/arch/x86/kernel/sys_x86_64.c
++++ b/arch/x86/kernel/sys_x86_64.c
+@@ -141,7 +141,8 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len,
+ 		return -ENOMEM;
+ 
+ 	if (addr) {
+-		addr = PAGE_ALIGN(addr);
++		/* PGCL: hint addresses are MMUPAGE-granular (identity at shift 0) */
++		addr = MMUPAGE_ALIGN(addr);
+ 		vma = find_vma(mm, addr);
+ 		if (end - len >= addr &&
+ 		    (!vma || addr + len <= vm_start_gap(vma)))
+@@ -187,7 +188,8 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr0,
+ 
+ 	/* requesting a specific address */
+ 	if (addr) {
+-		addr &= PAGE_MASK;
++		/* PGCL: hint addresses are MMUPAGE-granular (identity at shift 0) */
++		addr &= MMUPAGE_MASK;
+ 		if (!mmap_address_hint_valid(addr, len))
+ 			goto get_unmapped_area;
+ 
+@@ -225,7 +227,14 @@ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr0,
+ 		info.align_offset += get_align_bits();
+ 	}
+ 	addr = vm_unmapped_area(&info);
+-	if (!(addr & ~PAGE_MASK))
++	/*
++	 * PGCL: vm_unmapped_area() returns an MMUPAGE-granular address; a valid
++	 * result need not be PAGE_SIZE-aligned, so test alignment with
++	 * MMUPAGE_MASK (identity at PAGE_MMUSHIFT==0).  Using PAGE_MASK here made
++	 * valid MMUPAGE-aligned results look like errors -> silent bottom-up
++	 * fallback (and VM_BUG_ON under DEBUG_VM).
++	 */
++	if (!(addr & ~MMUPAGE_MASK))
+ 		return addr;
+ 	VM_BUG_ON(addr != -ENOMEM);
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,61 @@
+From 11a1f91caeb20aad1b8bf014a3b8f0448338f3ef Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 10 Jun 2026 12:49:49 +0200
+Subject: [PATCH 133/174] sparc64: colour shared mmaps with MMUPAGE_MASK, not
+ PAGE_MASK, under PGCL
+
+get_align_mask() builds the cache-colour alignment mask for file and
+MAP_SHARED mappings as
+
+    PAGE_MASK & (SHMLBA - 1)
+
+The colour bits that vm_unmapped_area() must align live between the
+userspace base-page boundary (MMUPAGE_SHIFT) and SHMLBA. With page
+clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE can exceed SHMLBA -- e.g.
+PAGE_SIZE 512K vs SHMLBA 16K at PAGE_MMUSHIFT=6 -- so PAGE_MASK clears
+all of (SHMLBA - 1) and the mask collapses to 0. The shared/file mapping
+is then returned only MMUPAGE-aligned rather than SHMLBA-coloured.
+
+A later MREMAP_FIXED of that mapping passes a target address derived from
+the mis-coloured base, which the (correct, MMUPAGE-based) MAP_FIXED colour
+sanity check in arch_get_unmapped_area() rejects with -EINVAL. LTP
+mremap06 reproduces this: an initial mmap(MAP_SHARED) lands at an
+8K-aligned but not 16K-coloured address, and the test's MREMAP_FIXED then
+fails. Mainline is unaffected since PAGE_SIZE == MMUPAGE_SIZE there and
+the mask is unchanged.
+
+Use MMUPAGE_MASK so the colour bits survive; identical to PAGE_MASK when
+PAGE_MMUSHIFT == 0. The remaining colour arithmetic (COLOR_ALIGN, the
+MAP_FIXED checks, align_offset) already operates in MMUPAGE units.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/sparc/kernel/sys_sparc_64.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/arch/sparc/kernel/sys_sparc_64.c b/arch/sparc/kernel/sys_sparc_64.c
+index 76637c00556f..fecc232d412a 100644
+--- a/arch/sparc/kernel/sys_sparc_64.c
++++ b/arch/sparc/kernel/sys_sparc_64.c
+@@ -93,7 +93,17 @@ static unsigned long get_align_mask(struct file *filp, unsigned long flags)
+ 	if (filp && is_file_hugepages(filp))
+ 		return huge_page_mask_align(filp);
+ 	if (filp || (flags & MAP_SHARED))
+-		return PAGE_MASK & (SHMLBA - 1);
++		/*
++		 * Cache-colour alignment.  The colour bits live between the
++		 * userspace base-page boundary (MMUPAGE_SHIFT) and SHMLBA.
++		 * Use MMUPAGE_MASK, not PAGE_MASK: under page clustering
++		 * (PAGE_MMUSHIFT>0) PAGE_SIZE can exceed SHMLBA (e.g. 512K
++		 * vs 16K), so PAGE_MASK & (SHMLBA-1) collapses to 0 and the
++		 * shared/file mapping is returned only MMUPAGE-aligned, not
++		 * SHMLBA-coloured -- which then trips the MAP_FIXED colour
++		 * sanity check on any later MREMAP_FIXED of that mapping.
++		 */
++		return MMUPAGE_MASK & (SHMLBA - 1);
+ 
+ 	return 0;
+ }
+-- 
+2.54.0
+

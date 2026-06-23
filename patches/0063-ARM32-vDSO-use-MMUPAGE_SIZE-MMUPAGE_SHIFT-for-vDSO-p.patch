@@ -1,0 +1,64 @@
+From 53b1eea86b5df405df4ffca5cf2394746960cc75 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 1 Apr 2026 19:25:53 +0200
+Subject: [PATCH 063/174] ARM32 vDSO: use MMUPAGE_SIZE/MMUPAGE_SHIFT for vDSO
+ page layout
+
+The ARM32 vDSO setup used PAGE_SIZE/PAGE_SHIFT for computing the vvar-
+to-vDSO-text distance and the text region length. With PGCL where
+PAGE_SIZE=64KB and MMUPAGE_SIZE=4KB, this placed the vDSO text 256KB
+after the vvar pages instead of 16KB. Since the vDSO linker script
+computes the vvar offset as __VDSO_PAGES * MMUPAGE_SIZE (16KB), the
+vDSO code tried to read timekeeping data from an unmapped address,
+causing SIGSEGV on any clock_gettime/gettimeofday call via the vDSO.
+
+This was the root cause of 41 LTP test failures on ARM32 with PGCL,
+since musl's mkstemp/tmpfile internally calls clock_gettime for
+randomness, and LTP's test framework uses these functions.
+
+Fix all four instances: text_pages calculation, pagelist construction,
+vvar-to-text offset, and text region length.
+
+After fix: ARM32 LTP goes from 34p/41f/26s to 75p/0f/26s.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm/kernel/vdso.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/kernel/vdso.c b/arch/arm/kernel/vdso.c
+index e306d0c5a21c..7b68d68889e9 100644
+--- a/arch/arm/kernel/vdso.c
++++ b/arch/arm/kernel/vdso.c
+@@ -176,7 +176,7 @@ static int __init vdso_init(void)
+ 		return -ENOEXEC;
+ 	}
+ 
+-	text_pages = (vdso_end - vdso_start) >> PAGE_SHIFT;
++	text_pages = (vdso_end - vdso_start) >> MMUPAGE_SHIFT;
+ 
+ 	/* Allocate the VDSO text pagelist */
+ 	vdso_text_pagelist = kzalloc_objs(struct page *, text_pages);
+@@ -187,7 +187,7 @@ static int __init vdso_init(void)
+ 	for (i = 0; i < text_pages; i++) {
+ 		struct page *page;
+ 
+-		page = virt_to_page(vdso_start + i * PAGE_SIZE);
++		page = virt_to_page(vdso_start + i * MMUPAGE_SIZE);
+ 		vdso_text_pagelist[i] = page;
+ 	}
+ 
+@@ -219,8 +219,8 @@ void arm_install_vdso(struct mm_struct *mm, unsigned long addr)
+ 		return;
+ 
+ 	/* Account for vvar pages. */
+-	addr += VDSO_NR_PAGES * PAGE_SIZE;
+-	len = (vdso_total_pages - VDSO_NR_PAGES) << PAGE_SHIFT;
++	addr += VDSO_NR_PAGES * MMUPAGE_SIZE;
++	len = (vdso_total_pages - VDSO_NR_PAGES) << MMUPAGE_SHIFT;
+ 
+ 	vma = _install_special_mapping(mm, addr, len,
+ 		VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC,
+-- 
+2.54.0
+

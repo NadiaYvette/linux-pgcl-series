@@ -1,0 +1,154 @@
+From 2e3f0a1834694d1ceca102b6bed27cd3a3b62e89 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 14 Jun 2026 17:24:00 +0200
+Subject: [PATCH 150/174] x86/realmode, mm/pgcl: allocate the real-mode
+ trampoline from MMUPAGE-granular low memory
+
+Under page clustering (CONFIG_PAGE_MMUSHIFT > 0) PAGE_SIZE is large (256K at
+shift 6).  Two things then conspire to starve the real-mode trampoline of sub-1M
+memory and panic the boot at init_real_mode() ("Real mode trampoline was not
+allocated") -- observed on a Lenovo ThinkPad (real, fragmented firmware e820) at
+PAGE_MMUSHIFT=6:
+
+ 1. reserve_real_mode() requests the trampoline with PAGE_SIZE alignment+size,
+    i.e. a 256K-aligned 256K block below 1M.  The trampoline only needs
+    hardware-page (MMUPAGE) granularity; 256K alignment is unsatisfiable in a
+    fragmented sub-1M e820.
+ 2. e820__memblock_setup() ends with memblock_trim_memory(PAGE_SIZE) ("throw
+    away partial pages"), which at 256K discards every sub-256K low-RAM fragment
+    -- including the memory just marked KHO-scratch for the trampoline -- before
+    reserve_real_mode() runs.
+
+Fix both, MMUPAGE-granular:
+ - reserve_real_mode()/real_mode_size_needed()/setup_real_mode(): align and size
+   the sub-1M reservation to MMUPAGE_SIZE, and round the set_memory_decrypted()
+   page count up (the trampoline is now smaller than a PAGE).
+ - e820__memblock_setup(): after the PAGE_SIZE trim, re-add the <1M e820 RAM at
+   MMUPAGE granularity.  The low 1M is reserved wholesale before the buddy
+   handover and never becomes buddy pages, so this cannot feed partial pages to
+   the page allocator.
+
+Every hunk is #if PAGE_MMUSHIFT or an MMUPAGE_SIZE-for-PAGE_SIZE substitution
+that is identity at shift 0 (MMUPAGE_SIZE == PAGE_SIZE), preserving the Newton
+limit.  Also lifts the PAGE_MMUSHIFT=7 ceiling, which had the same root cause.
+
+Verified in QEMU at PAGE_MMUSHIFT=6 with a synthetic fragmented sub-1M e820
+(memmap= holes at every 256K boundary, leaving no 256K-aligned 256K block):
+mainline panics "Real mode trampoline was not allocated"; with this change the
+kernel boots and brings up all 4 CPUs through the trampoline, no bad_page.
+Un-fragmented boot and PAGE_MMUSHIFT=0 remain clean.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/x86/include/asm/realmode.h | 10 +++++++++-
+ arch/x86/kernel/e820.c          | 27 +++++++++++++++++++++++++++
+ arch/x86/realmode/init.c        | 21 +++++++++++++++++----
+ 3 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/include/asm/realmode.h b/arch/x86/include/asm/realmode.h
+index e406a1e92c63..36ae704cb179 100644
+--- a/arch/x86/include/asm/realmode.h
++++ b/arch/x86/include/asm/realmode.h
+@@ -83,7 +83,15 @@ static __always_inline size_t real_mode_size_needed(void)
+ 	if (real_mode_header)
+ 		return 0;	/* already allocated. */
+ 
+-	return ALIGN(real_mode_blob_end - real_mode_blob, PAGE_SIZE);
++	/*
++	 * Align to MMUPAGE_SIZE, not PAGE_SIZE.  The real-mode trampoline only
++	 * needs hardware-page (MMUPAGE) granularity; under page clustering
++	 * (PAGE_MMUSHIFT > 0) a PAGE_SIZE alignment+size (e.g. 256K) often
++	 * cannot be satisfied in a fragmented sub-1M e820, panicking the boot in
++	 * init_real_mode().  Identity at PAGE_MMUSHIFT == 0 (MMUPAGE_SIZE ==
++	 * PAGE_SIZE).
++	 */
++	return ALIGN(real_mode_blob_end - real_mode_blob, MMUPAGE_SIZE);
+ }
+ 
+ static inline void set_real_mode_mem(phys_addr_t mem)
+diff --git a/arch/x86/kernel/e820.c b/arch/x86/kernel/e820.c
+index eb72537bc0b1..1fd66827ae4f 100644
+--- a/arch/x86/kernel/e820.c
++++ b/arch/x86/kernel/e820.c
+@@ -1376,5 +1376,32 @@ __init void e820__memblock_setup(void)
+ 	/* Throw away partial pages: */
+ 	memblock_trim_memory(PAGE_SIZE);
+ 
++#if PAGE_MMUSHIFT
++	/*
++	 * Under page clustering PAGE_SIZE is large (e.g. 256K), so the trim
++	 * above discards sub-PAGE low (<1M) RAM -- including the memory
++	 * reserve_real_mode() needs for the real-mode trampoline (see the KHO
++	 * scratch marking above).  The low 1M is reserved wholesale before the
++	 * buddy handover and never becomes buddy pages, so re-add the <1M e820
++	 * RAM at MMUPAGE granularity to keep it available to the early sub-1M
++	 * trampoline allocation.  Identity at PAGE_MMUSHIFT == 0 (the trim is
++	 * already PAGE==MMUPAGE granular, so nothing was thrown away to re-add).
++	 */
++	for (idx = 0; idx < e820_table->nr_entries; idx++) {
++		struct e820_entry *entry = &e820_table->entries[idx];
++		u64 start = entry->addr;
++
++		end = entry->addr + entry->size;
++		if (entry->type != E820_TYPE_RAM || start >= SZ_1M)
++			continue;
++		if (end > SZ_1M)
++			end = SZ_1M;
++		start = round_up(start, MMUPAGE_SIZE);
++		end = round_down(end, MMUPAGE_SIZE);
++		if (start < end)
++			memblock_add(start, end - start);
++	}
++#endif
++
+ 	memblock_dump_all();
+ }
+diff --git a/arch/x86/realmode/init.c b/arch/x86/realmode/init.c
+index 0f33bbe7a4df..cd5a56816e6d 100644
+--- a/arch/x86/realmode/init.c
++++ b/arch/x86/realmode/init.c
+@@ -54,8 +54,13 @@ void __init reserve_real_mode(void)
+ 
+ 	WARN_ON(slab_is_available());
+ 
+-	/* Has to be under 1M so we can execute real-mode AP code. */
+-	mem = memblock_phys_alloc_range(size, PAGE_SIZE, 0, 1<<20);
++	/*
++	 * Has to be under 1M so we can execute real-mode AP code.  Align to
++	 * MMUPAGE_SIZE (hardware page), not PAGE_SIZE: under page clustering a
++	 * PAGE_SIZE (e.g. 256K) alignment is unsatisfiable in a fragmented
++	 * sub-1M e820.  Identity at PAGE_MMUSHIFT == 0.
++	 */
++	mem = memblock_phys_alloc_range(size, MMUPAGE_SIZE, 0, 1<<20);
+ 	if (!mem)
+ 		pr_info("No sub-1M memory is available for the trampoline\n");
+ 	else
+@@ -97,7 +102,8 @@ static void __init setup_real_mode(void)
+ 	unsigned char *base;
+ 	unsigned long phys_base;
+ 	struct trampoline_header *trampoline_header;
+-	size_t size = PAGE_ALIGN(real_mode_blob_end - real_mode_blob);
++	/* MMUPAGE-granular to match reserve_real_mode()'s allocation size. */
++	size_t size = ALIGN(real_mode_blob_end - real_mode_blob, MMUPAGE_SIZE);
+ #ifdef CONFIG_X86_64
+ 	u64 *trampoline_pgd;
+ 	u64 efer;
+@@ -112,7 +118,14 @@ static void __init setup_real_mode(void)
+ 	 * successfully. This is not needed for SEV.
+ 	 */
+ 	if (cc_platform_has(CC_ATTR_HOST_MEM_ENCRYPT))
+-		set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
++		/*
++		 * Round up: under page clustering the trampoline is smaller than
++		 * a PAGE, so size >> PAGE_SHIFT would be 0.  set_memory_*
++		 * operates at PAGE granularity on the containing page.  Identity
++		 * at PAGE_MMUSHIFT == 0 (size is PAGE-aligned there).
++		 */
++		set_memory_decrypted((unsigned long)base,
++				     DIV_ROUND_UP(size, PAGE_SIZE));
+ 
+ 	memcpy(base, real_mode_blob, size);
+ 
+-- 
+2.54.0
+

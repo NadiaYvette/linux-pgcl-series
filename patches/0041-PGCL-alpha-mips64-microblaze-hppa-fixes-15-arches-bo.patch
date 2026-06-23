@@ -1,0 +1,1406 @@
+From 795316fdc460155fdaa98689901e1a1cca4e5238 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 24 Mar 2026 16:56:07 +0100
+Subject: [PATCH 041/174] =?UTF-8?q?PGCL:=20alpha/mips64/microblaze/hppa=20?=
+ =?UTF-8?q?fixes=20=E2=80=94=2015=20arches=20boot,=20expanded=20test=20sui?=
+ =?UTF-8?q?te?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Alpha: copy_page/clear_page assembly had hardcoded 8KB (MMUPAGE_SIZE) loop
+counts instead of using PAGE_SIZE/64. With MMUSHIFT=4 (PAGE_SIZE=128KB),
+only 8KB was copied/cleared, corrupting page contents. Fixed all 4 assembly
+files (copy_page.S, ev6-copy_page.S, clear_page.S, ev6-clear_page.S).
+
+MIPS64: Complete PGCL support — page table geometry (PGDIR_SHIFT, PMD_SHIFT,
+PTRS_PER_* all use MMUPAGE_SHIFT), PFN encoding (__phys_to_pte_val two-step
+shift to handle PFN_PTE_SHIFT != MMUPAGE_SHIFT), _PFN_MASK sub-page bits,
+set_ptes PGCL sub-page loop, TLB flush stride (5 functions PAGE→MMUPAGE),
+flush_cache_page MMUPAGE_MASK, PM_DEFAULT_MASK uses CONFIG_PAGE_SHIFT.
+
+Microblaze: hw_exception_handler.S used PAGE_SIZE/PAGE_MASK for page table
+walks in data storage, data TLB miss, and instruction TLB miss handlers.
+With MMUSHIFT=4, wrong masks caused PGD/PTE lookups to fail on write faults.
+Fixed 12 instances across 3 handlers + finish_tlb_load. Also fixed pgtable.h,
+head.S, pgtable.c for MMUPAGE alignment, and updated system.dts for QEMU.
+
+hppa: entry.S L2_ptep macro used PAGE_SHIFT to clear offset bits in page
+directory pointer instead of ASM_PLD_SHIFT (MMUPAGE_SHIFT). Page directory
+tables are MMUPAGE-sized, so wrong masking truncated pointer causing infinite
+TLB miss loops. Fixes both hppa32 and hppa64.
+
+powerpc: Minor mmap2 pgoff shift fix in syscalls.c.
+
+Test results with PAGE_MMUSHIFT=4:
+- x86_64:      19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP), mm-selftests PASS
+- arm64:       19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP), mm-selftests PASS
+- riscv64:     19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP), mm-selftests PASS
+- ppc64:       19/19 pgcl-test, 13/13 pgcl-stress, mm-selftests PASS
+- s390x:       19/19 pgcl-test, 13/13 pgcl-stress, mm-selftests PASS
+- sparc64:     19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP), mm-selftests PASS
+- arm32:       19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP), mm-selftests PASS
+- alpha:       19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP)
+- loongarch64: 19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP)
+- mips64:      19/19 pgcl-test, 11/11 pgcl-stress (2 SKIP)
+- hppa32:      19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP)
+- hppa64:      19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP)
+- riscv32:     19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP)
+- m68k:        19/19 pgcl-test, 12/12 pgcl-stress (1 SKIP)
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/alpha/lib/clear_page.S                   |   3 +-
+ arch/alpha/lib/copy_page.S                    |   3 +-
+ arch/alpha/lib/ev6-clear_page.S               |   5 +-
+ arch/alpha/lib/ev6-copy_page.S                |   3 +-
+ arch/microblaze/boot/dts/system.dts           | 424 ++++--------------
+ arch/microblaze/include/asm/pgtable.h         |  12 +-
+ arch/microblaze/kernel/head.S                 |   2 +-
+ arch/microblaze/kernel/hw_exception_handler.S |  32 +-
+ arch/microblaze/mm/pgtable.c                  |  39 +-
+ arch/mips/include/asm/mipsregs.h              |  28 +-
+ arch/mips/include/asm/pgtable-32.h            |  24 +-
+ arch/mips/include/asm/pgtable-64.h            |  42 +-
+ arch/mips/include/asm/pgtable-bits.h          |  24 +-
+ arch/mips/include/asm/pgtable.h               |  40 +-
+ arch/mips/mm/c-r4k.c                          |   2 +-
+ arch/mips/mm/tlb-r4k.c                        |  26 +-
+ arch/mips/mm/tlbex.c                          |  16 +-
+ arch/parisc/kernel/entry.S                    |   2 +-
+ arch/powerpc/kernel/syscalls.c                |   6 +-
+ 19 files changed, 284 insertions(+), 449 deletions(-)
+
+diff --git a/arch/alpha/lib/clear_page.S b/arch/alpha/lib/clear_page.S
+index af70ee309a33..0c5979633a53 100644
+--- a/arch/alpha/lib/clear_page.S
++++ b/arch/alpha/lib/clear_page.S
+@@ -5,6 +5,7 @@
+  * Zero an entire page.
+  */
+ #include <linux/export.h>
++#include <asm/page.h>
+ 	.text
+ 	.align 4
+ 	.global clear_page
+@@ -12,7 +13,7 @@
+ clear_page:
+ 	.prologue 0
+ 
+-	lda	$0,128
++	lda	$0,PAGE_SIZE/64
+ 	nop
+ 	unop
+ 	nop
+diff --git a/arch/alpha/lib/copy_page.S b/arch/alpha/lib/copy_page.S
+index 1c444fdad9a5..da1dad6befbc 100644
+--- a/arch/alpha/lib/copy_page.S
++++ b/arch/alpha/lib/copy_page.S
+@@ -5,6 +5,7 @@
+  * Copy an entire page.
+  */
+ #include <linux/export.h>
++#include <asm/page.h>
+ 	.text
+ 	.align 4
+ 	.global copy_page
+@@ -12,7 +13,7 @@
+ copy_page:
+ 	.prologue 0
+ 
+-	lda	$18,128
++	lda	$18,PAGE_SIZE/64
+ 	nop
+ 	unop
+ 	nop
+diff --git a/arch/alpha/lib/ev6-clear_page.S b/arch/alpha/lib/ev6-clear_page.S
+index a534d9ff7161..03055f44bab2 100644
+--- a/arch/alpha/lib/ev6-clear_page.S
++++ b/arch/alpha/lib/ev6-clear_page.S
+@@ -5,6 +5,7 @@
+  * Zero an entire page.
+  */
+ #include <linux/export.h>
++#include <asm/page.h>
+         .text
+         .align 4
+         .global clear_page
+@@ -12,8 +13,8 @@
+ clear_page:
+         .prologue 0
+ 
+-	lda	$0,128
+-	lda	$1,125
++	lda	$0,PAGE_SIZE/64
++	lda	$1,PAGE_SIZE/64-3
+ 	addq	$16,64,$2
+ 	addq	$16,128,$3
+ 
+diff --git a/arch/alpha/lib/ev6-copy_page.S b/arch/alpha/lib/ev6-copy_page.S
+index 36be5113b7b7..ae5a1376e162 100644
+--- a/arch/alpha/lib/ev6-copy_page.S
++++ b/arch/alpha/lib/ev6-copy_page.S
+@@ -58,6 +58,7 @@
+    less important than the dcache miss case.  */
+ 
+ #include <linux/export.h>
++#include <asm/page.h>
+ 	.text
+ 	.align 4
+ 	.global copy_page
+@@ -78,7 +79,7 @@ copy_page:
+ 
+ 	wh64	($1)
+ 	ldl	$31,256($17)
+-	lda	$18,118
++	lda	$18,PAGE_SIZE/64-10
+ 	lda	$1,3*64($16)
+ 
+ 	wh64	($1)
+diff --git a/arch/microblaze/boot/dts/system.dts b/arch/microblaze/boot/dts/system.dts
+index 22252451ec09..e54237e8cd75 100644
+--- a/arch/microblaze/boot/dts/system.dts
++++ b/arch/microblaze/boot/dts/system.dts
+@@ -1,353 +1,95 @@
+-// SPDX-License-Identifier: GPL-2.0-or-later
+-/*
+- * Device Tree Generator version: 1.1
+- *
+- * (C) Copyright 2007-2008 Xilinx, Inc.
+- * (C) Copyright 2007-2009 Michal Simek
+- *
+- * Michal SIMEK <monstr@monstr.eu>
+- *
+- * CAUTION: This file is automatically generated by libgen.
+- * Version: Xilinx EDK 10.1.03 EDK_K_SP3.6
+- *
+- * XPS project directory: Xilinx-ML505-ll_temac-sgdma-MMU-FDT-edk101
+- */
+-
+ /dts-v1/;
++
+ / {
+-	#address-cells = <1>;
+-	#size-cells = <1>;
++	#address-cells = <0x01>;
++	#size-cells = <0x01>;
+ 	compatible = "xlnx,microblaze";
+-	model = "testing";
+-	DDR2_SDRAM: memory@90000000 {
+-		device_type = "memory";
+-		reg = < 0x90000000 0x10000000 >;
+-	} ;
+-	aliases {
+-		ethernet0 = &Hard_Ethernet_MAC;
+-		serial0 = &RS232_Uart_1;
+-	} ;
+-	chosen {
+-		bootargs = "console=ttyUL0,115200 highres=on";
+-		stdout-path = "/plb@0/serial@84000000";
+-	} ;
+-	cpus {
+-		#address-cells = <1>;
+-		#cpus = <0x1>;
+-		#size-cells = <0>;
+-		microblaze_0: cpu@0 {
+-			clock-frequency = <125000000>;
+-			compatible = "xlnx,microblaze-7.10.d";
+-			d-cache-baseaddr = <0x90000000>;
+-			d-cache-highaddr = <0x9fffffff>;
+-			d-cache-line-size = <0x10>;
+-			d-cache-size = <0x2000>;
+-			device_type = "cpu";
+-			i-cache-baseaddr = <0x90000000>;
+-			i-cache-highaddr = <0x9fffffff>;
+-			i-cache-line-size = <0x10>;
+-			i-cache-size = <0x2000>;
+-			model = "microblaze,7.10.d";
+-			reg = <0>;
+-			timebase-frequency = <125000000>;
+-			xlnx,addr-tag-bits = <0xf>;
+-			xlnx,allow-dcache-wr = <0x1>;
+-			xlnx,allow-icache-wr = <0x1>;
+-			xlnx,area-optimized = <0x0>;
+-			xlnx,cache-byte-size = <0x2000>;
+-			xlnx,d-lmb = <0x1>;
+-			xlnx,d-opb = <0x0>;
+-			xlnx,d-plb = <0x1>;
+-			xlnx,data-size = <0x20>;
+-			xlnx,dcache-addr-tag = <0xf>;
+-			xlnx,dcache-always-used = <0x1>;
+-			xlnx,dcache-byte-size = <0x2000>;
+-			xlnx,dcache-line-len = <0x4>;
+-			xlnx,dcache-use-fsl = <0x1>;
+-			xlnx,debug-enabled = <0x1>;
+-			xlnx,div-zero-exception = <0x1>;
+-			xlnx,dopb-bus-exception = <0x0>;
+-			xlnx,dynamic-bus-sizing = <0x1>;
+-			xlnx,edge-is-positive = <0x1>;
+-			xlnx,family = "virtex5";
+-			xlnx,endianness = <0x1>;
+-			xlnx,fpu-exception = <0x1>;
+-			xlnx,fsl-data-size = <0x20>;
+-			xlnx,fsl-exception = <0x0>;
+-			xlnx,fsl-links = <0x0>;
+-			xlnx,i-lmb = <0x1>;
+-			xlnx,i-opb = <0x0>;
+-			xlnx,i-plb = <0x1>;
+-			xlnx,icache-always-used = <0x1>;
+-			xlnx,icache-line-len = <0x4>;
+-			xlnx,icache-use-fsl = <0x1>;
+-			xlnx,ill-opcode-exception = <0x1>;
+-			xlnx,instance = "microblaze_0";
+-			xlnx,interconnect = <0x1>;
+-			xlnx,interrupt-is-edge = <0x0>;
+-			xlnx,iopb-bus-exception = <0x0>;
+-			xlnx,mmu-dtlb-size = <0x4>;
+-			xlnx,mmu-itlb-size = <0x2>;
+-			xlnx,mmu-tlb-access = <0x3>;
+-			xlnx,mmu-zones = <0x10>;
+-			xlnx,number-of-pc-brk = <0x1>;
+-			xlnx,number-of-rd-addr-brk = <0x0>;
+-			xlnx,number-of-wr-addr-brk = <0x0>;
+-			xlnx,opcode-0x0-illegal = <0x1>;
+-			xlnx,pvr = <0x2>;
+-			xlnx,pvr-user1 = <0x0>;
+-			xlnx,pvr-user2 = <0x0>;
+-			xlnx,reset-msr = <0x0>;
+-			xlnx,sco = <0x0>;
+-			xlnx,unaligned-exceptions = <0x1>;
+-			xlnx,use-barrel = <0x1>;
+-			xlnx,use-dcache = <0x1>;
+-			xlnx,use-div = <0x1>;
+-			xlnx,use-ext-brk = <0x1>;
+-			xlnx,use-ext-nm-brk = <0x1>;
+-			xlnx,use-extended-fsl-instr = <0x0>;
+-			xlnx,use-fpu = <0x2>;
+-			xlnx,use-hw-mul = <0x2>;
+-			xlnx,use-icache = <0x1>;
+-			xlnx,use-interrupt = <0x1>;
+-			xlnx,use-mmu = <0x3>;
+-			xlnx,use-msr-instr = <0x1>;
+-			xlnx,use-pcmp-instr = <0x1>;
+-		} ;
+-	} ;
+-	mb_plb: plb@0 {
+-		#address-cells = <1>;
+-		#size-cells = <1>;
+-		compatible = "xlnx,plb-v46-1.03.a", "xlnx,plb-v46-1.00.a", "simple-bus";
+-		ranges ;
+-		FLASH: flash@a0000000 {
+-			bank-width = <2>;
+-			compatible = "xlnx,xps-mch-emc-2.00.a", "cfi-flash";
+-			reg = < 0xa0000000 0x2000000 >;
+-			xlnx,family = "virtex5";
+-			xlnx,include-datawidth-matching-0 = <0x1>;
+-			xlnx,include-datawidth-matching-1 = <0x0>;
+-			xlnx,include-datawidth-matching-2 = <0x0>;
+-			xlnx,include-datawidth-matching-3 = <0x0>;
+-			xlnx,include-negedge-ioregs = <0x0>;
+-			xlnx,include-plb-ipif = <0x1>;
+-			xlnx,include-wrbuf = <0x1>;
+-			xlnx,max-mem-width = <0x10>;
+-			xlnx,mch-native-dwidth = <0x20>;
+-			xlnx,mch-plb-clk-period-ps = <0x1f40>;
+-			xlnx,mch-splb-awidth = <0x20>;
+-			xlnx,mch0-accessbuf-depth = <0x10>;
+-			xlnx,mch0-protocol = <0x0>;
+-			xlnx,mch0-rddatabuf-depth = <0x10>;
+-			xlnx,mch1-accessbuf-depth = <0x10>;
+-			xlnx,mch1-protocol = <0x0>;
+-			xlnx,mch1-rddatabuf-depth = <0x10>;
+-			xlnx,mch2-accessbuf-depth = <0x10>;
+-			xlnx,mch2-protocol = <0x0>;
+-			xlnx,mch2-rddatabuf-depth = <0x10>;
+-			xlnx,mch3-accessbuf-depth = <0x10>;
+-			xlnx,mch3-protocol = <0x0>;
+-			xlnx,mch3-rddatabuf-depth = <0x10>;
+-			xlnx,mem0-width = <0x10>;
+-			xlnx,mem1-width = <0x20>;
+-			xlnx,mem2-width = <0x20>;
+-			xlnx,mem3-width = <0x20>;
+-			xlnx,num-banks-mem = <0x1>;
+-			xlnx,num-channels = <0x0>;
+-			xlnx,priority-mode = <0x0>;
+-			xlnx,synch-mem-0 = <0x0>;
+-			xlnx,synch-mem-1 = <0x0>;
+-			xlnx,synch-mem-2 = <0x0>;
+-			xlnx,synch-mem-3 = <0x0>;
+-			xlnx,synch-pipedelay-0 = <0x2>;
+-			xlnx,synch-pipedelay-1 = <0x2>;
+-			xlnx,synch-pipedelay-2 = <0x2>;
+-			xlnx,synch-pipedelay-3 = <0x2>;
+-			xlnx,tavdv-ps-mem-0 = <0x1adb0>;
+-			xlnx,tavdv-ps-mem-1 = <0x3a98>;
+-			xlnx,tavdv-ps-mem-2 = <0x3a98>;
+-			xlnx,tavdv-ps-mem-3 = <0x3a98>;
+-			xlnx,tcedv-ps-mem-0 = <0x1adb0>;
+-			xlnx,tcedv-ps-mem-1 = <0x3a98>;
+-			xlnx,tcedv-ps-mem-2 = <0x3a98>;
+-			xlnx,tcedv-ps-mem-3 = <0x3a98>;
+-			xlnx,thzce-ps-mem-0 = <0x88b8>;
+-			xlnx,thzce-ps-mem-1 = <0x1b58>;
+-			xlnx,thzce-ps-mem-2 = <0x1b58>;
+-			xlnx,thzce-ps-mem-3 = <0x1b58>;
+-			xlnx,thzoe-ps-mem-0 = <0x1b58>;
+-			xlnx,thzoe-ps-mem-1 = <0x1b58>;
+-			xlnx,thzoe-ps-mem-2 = <0x1b58>;
+-			xlnx,thzoe-ps-mem-3 = <0x1b58>;
+-			xlnx,tlzwe-ps-mem-0 = <0x88b8>;
+-			xlnx,tlzwe-ps-mem-1 = <0x0>;
+-			xlnx,tlzwe-ps-mem-2 = <0x0>;
+-			xlnx,tlzwe-ps-mem-3 = <0x0>;
+-			xlnx,twc-ps-mem-0 = <0x2af8>;
+-			xlnx,twc-ps-mem-1 = <0x3a98>;
+-			xlnx,twc-ps-mem-2 = <0x3a98>;
+-			xlnx,twc-ps-mem-3 = <0x3a98>;
+-			xlnx,twp-ps-mem-0 = <0x11170>;
+-			xlnx,twp-ps-mem-1 = <0x2ee0>;
+-			xlnx,twp-ps-mem-2 = <0x2ee0>;
+-			xlnx,twp-ps-mem-3 = <0x2ee0>;
+-			xlnx,xcl0-linesize = <0x4>;
+-			xlnx,xcl0-writexfer = <0x1>;
+-			xlnx,xcl1-linesize = <0x4>;
+-			xlnx,xcl1-writexfer = <0x1>;
+-			xlnx,xcl2-linesize = <0x4>;
+-			xlnx,xcl2-writexfer = <0x1>;
+-			xlnx,xcl3-linesize = <0x4>;
+-			xlnx,xcl3-writexfer = <0x1>;
+-		} ;
+-		Hard_Ethernet_MAC: xps-ll-temac@81c00000 {
+-			#address-cells = <1>;
+-			#size-cells = <1>;
+-			compatible = "xlnx,compound";
+-			ranges ;
+-			ethernet@81c00000 {
+-				compatible = "xlnx,xps-ll-temac-1.01.b", "xlnx,xps-ll-temac-1.00.a";
+-				interrupt-parent = <&xps_intc_0>;
+-				interrupts = < 5 2 >;
+-				llink-connected = <&PIM3>;
+-				local-mac-address = [ 00 0a 35 00 00 00 ];
+-				reg = < 0x81c00000 0x40 >;
+-				xlnx,bus2core-clk-ratio = <0x1>;
+-				xlnx,phy-type = <0x1>;
+-				xlnx,phyaddr = <0x1>;
+-				xlnx,rxcsum = <0x0>;
+-				xlnx,rxfifo = <0x1000>;
+-				xlnx,temac-type = <0x0>;
+-				xlnx,txcsum = <0x0>;
+-				xlnx,txfifo = <0x1000>;
+-			} ;
+-		} ;
+-		IIC_EEPROM: i2c@81600000 {
+-			compatible = "xlnx,xps-iic-2.00.a";
+-			interrupt-parent = <&xps_intc_0>;
+-			interrupts = < 6 2 >;
+-			reg = < 0x81600000 0x10000 >;
+-			xlnx,clk-freq = <0x7735940>;
+-			xlnx,family = "virtex5";
+-			xlnx,gpo-width = <0x1>;
+-			xlnx,iic-freq = <0x186a0>;
+-			xlnx,scl-inertial-delay = <0x0>;
+-			xlnx,sda-inertial-delay = <0x0>;
+-			xlnx,ten-bit-adr = <0x0>;
+-		} ;
+-		LEDs_8Bit: gpio@81400000 {
+-			compatible = "xlnx,xps-gpio-1.00.a";
+-			interrupt-parent = <&xps_intc_0>;
+-			interrupts = < 7 2 >;
+-			reg = < 0x81400000 0x10000 >;
+-			xlnx,all-inputs = <0x0>;
+-			xlnx,all-inputs-2 = <0x0>;
+-			xlnx,dout-default = <0x0>;
+-			xlnx,dout-default-2 = <0x0>;
+-			xlnx,family = "virtex5";
+-			xlnx,gpio-width = <0x8>;
+-			xlnx,interrupt-present = <0x1>;
+-			xlnx,is-bidir = <0x1>;
+-			xlnx,is-bidir-2 = <0x1>;
+-			xlnx,is-dual = <0x0>;
+-			xlnx,tri-default = <0xffffffff>;
+-			xlnx,tri-default-2 = <0xffffffff>;
+-			#gpio-cells = <2>;
+-			gpio-controller;
+-		} ;
+-
+-		gpio-leds {
+-			compatible = "gpio-leds";
++	model = "petalogix-ml605";
+ 
+-			heartbeat {
+-				label = "Heartbeat";
+-				gpios = <&LEDs_8Bit 4 1>;
+-				linux,default-trigger = "heartbeat";
+-			};
+-
+-			yellow {
+-				label = "Yellow";
+-				gpios = <&LEDs_8Bit 5 1>;
+-			};
++	memory@50000000 {
++		device_type = "memory";
++		reg = <0x50000000 0x10000000>;
++	};
+ 
+-			red {
+-				label = "Red";
+-				gpios = <&LEDs_8Bit 6 1>;
+-			};
++	chosen {
++		bootargs = "console=ttyS0,115200";
++		stdout-path = "/axi/serial@83e00000";
++	};
+ 
+-			green {
+-				label = "Green";
+-				gpios = <&LEDs_8Bit 7 1>;
+-			};
+-		} ;
++	cpus {
++		#address-cells = <0x01>;
++		#cpus = <0x01>;
++		#size-cells = <0x00>;
+ 
+-		gpio-restart {
+-			compatible = "gpio-restart";
+-			/*
+-			 * FIXME: is this active low or active high?
+-			 * the current flag (1) indicates active low.
+-			 * delay measures are templates, should be adjusted
+-			 * to datasheet or trial-and-error with real hardware.
+-			 */
+-			gpios = <&LEDs_8Bit 2 1>;
+-			active-delay = <100>;
+-			inactive-delay = <10>;
+-			wait-delay = <100>;
++		cpu@0 {
++			clock-frequency = <200000000>;
++			compatible = "xlnx,microblaze-8.10.a";
++			d-cache-baseaddr = <0x50000000>;
++			d-cache-highaddr = <0x5fffffff>;
++			d-cache-line-size = <0x20>;
++			d-cache-size = <0x800>;
++			device_type = "cpu";
++			i-cache-baseaddr = <0x50000000>;
++			i-cache-highaddr = <0x5fffffff>;
++			i-cache-line-size = <0x20>;
++			i-cache-size = <0x800>;
++			model = "microblaze,8.10.a";
++			reg = <0x00>;
++			timebase-frequency = <200000000>;
++			xlnx,endianness = <0x01>;
++			xlnx,use-mmu = <0x03>;
++			xlnx,use-barrel = <0x01>;
++			xlnx,use-div = <0x01>;
++			xlnx,use-hw-mul = <0x02>;
++			xlnx,use-fpu = <0x01>;
++			xlnx,use-msr-instr = <0x01>;
++			xlnx,use-pcmp-instr = <0x01>;
++			xlnx,pvr = <0x02>;
++			xlnx,use-dcache = <0x01>;
++			xlnx,use-icache = <0x01>;
++			xlnx,mmu-dtlb-size = <0x04>;
++			xlnx,mmu-itlb-size = <0x02>;
++			xlnx,mmu-tlb-access = <0x03>;
++			xlnx,mmu-zones = <0x02>;
++			xlnx,use-interrupt = <0x01>;
+ 		};
++	};
+ 
+-		RS232_Uart_1: serial@84000000 {
+-			clock-frequency = <125000000>;
+-			compatible = "xlnx,xps-uartlite-1.00.a";
++	axi {
++		#address-cells = <0x01>;
++		#size-cells = <0x01>;
++		compatible = "xlnx,axi-interconnect-1.02.a", "simple-bus";
++		ranges;
++
++		serial@83e00000 {
++			clock-frequency = <100000000>;
++			compatible = "xlnx,axi-uart16550-1.01.a", "xlnx,xps-uart16550-2.00.a", "ns16550a";
+ 			current-speed = <115200>;
+ 			device_type = "serial";
+-			interrupt-parent = <&xps_intc_0>;
+-			interrupts = < 8 0 >;
+-			port-number = <0>;
+-			reg = < 0x84000000 0x10000 >;
+-			xlnx,baudrate = <0x1c200>;
+-			xlnx,data-bits = <0x8>;
+-			xlnx,family = "virtex5";
+-			xlnx,odd-parity = <0x0>;
+-			xlnx,use-parity = <0x0>;
+-		} ;
+-		debug_module: debug@84400000 {
+-			compatible = "xlnx,mdm-1.00.d";
+-			reg = < 0x84400000 0x10000 >;
+-			xlnx,family = "virtex5";
+-			xlnx,interconnect = <0x1>;
+-			xlnx,jtag-chain = <0x2>;
+-			xlnx,mb-dbg-ports = <0x1>;
+-			xlnx,uart-width = <0x8>;
+-			xlnx,use-uart = <0x1>;
+-			xlnx,write-fsl-ports = <0x0>;
+-		} ;
+-		mpmc@90000000 {
+-			#address-cells = <1>;
+-			#size-cells = <1>;
+-			compatible = "xlnx,mpmc-4.02.a";
+-			ranges ;
+-			PIM3: sdma@84600180 {
+-				compatible = "xlnx,ll-dma-1.00.a";
+-				interrupt-parent = <&xps_intc_0>;
+-				interrupts = < 2 2 1 2 >;
+-				reg = < 0x84600180 0x80 >;
+-			} ;
+-		} ;
+-		xps_intc_0: interrupt-controller@81800000 {
+-			#interrupt-cells = <0x2>;
+-			compatible = "xlnx,xps-intc-1.00.a";
+-			interrupt-controller ;
+-			reg = < 0x81800000 0x10000 >;
+-			xlnx,kind-of-intr = <0x100>;
+-			xlnx,num-intr-inputs = <0x9>;
+-		} ;
+-		xps_timer_1: timer@83c00000 {
+-			compatible = "xlnx,xps-timer-1.00.a";
+-			interrupt-parent = <&xps_intc_0>;
+-			interrupts = < 3 2 >;
+-			reg = < 0x83c00000 0x10000 >;
++			interrupt-parent = <&intc>;
++			interrupts = <0x05 0x02>;
++			reg = <0x83e00000 0x10000>;
++			reg-offset = <0x1000>;
++			reg-shift = <0x02>;
++		};
++
++		system-timer@83c00000 {
++			clock-frequency = <100000000>;
++			compatible = "xlnx,axi-timer-1.01.a", "xlnx,xps-timer-1.00.a";
++			interrupt-parent = <&intc>;
++			interrupts = <0x02 0x00>;
++			reg = <0x83c00000 0x10000>;
+ 			xlnx,count-width = <0x20>;
+-			xlnx,one-timer-only = <0x0>;
+-		} ;
+-	} ;
+-}  ;
++			xlnx,one-timer-only = <0x00>;
++		};
++
++		intc: interrupt-controller@81800000 {
++			#interrupt-cells = <0x02>;
++			compatible = "xlnx,axi-intc-1.01.a", "xlnx,xps-intc-1.00.a";
++			interrupt-controller;
++			reg = <0x81800000 0x10000>;
++			xlnx,kind-of-intr = <0x04>;
++			xlnx,num-intr-inputs = <0x06>;
++		};
++	};
++};
+diff --git a/arch/microblaze/include/asm/pgtable.h b/arch/microblaze/include/asm/pgtable.h
+index 1e5a824faf8d..b476270d8fdc 100644
+--- a/arch/microblaze/include/asm/pgtable.h
++++ b/arch/microblaze/include/asm/pgtable.h
+@@ -152,7 +152,7 @@ extern pte_t *va_to_pte(unsigned long address);
+ #define _PAGE_HWWRITE	0x100	/* hardware: Dirty & RW, set in exception */
+ #define _PAGE_HWEXEC	0x200	/* hardware: EX permission */
+ #define _PAGE_ACCESSED	0x400	/* software: R: page referenced */
+-#define _PMD_PRESENT	PAGE_MASK
++#define _PMD_PRESENT	MMUPAGE_MASK
+ 
+ /* We borrow bit 24 to store the exclusive marker in swap PTEs. */
+ #define _PAGE_SWP_EXCLUSIVE	_PAGE_DIRTY
+@@ -217,8 +217,13 @@ extern pte_t *va_to_pte(unsigned long address);
+ #define	pmd_present(pmd)	((pmd_val(pmd) & _PMD_PRESENT) != 0)
+ #define	pmd_clear(pmdp)		do { pmd_val(*(pmdp)) = 0; } while (0)
+ 
++/*
++ * pte_page returns the kernel page (struct page) containing the
++ * hardware page described by this PTE. Multiple MMU pages within one
++ * kernel page map to the same struct page.
++ */
+ #define pte_page(x)		(mem_map + (unsigned long) \
+-				((pte_val(x) - memory_start) >> PAGE_SHIFT))
++				(((pte_val(x) & MMUPAGE_MASK) - memory_start) >> PAGE_SHIFT))
+ #define PFN_PTE_SHIFT		PAGE_SHIFT
+ 
+ #define pte_pfn(x)		(pte_val(x) >> PFN_PTE_SHIFT)
+@@ -357,10 +362,11 @@ static inline void ptep_mkdirty(struct mm_struct *mm,
+ /* returns effective address of the pmd entry*/
+ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+ {
+-	return ((unsigned long) (pmd_val(pmd) & PAGE_MASK));
++	return ((unsigned long) (pmd_val(pmd) & MMUPAGE_MASK));
+ }
+ 
+ /* returns pfn of the pmd entry*/
++/* PTE tables are MMUPAGE-sized; return the kernel-page PFN they reside in */
+ #define pmd_pfn(pmd)	(__pa(pmd_val(pmd)) >> PAGE_SHIFT)
+ 
+ /* returns struct *page of the pmd entry*/
+diff --git a/arch/microblaze/kernel/head.S b/arch/microblaze/kernel/head.S
+index 808019c3b7ac..e72c6c5ebbb6 100644
+--- a/arch/microblaze/kernel/head.S
++++ b/arch/microblaze/kernel/head.S
+@@ -41,7 +41,7 @@
+ .section .data
+ .global swapper_pg_dir
+ swapper_pg_dir:
+-	.space	PAGE_SIZE
++	.space	MMUPAGE_SIZE
+ 
+ .section .rodata
+ .align 4
+diff --git a/arch/microblaze/kernel/hw_exception_handler.S b/arch/microblaze/kernel/hw_exception_handler.S
+index 07ea23965f81..9f82f66e3521 100644
+--- a/arch/microblaze/kernel/hw_exception_handler.S
++++ b/arch/microblaze/kernel/hw_exception_handler.S
+@@ -518,16 +518,16 @@ ex_handler_done:
+ 		tophys(r4,r4)
+ 		/* Create L1 (pgdir/pmd) address */
+ 		bsrli	r5, r3, PGDIR_SHIFT - 2
+-		andi	r5, r5, PAGE_SIZE - 4
+-/* Assume pgdir aligned on 4K boundary, no need for "andi r4,r4,0xfffff003" */
++		andi	r5, r5, MMUPAGE_SIZE - 4
++/* Assume pgdir aligned on MMUPAGE boundary */
+ 		or	r4, r4, r5
+ 		lwi	r4, r4, 0		/* Get L1 entry */
+-		andi	r5, r4, PAGE_MASK /* Extract L2 (pte) base address */
++		andi	r5, r4, MMUPAGE_MASK /* Extract L2 (pte) base address */
+ 		beqi	r5, ex2			/* Bail if no table */
+ 
+ 		tophys(r5,r5)
+ 		bsrli	r6, r3, PTE_SHIFT /* Compute PTE address */
+-		andi	r6, r6, PAGE_SIZE - 4
++		andi	r6, r6, MMUPAGE_SIZE - 4
+ 		or	r5, r5, r6
+ 		lwi	r4, r5, 0		/* Get Linux PTE */
+ 
+@@ -547,7 +547,7 @@ ex_handler_done:
+ 		 * here we (properly should) assume have the appropriate value.
+ 		 */
+ /* Ignore memory coherent, just LSB on ZSEL is used + EX/WR */
+-		andi	r4, r4, PAGE_MASK | TLB_EX | TLB_WR | \
++		andi	r4, r4, MMUPAGE_MASK | TLB_EX | TLB_WR | \
+ 						TLB_ZSEL(1) | TLB_ATTR_MASK
+ 		ori	r4, r4, _PAGE_HWEXEC	/* make it executable */
+ 
+@@ -619,16 +619,16 @@ ex_handler_done:
+ 		tophys(r4,r4)
+ 		/* Create L1 (pgdir/pmd) address */
+ 		bsrli	r5, r3, PGDIR_SHIFT - 2
+-		andi	r5, r5, PAGE_SIZE - 4
+-/* Assume pgdir aligned on 4K boundary, no need for "andi r4,r4,0xfffff003" */
++		andi	r5, r5, MMUPAGE_SIZE - 4
++/* Assume pgdir aligned on MMUPAGE boundary */
+ 		or	r4, r4, r5
+ 		lwi	r4, r4, 0		/* Get L1 entry */
+-		andi	r5, r4, PAGE_MASK /* Extract L2 (pte) base address */
++		andi	r5, r4, MMUPAGE_MASK /* Extract L2 (pte) base address */
+ 		beqi	r5, ex7			/* Bail if no table */
+ 
+ 		tophys(r5,r5)
+ 		bsrli	r6, r3, PTE_SHIFT /* Compute PTE address */
+-		andi	r6, r6, PAGE_SIZE - 4
++		andi	r6, r6, MMUPAGE_SIZE - 4
+ 		or	r5, r5, r6
+ 		lwi	r4, r5, 0		/* Get Linux PTE */
+ 
+@@ -647,7 +647,7 @@ ex_handler_done:
+ 		 * here we (properly should) assume have the appropriate value.
+ 		 */
+ 		brid	finish_tlb_load
+-		andi	r4, r4, PAGE_MASK | TLB_EX | TLB_WR | \
++		andi	r4, r4, MMUPAGE_MASK | TLB_EX | TLB_WR | \
+ 						TLB_ZSEL(1) | TLB_ATTR_MASK
+ 	ex7:
+ 		/* The bailout. Restore registers to pre-exception conditions
+@@ -690,16 +690,16 @@ ex_handler_done:
+ 		tophys(r4,r4)
+ 		/* Create L1 (pgdir/pmd) address */
+ 		bsrli	r5, r3, PGDIR_SHIFT - 2
+-		andi	r5, r5, PAGE_SIZE - 4
+-/* Assume pgdir aligned on 4K boundary, no need for "andi r4,r4,0xfffff003" */
++		andi	r5, r5, MMUPAGE_SIZE - 4
++/* Assume pgdir aligned on MMUPAGE boundary */
+ 		or	r4, r4, r5
+ 		lwi	r4, r4, 0		/* Get L1 entry */
+-		andi	r5, r4, PAGE_MASK /* Extract L2 (pte) base address */
++		andi	r5, r4, MMUPAGE_MASK /* Extract L2 (pte) base address */
+ 		beqi	r5, ex10		/* Bail if no table */
+ 
+ 		tophys(r5,r5)
+ 		bsrli	r6, r3, PTE_SHIFT /* Compute PTE address */
+-		andi	r6, r6, PAGE_SIZE - 4
++		andi	r6, r6, MMUPAGE_SIZE - 4
+ 		or	r5, r5, r6
+ 		lwi	r4, r5, 0		/* Get Linux PTE */
+ 
+@@ -718,7 +718,7 @@ ex_handler_done:
+ 		 * here we (properly should) assume have the appropriate value.
+ 		 */
+ 		brid	finish_tlb_load
+-		andi	r4, r4, PAGE_MASK | TLB_EX | TLB_WR | \
++		andi	r4, r4, MMUPAGE_MASK | TLB_EX | TLB_WR | \
+ 						TLB_ZSEL(1) | TLB_ATTR_MASK
+ 	ex10:
+ 		/* The bailout. Restore registers to pre-exception conditions
+@@ -772,7 +772,7 @@ ex_handler_done:
+ 		 * set of bits. These are size, valid, E, U0, and ensure
+ 		 * bits 20 and 21 are zero.
+ 		 */
+-		andi	r3, r3, PAGE_MASK
++		andi	r3, r3, MMUPAGE_MASK
+ 		ori	r3, r3, TLB_VALID | TLB_PAGESZ(PAGESZ_4K)
+ 		mts	rtlbhi,	r3		/* Load TLB HI */
+ 		nop
+diff --git a/arch/microblaze/mm/pgtable.c b/arch/microblaze/mm/pgtable.c
+index e96dd1b7aba4..2e0451ddf791 100644
+--- a/arch/microblaze/mm/pgtable.c
++++ b/arch/microblaze/mm/pgtable.c
+@@ -59,8 +59,8 @@ static void __iomem *__ioremap(phys_addr_t addr, unsigned long size,
+ 	 * Before then, we use space going down from ioremap_base
+ 	 * (ioremap_bot records where we're up to).
+ 	 */
+-	p = addr & PAGE_MASK;
+-	size = PAGE_ALIGN(addr + size) - p;
++	p = addr & MMUPAGE_MASK;
++	size = ALIGN(addr + size, MMUPAGE_SIZE) - p;
+ 
+ 	/*
+ 	 * Don't allow anybody to remap normal RAM that we're using.
+@@ -108,7 +108,7 @@ static void __iomem *__ioremap(phys_addr_t addr, unsigned long size,
+ 		flags |= _PAGE_GUARDED;
+ 
+ 	err = 0;
+-	for (i = 0; i < size && err == 0; i += PAGE_SIZE)
++	for (i = 0; i < size && err == 0; i += MMUPAGE_SIZE)
+ 		err = map_page(v + i, p + i, flags);
+ 	if (err) {
+ 		if (mem_init_done)
+@@ -116,7 +116,7 @@ static void __iomem *__ioremap(phys_addr_t addr, unsigned long size,
+ 		return NULL;
+ 	}
+ 
+-	return (void __iomem *) (v + ((unsigned long)addr & ~PAGE_MASK));
++	return (void __iomem *) (v + ((unsigned long)addr & ~MMUPAGE_MASK));
+ }
+ 
+ void __iomem *ioremap(phys_addr_t addr, unsigned long size)
+@@ -129,7 +129,7 @@ void iounmap(volatile void __iomem *addr)
+ {
+ 	if ((__force void *)addr > high_memory &&
+ 					(unsigned long) addr < ioremap_bot)
+-		vfree((void *) (PAGE_MASK & (unsigned long) addr));
++		vfree((void *) (MMUPAGE_MASK & (unsigned long) addr));
+ }
+ EXPORT_SYMBOL(iounmap);
+ 
+@@ -152,8 +152,13 @@ int map_page(unsigned long va, phys_addr_t pa, int flags)
+ 
+ 	if (pg != NULL) {
+ 		err = 0;
+-		set_pte_at(&init_mm, va, pg, pfn_pte(pa >> PAGE_SHIFT,
+-				__pgprot(flags)));
++		/*
++		 * map_page() maps a single MMUPAGE-sized page. Bypass pfn_pte
++		 * (which uses PAGE-granular PFNs) and construct the PTE
++		 * directly with the MMUPAGE-aligned physical address.
++		 */
++		set_pte_at(&init_mm, va, pg,
++			   __pte((pa & MMUPAGE_MASK) | flags));
+ 		if (unlikely(mem_init_done))
+ 			_tlbie(va);
+ 	}
+@@ -169,7 +174,7 @@ void __init mapin_ram(void)
+ 
+ 	v = CONFIG_KERNEL_START;
+ 	p = memory_start;
+-	for (s = 0; s < lowmem_size; s += PAGE_SIZE) {
++	for (s = 0; s < lowmem_size; s += MMUPAGE_SIZE) {
+ 		f = _PAGE_PRESENT | _PAGE_ACCESSED |
+ 				_PAGE_SHARED | _PAGE_HWEXEC;
+ 		if (!is_kernel_text(v))
+@@ -179,8 +184,8 @@ void __init mapin_ram(void)
+ 			   forces R/W kernel access */
+ 			f |= _PAGE_USER;
+ 		map_page(v, p, f);
+-		v += PAGE_SIZE;
+-		p += PAGE_SIZE;
++		v += MMUPAGE_SIZE;
++		p += MMUPAGE_SIZE;
+ 	}
+ }
+ 
+@@ -201,13 +206,13 @@ static int get_pteptr(struct mm_struct *mm, unsigned long addr, pte_t **ptep)
+ 	pte_t	*pte;
+ 	int     retval = 0;
+ 
+-	pgd = pgd_offset(mm, addr & PAGE_MASK);
++	pgd = pgd_offset(mm, addr & MMUPAGE_MASK);
+ 	if (pgd) {
+-		p4d = p4d_offset(pgd, addr & PAGE_MASK);
+-		pud = pud_offset(p4d, addr & PAGE_MASK);
+-		pmd = pmd_offset(pud, addr & PAGE_MASK);
++		p4d = p4d_offset(pgd, addr & MMUPAGE_MASK);
++		pud = pud_offset(p4d, addr & MMUPAGE_MASK);
++		pmd = pmd_offset(pud, addr & MMUPAGE_MASK);
+ 		if (pmd_present(*pmd)) {
+-			pte = pte_offset_kernel(pmd, addr & PAGE_MASK);
++			pte = pte_offset_kernel(pmd, addr & MMUPAGE_MASK);
+ 			if (pte) {
+ 				retval = 1;
+ 				*ptep = pte;
+@@ -237,7 +242,7 @@ unsigned long iopa(unsigned long addr)
+ 
+ 	pa = 0;
+ 	if (get_pteptr(mm, addr, &pte))
+-		pa = (pte_val(*pte) & PAGE_MASK) | (addr & ~PAGE_MASK);
++		pa = (pte_val(*pte) & MMUPAGE_MASK) | (addr & ~MMUPAGE_MASK);
+ 
+ 	return pa;
+ }
+@@ -247,7 +252,7 @@ __ref pte_t *pte_alloc_one_kernel(struct mm_struct *mm)
+ 	if (mem_init_done)
+ 		return __pte_alloc_one_kernel(mm);
+ 	else
+-		return memblock_alloc_try_nid(PAGE_SIZE, PAGE_SIZE,
++		return memblock_alloc_try_nid(MMUPAGE_SIZE, MMUPAGE_SIZE,
+ 					      MEMBLOCK_LOW_LIMIT,
+ 					      memory_start + kernel_tlb,
+ 					      NUMA_NO_NODE);
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+index 12a095dbf9e2..4a502723bbf4 100644
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -322,34 +322,38 @@
+ #define PM_1G		0x7fffe000
+ 
+ /*
+- * Default page size for a given kernel configuration
++ * Default page size for a given kernel configuration.
++ * With PGCL (PAGE_MMUSHIFT > 0), CONFIG_PAGE_SIZE_* reflects the kernel
++ * allocation granularity, not the hardware MMU page size.  PM_DEFAULT_MASK
++ * must match the hardware page size (MMUPAGE_SIZE = 1 << CONFIG_PAGE_SHIFT).
+  */
+-#ifdef CONFIG_PAGE_SIZE_4KB
++#if CONFIG_PAGE_SHIFT == 12
+ #define PM_DEFAULT_MASK PM_4K
+-#elif defined(CONFIG_PAGE_SIZE_8KB)
++#elif CONFIG_PAGE_SHIFT == 13
+ #define PM_DEFAULT_MASK PM_8K
+-#elif defined(CONFIG_PAGE_SIZE_16KB)
++#elif CONFIG_PAGE_SHIFT == 14
+ #define PM_DEFAULT_MASK PM_16K
+-#elif defined(CONFIG_PAGE_SIZE_32KB)
++#elif CONFIG_PAGE_SHIFT == 15
+ #define PM_DEFAULT_MASK PM_32K
+-#elif defined(CONFIG_PAGE_SIZE_64KB)
++#elif CONFIG_PAGE_SHIFT == 16
+ #define PM_DEFAULT_MASK PM_64K
+ #else
+ #error Bad page size configuration!
+ #endif
+ 
+ /*
+- * Default huge tlb size for a given kernel configuration
++ * Default huge tlb size for a given kernel configuration.
++ * Must match hardware page size (CONFIG_PAGE_SHIFT), not kernel page size.
+  */
+-#ifdef CONFIG_PAGE_SIZE_4KB
++#if CONFIG_PAGE_SHIFT == 12
+ #define PM_HUGE_MASK	PM_1M
+-#elif defined(CONFIG_PAGE_SIZE_8KB)
++#elif CONFIG_PAGE_SHIFT == 13
+ #define PM_HUGE_MASK	PM_4M
+-#elif defined(CONFIG_PAGE_SIZE_16KB)
++#elif CONFIG_PAGE_SHIFT == 14
+ #define PM_HUGE_MASK	PM_16M
+-#elif defined(CONFIG_PAGE_SIZE_32KB)
++#elif CONFIG_PAGE_SHIFT == 15
+ #define PM_HUGE_MASK	PM_64M
+-#elif defined(CONFIG_PAGE_SIZE_64KB)
++#elif CONFIG_PAGE_SHIFT == 16
+ #define PM_HUGE_MASK	PM_256M
+ #elif defined(CONFIG_MIPS_HUGE_TLB_SUPPORT)
+ #error Bad page size configuration for hugetlbfs!
+diff --git a/arch/mips/include/asm/pgtable-32.h b/arch/mips/include/asm/pgtable-32.h
+index fc0aed982624..f8e213feaddf 100644
+--- a/arch/mips/include/asm/pgtable-32.h
++++ b/arch/mips/include/asm/pgtable-32.h
+@@ -60,11 +60,15 @@ extern int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
+  * works even with the cache aliasing problem the R4k and above have.
+  */
+ 
+-/* PGDIR_SHIFT determines what a third-level page table entry can map */
++/*
++ * PGDIR_SHIFT determines what a third-level page table entry can map.
++ * Page table pages are MMUPAGE-sized, so use MMUPAGE_SHIFT for
++ * entries-per-table-page calculation.
++ */
+ #if defined(CONFIG_MIPS_HUGE_TLB_SUPPORT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+-# define PGDIR_SHIFT	(PAGE_SHIFT + MMUPAGE_SHIFT - PTE_T_LOG2 - 1)
++# define PGDIR_SHIFT	(2 * MMUPAGE_SHIFT - PTE_T_LOG2 - 1)
+ #else
+-# define PGDIR_SHIFT	(PAGE_SHIFT + MMUPAGE_SHIFT - PTE_T_LOG2)
++# define PGDIR_SHIFT	(2 * MMUPAGE_SHIFT - PTE_T_LOG2)
+ #endif
+ 
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+@@ -75,9 +79,9 @@ extern int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
+  * we don't really have any PUD/PMD directory physically.
+  */
+ #if defined(CONFIG_MIPS_HUGE_TLB_SUPPORT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+-# define __PGD_TABLE_ORDER (32 - 2 * PAGE_SHIFT - MMUPAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2 + 1)
++# define __PGD_TABLE_ORDER (32 - 3 * MMUPAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2 + 1)
+ #else
+-# define __PGD_TABLE_ORDER (32 - 2 * PAGE_SHIFT - MMUPAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2)
++# define __PGD_TABLE_ORDER (32 - 3 * MMUPAGE_SHIFT + PGD_T_LOG2 + PTE_T_LOG2)
+ #endif
+ 
+ #define PGD_TABLE_ORDER	(__PGD_TABLE_ORDER >= 0 ? __PGD_TABLE_ORDER : 0)
+@@ -86,9 +90,9 @@ extern int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
+ 
+ #define PTRS_PER_PGD	(USER_PTRS_PER_PGD * 2)
+ #if defined(CONFIG_MIPS_HUGE_TLB_SUPPORT) && !defined(CONFIG_PHYS_ADDR_T_64BIT)
+-# define PTRS_PER_PTE	(PAGE_SIZE / sizeof(pte_t) / 2)
++# define PTRS_PER_PTE	(MMUPAGE_SIZE / sizeof(pte_t) / 2)
+ #else
+-# define PTRS_PER_PTE	(PAGE_SIZE / sizeof(pte_t))
++# define PTRS_PER_PTE	(MMUPAGE_SIZE / sizeof(pte_t))
+ #endif
+ 
+ #define USER_PTRS_PER_PGD	(0x80000000UL/PGDIR_SIZE)
+@@ -184,9 +188,9 @@ static inline pte_t pfn_pte(unsigned long pfn, pgprot_t prot)
+ #else
+ 
+ #define MAX_POSSIBLE_PHYSMEM_BITS 32
+-#define pte_pfn(x)		((unsigned long)((x).pte >> PFN_PTE_SHIFT))
+-#define pfn_pte(pfn, prot)	__pte(((unsigned long long)(pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
+-#define pfn_pmd(pfn, prot)	__pmd(((unsigned long long)(pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
++#define pte_pfn(x)		((unsigned long)((x).pte >> (PFN_PTE_SHIFT + PAGE_MMUSHIFT)))
++#define pfn_pte(pfn, prot)	__pte(((unsigned long long)(pfn) << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)) | pgprot_val(prot))
++#define pfn_pmd(pfn, prot)	__pmd(((unsigned long long)(pfn) << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)) | pgprot_val(prot))
+ #endif /* defined(CONFIG_PHYS_ADDR_T_64BIT) && defined(CONFIG_CPU_MIPS32) */
+ 
+ #define pte_page(x)		pfn_to_page(pte_pfn(x))
+diff --git a/arch/mips/include/asm/pgtable-64.h b/arch/mips/include/asm/pgtable-64.h
+index 0135652f2f36..1b32364c55e0 100644
+--- a/arch/mips/include/asm/pgtable-64.h
++++ b/arch/mips/include/asm/pgtable-64.h
+@@ -40,26 +40,30 @@
+  */
+ 
+ 
+-/* PGDIR_SHIFT determines what a third-level page table entry can map */
++/*
++ * PGDIR_SHIFT determines what a third-level page table entry can map.
++ * Page table pages are MMUPAGE-sized (hardware page), so all shift
++ * calculations use MMUPAGE_SHIFT for entries-per-table-page (log2(MMUPAGE_SIZE/8)).
++ */
+ #ifdef __PAGETABLE_PMD_FOLDED
+-#define PGDIR_SHIFT	(MMUPAGE_SHIFT + PAGE_SHIFT - 3)
++#define PGDIR_SHIFT	(2 * MMUPAGE_SHIFT - 3)
+ #else
+ 
+ /* PMD_SHIFT determines the size of the area a second-level page table can map */
+-#define PMD_SHIFT	(MMUPAGE_SHIFT + (PAGE_SHIFT - 3))
++#define PMD_SHIFT	(2 * MMUPAGE_SHIFT - 3)
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ 
+ # ifdef __PAGETABLE_PUD_FOLDED
+-# define PGDIR_SHIFT	(PMD_SHIFT + (PAGE_SHIFT + PMD_TABLE_ORDER - 3))
++# define PGDIR_SHIFT	(PMD_SHIFT + (MMUPAGE_SHIFT + PMD_TABLE_ORDER - 3))
+ # endif
+ #endif
+ 
+ #ifndef __PAGETABLE_PUD_FOLDED
+-#define PUD_SHIFT	(PMD_SHIFT + (PAGE_SHIFT + PMD_TABLE_ORDER - 3))
++#define PUD_SHIFT	(PMD_SHIFT + (MMUPAGE_SHIFT + PMD_TABLE_ORDER - 3))
+ #define PUD_SIZE	(1UL << PUD_SHIFT)
+ #define PUD_MASK	(~(PUD_SIZE-1))
+-#define PGDIR_SHIFT	(PUD_SHIFT + (PAGE_SHIFT + PUD_TABLE_ORDER - 3))
++#define PGDIR_SHIFT	(PUD_SHIFT + (MMUPAGE_SHIFT + PUD_TABLE_ORDER - 3))
+ #endif
+ 
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+@@ -122,14 +126,18 @@
+ #endif
+ #endif
+ 
+-#define PTRS_PER_PGD	((PAGE_SIZE << PGD_TABLE_ORDER) / sizeof(pgd_t))
++/*
++ * Page table pages are MMUPAGE-sized.  Use MMUPAGE_SIZE for entry counts
++ * so TLB refill andi masks fit in 16-bit immediates.
++ */
++#define PTRS_PER_PGD	((MMUPAGE_SIZE << PGD_TABLE_ORDER) / sizeof(pgd_t))
+ #ifndef __PAGETABLE_PUD_FOLDED
+-#define PTRS_PER_PUD	((PAGE_SIZE << PUD_TABLE_ORDER) / sizeof(pud_t))
++#define PTRS_PER_PUD	((MMUPAGE_SIZE << PUD_TABLE_ORDER) / sizeof(pud_t))
+ #endif
+ #ifndef __PAGETABLE_PMD_FOLDED
+-#define PTRS_PER_PMD	((PAGE_SIZE << PMD_TABLE_ORDER) / sizeof(pmd_t))
++#define PTRS_PER_PMD	((MMUPAGE_SIZE << PMD_TABLE_ORDER) / sizeof(pmd_t))
+ #endif
+-#define PTRS_PER_PTE	(PAGE_SIZE / sizeof(pte_t))
++#define PTRS_PER_PTE	(MMUPAGE_SIZE / sizeof(pte_t))
+ 
+ #define USER_PTRS_PER_PGD       ((TASK_SIZE64 / PGDIR_SIZE)?(TASK_SIZE64 / PGDIR_SIZE):1)
+ 
+@@ -141,7 +149,7 @@
+ #define VMALLOC_START		(MAP_BASE + (2 * PAGE_SIZE))
+ #define VMALLOC_END	\
+ 	(MAP_BASE + \
+-	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * PAGE_SIZE, \
++	 min(PTRS_PER_PGD * PTRS_PER_PUD * PTRS_PER_PMD * PTRS_PER_PTE * MMUPAGE_SIZE, \
+ 	     (1UL << cpu_vmbits)) - (1UL << 32))
+ 
+ #if defined(CONFIG_MODULES) && defined(KBUILD_64BIT_SYM32) && \
+@@ -298,9 +306,15 @@ static inline void pud_clear(pud_t *pudp)
+ 
+ #define pte_page(x)		pfn_to_page(pte_pfn(x))
+ 
+-#define pte_pfn(x)		((unsigned long)((x).pte >> PFN_PTE_SHIFT))
+-#define pfn_pte(pfn, prot)	__pte(((pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
+-#define pfn_pmd(pfn, prot)	__pmd(((pfn) << PFN_PTE_SHIFT) | pgprot_val(prot))
++/*
++ * pte_pfn returns a PAGE-granular PFN (phys >> PAGE_SHIFT).
++ * pfn_pte accepts a PAGE-granular PFN.
++ * With PGCL, PFN_PTE_SHIFT is MMUPAGE-based, so we shift by an extra
++ * PAGE_MMUSHIFT to get/set PAGE-granular PFNs.
++ */
++#define pte_pfn(x)		((unsigned long)((x).pte >> (PFN_PTE_SHIFT + PAGE_MMUSHIFT)))
++#define pfn_pte(pfn, prot)	__pte(((unsigned long)(pfn) << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)) | pgprot_val(prot))
++#define pfn_pmd(pfn, prot)	__pmd(((unsigned long)(pfn) << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)) | pgprot_val(prot))
+ 
+ #ifndef __PAGETABLE_PMD_FOLDED
+ static inline pmd_t *pud_pgtable(pud_t pud)
+diff --git a/arch/mips/include/asm/pgtable-bits.h b/arch/mips/include/asm/pgtable-bits.h
+index 088623ba7b8b..03da4a2f0e22 100644
+--- a/arch/mips/include/asm/pgtable-bits.h
++++ b/arch/mips/include/asm/pgtable-bits.h
+@@ -182,10 +182,16 @@ enum pgtable_bits {
+ #if defined(CONFIG_CPU_R3K_TLB)
+ # define _CACHE_UNCACHED	(1 << _CACHE_UNCACHED_SHIFT)
+ # define _CACHE_MASK		_CACHE_UNCACHED
+-# define PFN_PTE_SHIFT		PAGE_SHIFT
++# define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ #else
+ # define _CACHE_MASK		(7 << _CACHE_SHIFT)
+-# define PFN_PTE_SHIFT		(PAGE_SHIFT - 12 + _CACHE_SHIFT + 3)
++/*
++ * PFN_PTE_SHIFT: bit position where the PFN field starts in a Linux PTE.
++ * Uses MMUPAGE_SHIFT (hardware page size) so sub-page bits within a kernel
++ * page are preserved below PFN_PTE_SHIFT+PAGE_MMUSHIFT, which _PFN_MASK
++ * can then cover for pte_modify().
++ */
++# define PFN_PTE_SHIFT		(MMUPAGE_SHIFT - 12 + _CACHE_SHIFT + 3)
+ #endif
+ 
+ #ifndef _PAGE_NO_EXEC
+@@ -197,6 +203,20 @@ enum pgtable_bits {
+ 
+ #define _PFN_MASK		(~((1 << (PFN_PTE_SHIFT)) - 1))
+ 
++/*
++ * Physical-address to PTE-value conversion.  On MIPS, the PFN field in the
++ * Linux PTE starts at PFN_PTE_SHIFT, which can be greater than, equal to,
++ * or less than MMUPAGE_SHIFT depending on how many software/hardware bits
++ * precede the PFN field (controlled by _CACHE_SHIFT, which is an enum
++ * value varying with CONFIG options like RIXI, HUGE_TLB, PTE_SPECIAL).
++ *
++ * Use a two-step extract-then-place approach to avoid negative shifts:
++ *   phys → PTE: extract MMUPAGE PFN (>> MMUPAGE_SHIFT), place in PTE (<< PFN_PTE_SHIFT)
++ *   PTE → phys: extract PTE PFN (>> PFN_PTE_SHIFT), convert to address (<< MMUPAGE_SHIFT)
++ */
++#define __phys_to_pte_val(phys)	(((phys) >> MMUPAGE_SHIFT) << PFN_PTE_SHIFT)
++#define __pte_val_to_phys(val)	((((val) & _PFN_MASK) >> PFN_PTE_SHIFT) << MMUPAGE_SHIFT)
++
+ /*
+  * The final layouts of the PTE bits are:
+  *
+diff --git a/arch/mips/include/asm/pgtable.h b/arch/mips/include/asm/pgtable.h
+index fa7b935f947c..f7154013d4e2 100644
+--- a/arch/mips/include/asm/pgtable.h
++++ b/arch/mips/include/asm/pgtable.h
+@@ -66,9 +66,20 @@ extern void pagetable_init(void);
+ 
+ static inline unsigned long pmd_pfn(pmd_t pmd)
+ {
+-	return pmd_val(pmd) >> PFN_PTE_SHIFT;
++	return pmd_val(pmd) >> (PFN_PTE_SHIFT + PAGE_MMUSHIFT);
+ }
+ 
++/*
++ * pte_advance_pfn: advance PTE by nr PAGE-granular PFNs.
++ * With PGCL, PFN_PTE_SHIFT is MMUPAGE-based, so we shift by
++ * PFN_PTE_SHIFT + PAGE_MMUSHIFT to advance by PAGE-sized steps.
++ */
++static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
++{
++	return __pte(pte_val(pte) + (nr << (PFN_PTE_SHIFT + PAGE_MMUSHIFT)));
++}
++#define pte_advance_pfn pte_advance_pfn
++
+ #ifndef CONFIG_MIPS_HUGE_TLB_SUPPORT
+ #define pmd_page(pmd)		(pfn_to_page(pmd_phys(pmd) >> PAGE_SHIFT))
+ #endif /* CONFIG_MIPS_HUGE_TLB_SUPPORT */
+@@ -219,6 +230,30 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 	if (do_sync)
+ 		__update_cache(addr, pte);
+ 
++#if PAGE_MMUSHIFT > 0
++	if (nr == 1) {
++		/* Single PTE: caller already set up sub-page offset */
++		set_pte(ptep, pte);
++	} else {
++		/*
++		 * With PGCL, nr is in kernel pages.  Each kernel page spans
++		 * PAGE_MMUCOUNT hardware pages (MMUPAGEs).  Write
++		 * nr * PAGE_MMUCOUNT PTEs with correct sub-page offsets.
++		 */
++		for (i = 0; i < nr; i++) {
++			unsigned int j;
++
++			for (j = 0; j < PAGE_MMUCOUNT; j++) {
++				set_pte(ptep, __pte(pte_val(pte) +
++					__phys_to_pte_val((phys_addr_t)j *
++							  MMUPAGE_SIZE)));
++				ptep++;
++			}
++			if (i + 1 < nr)
++				pte = pte_advance_pfn(pte, 1);
++		}
++	}
++#else
+ 	for (;;) {
+ 		set_pte(ptep, pte);
+ 		if (--nr == 0)
+@@ -226,6 +261,7 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		ptep++;
+ 		pte = __pte(pte_val(pte) + (1UL << PFN_PTE_SHIFT));
+ 	}
++#endif
+ }
+ #define set_ptes set_ptes
+ 
+@@ -582,7 +618,7 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		address += PAGE_SIZE;
++		address += MMUPAGE_SIZE;
+ 	}
+ }
+ #define update_mmu_cache(vma, address, ptep) \
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index 10413b6f6662..8ef65c7a569c 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -554,7 +554,7 @@ static inline void local_r4k_flush_cache_page(void *args)
+ 	if (!has_valid_asid(mm, R4K_HIT))
+ 		return;
+ 
+-	addr &= PAGE_MASK;
++	addr &= MMUPAGE_MASK;
+ 	pmdp = pmd_off(mm, addr);
+ 	ptep = pte_offset_kernel(pmdp, addr);
+ 
+diff --git a/arch/mips/mm/tlb-r4k.c b/arch/mips/mm/tlb-r4k.c
+index 24fe85fa169d..47134e2d4198 100644
+--- a/arch/mips/mm/tlb-r4k.c
++++ b/arch/mips/mm/tlb-r4k.c
+@@ -117,9 +117,9 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long size, flags;
+ 
+ 		local_irq_save(flags);
+-		start = round_down(start, PAGE_SIZE << 1);
+-		end = round_up(end, PAGE_SIZE << 1);
+-		size = (end - start) >> (PAGE_SHIFT + 1);
++		start = round_down(start, MMUPAGE_SIZE << 1);
++		end = round_up(end, MMUPAGE_SIZE << 1);
++		size = (end - start) >> (MMUPAGE_SHIFT + 1);
+ 		if (size <= (current_cpu_data.tlbsizeftlbsets ?
+ 			     current_cpu_data.tlbsize / 8 :
+ 			     current_cpu_data.tlbsize / 2)) {
+@@ -140,7 +140,7 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 					write_c0_entryhi(start);
+ 				else
+ 					write_c0_entryhi(start | newpid);
+-				start += (PAGE_SIZE << 1);
++				start += (MMUPAGE_SIZE << 1);
+ 				mtc0_tlbw_hazard();
+ 				tlb_probe();
+ 				tlb_probe_hazard();
+@@ -172,23 +172,23 @@ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 	unsigned long size, flags;
+ 
+ 	local_irq_save(flags);
+-	size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++	size = (end - start + (MMUPAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
+ 	size = (size + 1) >> 1;
+ 	if (size <= (current_cpu_data.tlbsizeftlbsets ?
+ 		     current_cpu_data.tlbsize / 8 :
+ 		     current_cpu_data.tlbsize / 2)) {
+ 		int pid = read_c0_entryhi();
+ 
+-		start &= (PAGE_MASK << 1);
+-		end += ((PAGE_SIZE << 1) - 1);
+-		end &= (PAGE_MASK << 1);
++		start &= (MMUPAGE_MASK << 1);
++		end += ((MMUPAGE_SIZE << 1) - 1);
++		end &= (MMUPAGE_MASK << 1);
+ 		htw_stop();
+ 
+ 		while (start < end) {
+ 			int idx;
+ 
+ 			write_c0_entryhi(start);
+-			start += (PAGE_SIZE << 1);
++			start += (MMUPAGE_SIZE << 1);
+ 			mtc0_tlbw_hazard();
+ 			tlb_probe();
+ 			tlb_probe_hazard();
+@@ -221,7 +221,7 @@ void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
+ 		unsigned long flags, old_entryhi;
+ 		int idx;
+ 
+-		page &= (PAGE_MASK << 1);
++		page &= (MMUPAGE_MASK << 1);
+ 		local_irq_save(flags);
+ 		old_entryhi = read_c0_entryhi();
+ 		htw_stop();
+@@ -268,7 +268,7 @@ void local_flush_tlb_one(unsigned long page)
+ 	local_irq_save(flags);
+ 	oldpid = read_c0_entryhi();
+ 	htw_stop();
+-	page &= (PAGE_MASK << 1);
++	page &= (MMUPAGE_MASK << 1);
+ 	write_c0_entryhi(page);
+ 	mtc0_tlbw_hazard();
+ 	tlb_probe();
+@@ -313,7 +313,7 @@ void __update_tlb(struct vm_area_struct * vma, unsigned long address, pte_t pte)
+ 	local_irq_save(flags);
+ 
+ 	htw_stop();
+-	address &= (PAGE_MASK << 1);
++	address &= (MMUPAGE_MASK << 1);
+ 	if (cpu_has_mmid) {
+ 		write_c0_entryhi(address);
+ 	} else {
+@@ -790,7 +790,7 @@ static void r4k_tlb_configure(void)
+ 	write_c0_pagemask(PM_DEFAULT_MASK);
+ 	back_to_back_c0_hazard();
+ 	if (read_c0_pagemask() != PM_DEFAULT_MASK)
+-		panic("MMU doesn't support PAGE_SIZE=0x%lx", PAGE_SIZE);
++		panic("MMU doesn't support MMUPAGE_SIZE=0x%lx", MMUPAGE_SIZE);
+ 
+ 	write_c0_wired(0);
+ 	if (current_cpu_type() == CPU_R10000 ||
+diff --git a/arch/mips/mm/tlbex.c b/arch/mips/mm/tlbex.c
+index c90d4fe708f3..da064a8be84c 100644
+--- a/arch/mips/mm/tlbex.c
++++ b/arch/mips/mm/tlbex.c
+@@ -780,7 +780,7 @@ void build_get_pmde64(u32 **p, struct uasm_label **l, struct uasm_reloc **r,
+ 		 * everything but the lower xuseg addresses goes down
+ 		 * the module_alloc/vmalloc path.
+ 		 */
+-		uasm_i_dsrl_safe(p, ptr, tmp, PGDIR_SHIFT + PGD_TABLE_ORDER + PAGE_SHIFT - 3);
++		uasm_i_dsrl_safe(p, ptr, tmp, PGDIR_SHIFT + PGD_TABLE_ORDER + MMUPAGE_SHIFT - 3);
+ 		uasm_il_bnez(p, r, ptr, label_vmalloc);
+ 	} else {
+ 		uasm_il_bltz(p, r, tmp, label_vmalloc);
+@@ -1073,7 +1073,7 @@ build_fast_tlb_refill_handler (u32 **p, struct uasm_label **l,
+ 			UASM_i_SW(p, scratch, scratchpad_offset(0), 0);
+ 
+ 		uasm_i_dsrl_safe(p, scratch, tmp,
+-				 PGDIR_SHIFT + PGD_TABLE_ORDER + PAGE_SHIFT - 3);
++				 PGDIR_SHIFT + PGD_TABLE_ORDER + MMUPAGE_SHIFT - 3);
+ 		uasm_il_bnez(p, r, scratch, label_vmalloc);
+ 
+ 		if (pgd_reg == -1) {
+@@ -1442,13 +1442,13 @@ static void setup_pw(void)
+ 	pgd_w = PGDIR_SHIFT - PMD_SHIFT + PGD_TABLE_ORDER;
+ 
+ 	pmd_i = PMD_SHIFT;    /* 2nd level PMD */
+-	pmd_w = PMD_SHIFT - PAGE_SHIFT;
++	pmd_w = PMD_SHIFT - MMUPAGE_SHIFT;
+ #else
+-	pgd_w = PGDIR_SHIFT - PAGE_SHIFT + PGD_TABLE_ORDER;
++	pgd_w = PGDIR_SHIFT - MMUPAGE_SHIFT + PGD_TABLE_ORDER;
+ #endif
+ 
+-	pt_i  = PAGE_SHIFT;    /* 3rd level PTE */
+-	pt_w  = PAGE_SHIFT - 3;
++	pt_i  = MMUPAGE_SHIFT;    /* 3rd level PTE */
++	pt_w  = MMUPAGE_SHIFT - 3;
+ 
+ 	pte_i = ilog2(_PAGE_GLOBAL);
+ 	pte_w = 0;
+@@ -1483,7 +1483,7 @@ static void build_loongson3_tlb_refill_handler(void)
+ 	if (check_for_high_segbits) {
+ 		uasm_i_dmfc0(&p, GPR_K0, C0_BADVADDR);
+ 		uasm_i_dsrl_safe(&p, GPR_K1, GPR_K0,
+-				PGDIR_SHIFT + PGD_TABLE_ORDER + PAGE_SHIFT - 3);
++				PGDIR_SHIFT + PGD_TABLE_ORDER + MMUPAGE_SHIFT - 3);
+ 		uasm_il_beqz(&p, &r, GPR_K1, label_vmalloc);
+ 		uasm_i_nop(&p);
+ 
+@@ -2542,7 +2542,7 @@ void build_tlb_refill_handler(void)
+ 	check_pabits();
+ 
+ #ifdef CONFIG_64BIT
+-	check_for_high_segbits = current_cpu_data.vmbits > (PGDIR_SHIFT + PGD_TABLE_ORDER + PAGE_SHIFT - 3);
++	check_for_high_segbits = current_cpu_data.vmbits > (PGDIR_SHIFT + PGD_TABLE_ORDER + MMUPAGE_SHIFT - 3);
+ #endif
+ 
+ 	if (cpu_has_3kex) {
+diff --git a/arch/parisc/kernel/entry.S b/arch/parisc/kernel/entry.S
+index 2941109e9853..4aa5926c9188 100644
+--- a/arch/parisc/kernel/entry.S
++++ b/arch/parisc/kernel/entry.S
+@@ -389,7 +389,7 @@
+ #else
+ 	extru_safe	\va,31-ASM_PGDIR_SHIFT,ASM_BITS_PER_PGD,\index
+ #endif
+-	dep             %r0,31,PAGE_SHIFT,\pmd  /* clear offset */
++	dep             %r0,31,ASM_PLD_SHIFT,\pmd  /* clear offset within MMUPAGE-sized page dir */
+ #if CONFIG_PGTABLE_LEVELS < 3
+ 	copy		%r0,\pte
+ #endif
+diff --git a/arch/powerpc/kernel/syscalls.c b/arch/powerpc/kernel/syscalls.c
+index 68ebb23a5af4..51bf3266ecd5 100644
+--- a/arch/powerpc/kernel/syscalls.c
++++ b/arch/powerpc/kernel/syscalls.c
+@@ -53,7 +53,7 @@ SYSCALL_DEFINE6(mmap2, unsigned long, addr, size_t, len,
+ 		unsigned long, prot, unsigned long, flags,
+ 		unsigned long, fd, unsigned long, pgoff)
+ {
+-	return do_mmap2(addr, len, prot, flags, fd, pgoff, PAGE_SHIFT-12);
++	return do_mmap2(addr, len, prot, flags, fd, pgoff, MMUPAGE_SHIFT-12);
+ }
+ 
+ #ifdef CONFIG_COMPAT
+@@ -62,7 +62,7 @@ COMPAT_SYSCALL_DEFINE6(mmap2,
+ 		       unsigned long, prot, unsigned long, flags,
+ 		       unsigned long, fd, unsigned long, off_4k)
+ {
+-	return do_mmap2(addr, len, prot, flags, fd, off_4k, PAGE_SHIFT-12);
++	return do_mmap2(addr, len, prot, flags, fd, off_4k, MMUPAGE_SHIFT-12);
+ }
+ #endif
+ 
+@@ -70,7 +70,7 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, size_t, len,
+ 		unsigned long, prot, unsigned long, flags,
+ 		unsigned long, fd, off_t, offset)
+ {
+-	return do_mmap2(addr, len, prot, flags, fd, offset, PAGE_SHIFT);
++	return do_mmap2(addr, len, prot, flags, fd, offset, MMUPAGE_SHIFT);
+ }
+ 
+ #ifdef CONFIG_PPC64
+-- 
+2.54.0
+

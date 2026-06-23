@@ -1,0 +1,116 @@
+From 65c0b8178929d3a0b57d7c450dd7af616fa414e6 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 06:12:58 +0200
+Subject: [PATCH 085/174] mm/rmap: try_to_unmap_one consumes pvmw->nr_mmupages
+
+Switch try_to_unmap_one's PTE-level operations (cache flush,
+get_and_clear_ptes, TLB flush, RSS counter dec, folio_put_refs, set_ptes
+restore on race) from folio_unmap_pte_batch's MMUPAGE count to
+pvmw->nr_mmupages.  The walker now yields one kernel page worth of
+consecutive same-PFN PTEs per step (PAGE_MMUCOUNT under PGCL=4, 1
+under non-PGCL), so this is the natural batch size for these
+PTE-level ops.
+
+Issue exactly one rmap event per yield via folio_remove_rmap_pte()
+(singular) instead of folio_remove_rmap_ptes(... nr_pages, ...): one
+walker yield = one kernel page = one struct page = one _mapcount
+change.  This eliminates the unit mismatch where __folio_remove_rmap()
+iterated the per-page _mapcount array nr_pages times with nr_pages in
+MMUPAGE units rather than kernel-page units.
+
+The early walk_done optimization is converted to compare batch_kpages
+(nr_pages >> PAGE_MMUSHIFT, rounded up) against folio_nr_pages, since
+nr_pages is now MMUPAGE-granular while folio_nr_pages is kernel-page-
+granular.
+
+For non-PGCL: nr_mmupages is always 1 and the conversion is a no-op
+(folio_remove_rmap_pte is equivalent to folio_remove_rmap_ptes(...,1,...);
+batch_kpages == nr_pages).  For PGCL=4 + THP=on this preserves the
+clean baseline established in Phase 2b (cow.c selftest PASS, zero
+BUG/Oops events).
+
+This commit pairs with the do_anonymous_page +(rss-1) _mapcount
+compensation removal in the next commit; together they restore
+symmetric +1/-1 accounting for non-large PGCL anon folios.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/rmap.c | 33 ++++++++++++++++++++++++++++-----
+ 1 file changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index ee31edceb464..6bd694a70404 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1235,6 +1235,7 @@ static bool mapping_wrprotect_range_one(struct folio *folio,
+ 	struct page_vma_mapped_walk pvmw = {
+ 		.pfn		= state->pfn,
+ 		.nr_pages	= state->nr_pages,
++		.nr_mmupages	= 1,
+ 		.pgoff		= state->pgoff,
+ 		.vma		= vma,
+ 		.address	= address,
+@@ -1316,6 +1317,7 @@ int pfn_mkclean_range(unsigned long pfn, unsigned long nr_pages, pgoff_t pgoff,
+ 		.pgoff		= pgoff,
+ 		.vma		= vma,
+ 		.flags		= PVMW_SYNC,
++		.nr_mmupages	= 1,
+ 	};
+ 
+ 	if (invalid_mkclean_vma(vma, NULL))
+@@ -2171,7 +2173,18 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 			if (pte_dirty(pteval))
+ 				folio_mark_dirty(folio);
+ 		} else if (likely(pte_present(pteval))) {
+-			nr_pages = folio_unmap_pte_batch(folio, &pvmw, flags, pteval);
++			/*
++			 * Under PGCL the walker yields one kernel page worth
++			 * of consecutive same-PFN PTEs at a time
++			 * (pvmw.nr_mmupages, typically PAGE_MMUCOUNT).  Use
++			 * that batch count for PTE-level operations (cache /
++			 * TLB flush, get_and_clear_ptes, set_ptes restore on
++			 * race, RSS accounting, refcount).  Issue a single
++			 * rmap event per yield (one struct page).  For
++			 * non-PGCL builds, nr_mmupages is always 1 so this
++			 * collapses to the per-PTE legacy behavior.
++			 */
++			nr_pages = pvmw.nr_mmupages;
+ 			end_addr = address + nr_pages * MMUPAGE_SIZE;
+ 			flush_cache_range(vma, address, end_addr);
+ 
+@@ -2355,7 +2368,12 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 		if (unlikely(folio_test_hugetlb(folio))) {
+ 			hugetlb_remove_rmap(folio);
+ 		} else {
+-			folio_remove_rmap_ptes(folio, subpage, nr_pages, vma);
++			/*
++			 * One walker yield = one kernel page = one struct
++			 * page = one rmap event.  rmap APIs take kernel-page
++			 * count.  Refcount and RSS use MMUPAGE units (above).
++			 */
++			folio_remove_rmap_pte(folio, subpage, vma);
+ 		}
+ 		if (vma->vm_flags & VM_LOCKED)
+ 			mlock_drain_local();
+@@ -2363,10 +2381,15 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 
+ 		/*
+ 		 * If we are sure that we batched the entire folio and cleared
+-		 * all PTEs, we can just optimize and stop right here.
++		 * all PTEs, we can just optimize and stop right here.  Under
++		 * PGCL nr_pages is in MMUPAGE units while folio_nr_pages is
++		 * in kernel-page units; convert to compare apples-to-apples.
+ 		 */
+-		if (nr_pages == folio_nr_pages(folio))
+-			goto walk_done;
++		{
++			unsigned int batch_kpages = max(1U, nr_pages >> PAGE_MMUSHIFT);
++			if (batch_kpages == folio_nr_pages(folio))
++				goto walk_done;
++		}
+ 		continue;
+ walk_abort:
+ 		ret = false;
+-- 
+2.54.0
+

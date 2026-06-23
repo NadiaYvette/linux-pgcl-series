@@ -1,0 +1,71 @@
+From 0aceb3e9864ac8597e0bb1a1950e39551fd20836 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 19 Jun 2026 16:45:58 +0200
+Subject: [PATCH 174/174] drm/gem: size the mmap offset span in MMUPAGE units
+ under page-clustering
+
+The DRM VMA offset manager is keyed in MMUPAGE units: under page
+clustering drm_gem_create_mmap_offset_size() adds a node of
+size / MMUPAGE_SIZE slots and drm_vma_node_offset_addr() reconstructs the
+user offset as node->start << MMUPAGE_SHIFT.  drm_vma_node_start() and
+drm_vma_node_size() are therefore MMUPAGE-unit quantities, but three
+consumers still scaled them by PAGE_SHIFT, over-counting by
+PAGE_MMUCOUNT:
+
+  - drm_vma_node_unmap() unmapped (size << PAGE_SHIFT) bytes;
+  - drm_gem_mmap() passed obj_size = (node size << PAGE_SHIFT) to
+    drm_gem_mmap_obj(), where it is the lower-bound length check -- so it
+    never wrongly rejected, but the size validation was defeated; and
+  - drm_gem_get_unmapped_area() looked the node up with (len >> PAGE_SHIFT)
+    cluster slots against the MMUPAGE-keyed tree, whereas the sibling
+    drm_gem_mmap() correctly uses vma_pages() (an MMUPAGE count).
+
+Use MMUPAGE_SHIFT / >> MMUPAGE_SHIFT in all three so the size half of the
+node matches its already-MMUPAGE offset half.  Identity when
+CONFIG_PAGE_MMUSHIFT == 0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ drivers/gpu/drm/drm_gem.c     | 4 ++--
+ include/drm/drm_vma_manager.h | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index ed3cfbe7732d..74ff4def3619 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -1358,7 +1358,7 @@ unsigned long drm_gem_get_unmapped_area(struct file *filp, unsigned long uaddr,
+ 	struct drm_gem_object *obj;
+ 	unsigned long ret;
+ 
+-	obj = drm_gem_object_lookup_at_offset(filp, pgoff, len >> PAGE_SHIFT);
++	obj = drm_gem_object_lookup_at_offset(filp, pgoff, len >> MMUPAGE_SHIFT);
+ 	if (IS_ERR(obj))
+ 		obj = NULL;
+ 
+@@ -1400,7 +1400,7 @@ int drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
+ 		return PTR_ERR(obj);
+ 
+ 	ret = drm_gem_mmap_obj(obj,
+-			       drm_vma_node_size(&obj->vma_node) << PAGE_SHIFT,
++			       drm_vma_node_size(&obj->vma_node) << MMUPAGE_SHIFT,
+ 			       vma);
+ 
+ 	drm_gem_object_put(obj);
+diff --git a/include/drm/drm_vma_manager.h b/include/drm/drm_vma_manager.h
+index 6d3fc068c744..3ad351b147d6 100644
+--- a/include/drm/drm_vma_manager.h
++++ b/include/drm/drm_vma_manager.h
+@@ -223,7 +223,7 @@ static inline void drm_vma_node_unmap(struct drm_vma_offset_node *node,
+ 	if (drm_mm_node_allocated(&node->vm_node))
+ 		unmap_mapping_range(file_mapping,
+ 				    drm_vma_node_offset_addr(node),
+-				    drm_vma_node_size(node) << PAGE_SHIFT, 1);
++				    drm_vma_node_size(node) << MMUPAGE_SHIFT, 1);
+ }
+ 
+ /**
+-- 
+2.54.0
+

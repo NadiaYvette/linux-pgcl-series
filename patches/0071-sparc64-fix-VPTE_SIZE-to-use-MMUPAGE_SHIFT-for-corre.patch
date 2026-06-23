@@ -1,0 +1,58 @@
+From 638724b12a9959fd19906836d3b0ff79b28093d9 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Mon, 27 Apr 2026 00:12:09 +0200
+Subject: [PATCH 071/174] sparc64: fix VPTE_SIZE to use MMUPAGE_SHIFT for
+ correct TASK_SIZE
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VPTE_SIZE computes the Virtual Page Table Entries region size as one
+8-byte entry per hardware page: (2^VA_BITS / page_size) * 8. This
+must use the hardware MMU page size (MMUPAGE_SHIFT), not the kernel
+page size (PAGE_SHIFT).
+
+With PGCL (PAGE_MMUSHIFT=4), PAGE_SHIFT=17 but MMUPAGE_SHIFT=13.
+Using PAGE_SHIFT gives VPTE_SIZE = 2^30 (1GB), making TASK_SIZE =
+0xFFFFFFFFC0000000 — which overlaps PAGE_OFFSET (0xfffff80000000000).
+User programs get mapped at kernel addresses, causing universal SIGSEGV.
+
+Fix: use MMUPAGE_SHIFT, giving VPTE_SIZE = 2^34 (16GB) and TASK_SIZE
+= 0xFFFFFFFC00000000, matching the non-PGCL layout.
+
+The sparc64 TSB handlers already use MMUPAGE_SHIFT for VPTE lookups,
+so this change makes the header consistent with the runtime code.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/sparc/include/asm/processor_64.h | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/arch/sparc/include/asm/processor_64.h b/arch/sparc/include/asm/processor_64.h
+index 485070495263..2150c5e16b2e 100644
+--- a/arch/sparc/include/asm/processor_64.h
++++ b/arch/sparc/include/asm/processor_64.h
+@@ -21,10 +21,18 @@
+  * XXX No longer using virtual page tables, kill this upper limit...
+  */
+ #define VA_BITS		44
++/*
++ * VPTE_SIZE: Virtual Page Table Entries size.  One 8-byte entry per
++ * hardware MMU page, so the VPTE region size depends on the MMU page
++ * shift (MMUPAGE_SHIFT), not the kernel page shift (PAGE_SHIFT).
++ * With PGCL, PAGE_SHIFT > MMUPAGE_SHIFT, and using PAGE_SHIFT here
++ * makes VPTE_SIZE too small, pushing TASK_SIZE into the kernel VA
++ * range and causing userspace to be mapped at kernel addresses.
++ */
+ #ifndef __ASSEMBLER__
+-#define VPTE_SIZE	(1UL << (VA_BITS - PAGE_SHIFT + 3))
++#define VPTE_SIZE	(1UL << (VA_BITS - MMUPAGE_SHIFT + 3))
+ #else
+-#define VPTE_SIZE	(1 << (VA_BITS - PAGE_SHIFT + 3))
++#define VPTE_SIZE	(1 << (VA_BITS - MMUPAGE_SHIFT + 3))
+ #endif
+ 
+ #define TASK_SIZE_OF(tsk) \
+-- 
+2.54.0
+

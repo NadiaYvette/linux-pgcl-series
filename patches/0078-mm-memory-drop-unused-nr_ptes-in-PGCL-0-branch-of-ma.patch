@@ -1,0 +1,45 @@
+From a4f27a4ad83b91af099e97d43b0b5f69d5a20b29 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 30 Apr 2026 16:26:37 +0200
+Subject: [PATCH 078/174] mm/memory: drop unused nr_ptes in PGCL=0 branch of
+ map_anon_folio_pte_nopf()
+
+Compiling with CONFIG_PAGE_MMUSHIFT=0 fails:
+
+  mm/memory.c: In function 'map_anon_folio_pte_nopf':
+  mm/memory.c:5665:29: error: unused variable 'nr_ptes' [-Werror=unused-variable]
+   const unsigned long nr_ptes = nr_pages;
+
+The #else (non-PGCL) branch declares nr_ptes but the surrounding code
+was simplified at some point so that branch now uses nr_pages directly
+in set_ptes() and update_mmu_cache_range().  With -Werror the unused
+local kills the build.
+
+Drop the redundant declaration; nr_ptes is only needed inside the
+#if PAGE_MMUSHIFT branch.
+---
+ mm/memory.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index 67e6538f56b4..834ba23a32ce 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5674,11 +5674,12 @@ void map_anon_folio_pte_nopf(struct folio *folio, pte_t *pte,
+ 	 * PAGE_MMUCOUNT PTEs.  For single-page (nr_pages == 1), we
+ 	 * install exactly 1 PTE — clustering of the remaining sub-pages
+ 	 * is handled by the caller (do_anonymous_page inline block).
++	 *
++	 * PGCL=0 (PAGE_MMUSHIFT == 0) doesn't need this — the #else
++	 * branch below uses nr_pages directly.
+ 	 */
+ 	const unsigned long nr_ptes = (nr_pages > 1)
+ 		? (unsigned long)nr_pages * PAGE_MMUCOUNT : 1;
+-#else
+-	const unsigned long nr_ptes = nr_pages;
+ #endif
+ 
+ 	entry = pte_sw_mkyoung(entry);
+-- 
+2.54.0
+

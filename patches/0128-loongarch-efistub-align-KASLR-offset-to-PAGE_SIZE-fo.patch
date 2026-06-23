@@ -1,0 +1,54 @@
+From a18b41cc87eb6dd9389eb778d79bcf98b8d2aaa3 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 29 May 2026 10:35:43 +0200
+Subject: [PATCH 128/174] loongarch/efistub: align KASLR offset to PAGE_SIZE
+ for PGCL
+
+efi_get_kimg_kaslr_address() aligned the random offset to SZ_64K,
+which matches the LoongArch EFI_ALLOC_ALIGN.  With PGCL the kernel
+PAGE_SIZE can exceed SZ_64K (1 MB at PAGE_MMUSHIFT=6 with the default
+PAGE_SIZE_16KB hardware page), so a 64K-granular KASLR shift leaves
+__per_cpu_start at a sub-PAGE offset.  pcpu_setup_first_chunk() then
+trips PCPU_SETUP_BUG_ON(offset_in_page(__per_cpu_start)) before the
+console is up, panicking with the EFI handover progress code as the
+last visible output.
+
+Bump the alignment to max(SZ_64K, PAGE_SIZE) so the relocated kernel
+keeps its link-time PAGE alignment without disabling KASLR.
+
+Boot-tested on QEMU virt / la464 at PGCL=6 (PAGE_SIZE=1 MB): pgcl-test
+19/0, pgcl-stress 12/0, LTP 71p/3f/27s.  Without the fix the kernel
+hangs in the EDK2 handoff.
+---
+ drivers/firmware/efi/libstub/loongarch.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/firmware/efi/libstub/loongarch.c b/drivers/firmware/efi/libstub/loongarch.c
+index 2b0c87dc9908..3361b5aa3aa9 100644
+--- a/drivers/firmware/efi/libstub/loongarch.c
++++ b/drivers/firmware/efi/libstub/loongarch.c
+@@ -29,10 +29,20 @@ unsigned long efi_get_kimg_kaslr_address(void)
+ 
+ #ifdef CONFIG_RANDOMIZE_BASE
+ 	if (!efi_nokaslr) {
++		/*
++		 * Align KASLR offset to at least PAGE_SIZE; the percpu
++		 * setup BUGs on offset_in_page(__per_cpu_start), which a
++		 * sub-PAGE relocation would violate. With PGCL the kernel
++		 * PAGE_SIZE can exceed SZ_64K (e.g. 1 MB at PAGE_MMUSHIFT=6
++		 * with 16 KB MMU pages); the old SZ_64K alignment hung the
++		 * boot before the kernel banner.
++		 */
++		unsigned long align = max_t(unsigned long, SZ_64K, PAGE_SIZE);
++
+ 		efi_get_random_bytes(sizeof(random_offset), (u8 *)&random_offset);
+ 		random_offset ^= (random_get_entropy() << 16);
+ 		random_offset &= (CONFIG_RANDOMIZE_BASE_MAX_OFFSET - 1);
+-		random_offset = ALIGN(random_offset + SZ_64K, SZ_64K);
++		random_offset = ALIGN(random_offset + align, align);
+ 	}
+ #endif
+ 
+-- 
+2.54.0
+

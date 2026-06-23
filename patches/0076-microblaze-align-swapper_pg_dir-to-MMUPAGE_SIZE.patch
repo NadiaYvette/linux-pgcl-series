@@ -1,0 +1,60 @@
+From 250228262ef6befb8f58ef70f6ce61497c8002a7 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 29 Apr 2026 10:32:43 +0200
+Subject: [PATCH 076/174] microblaze: align swapper_pg_dir to MMUPAGE_SIZE
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The TLB miss handler in hw_exception_handler.S computes the PGD entry
+address with
+
+  or  r4, r4, r5
+
+where r4 is the page-directory base (swapper_pg_dir for kernel maps)
+and r5 is the offset of the entry within the directory.  This bitwise-
+or is correct only when the base is MMUPAGE-aligned: any low bits set
+in r4 collide with the offset and yield a different address.
+
+The original swapper_pg_dir definition relied on incidental .data
+alignment.  Pre-PGCL it happened to land on a 4 KiB boundary; with
+PGCL changing the data layout (notably the new debug_fault_capture
+work and the THREAD_SIZE fix's reshuffling of .data), it ended up at
+0xc08c3140 — a 64-byte boundary.  The TLB miss handler then read PGD
+entries from the wrong offset, treated random data as PTE pointers,
+and the first vmalloc/ioremap mapping (xintc's 0xf0000008) faulted
+in `xintc_write` → `_exception` → `die` → panic.
+
+Add an explicit `.balign MMUPAGE_SIZE` so swapper_pg_dir lands on a
+4 KiB boundary regardless of preceding .data layout.
+
+Result: microblaze with PAGE_MMUSHIFT=4 now boots end-to-end on
+qemu-system-microblaze -M petalogix-s3adsp1800 (big-endian), reaches
+"console [ttyUL0] enabled", runs init, and pgcl-test 19/19 +
+pgcl-stress 12/12 PASS.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/microblaze/kernel/head.S | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/microblaze/kernel/head.S b/arch/microblaze/kernel/head.S
+index e72c6c5ebbb6..8398b40766a3 100644
+--- a/arch/microblaze/kernel/head.S
++++ b/arch/microblaze/kernel/head.S
+@@ -39,6 +39,12 @@
+ #include <asm/processor.h>
+ 
+ .section .data
++# swapper_pg_dir must be MMUPAGE-aligned: the TLB miss handler in
++# hw_exception_handler.S computes the PGD entry address with an
++# "or r4, r4, r5" of pg_dir base and offset, which is correct only
++# when the base is MMUPAGE-aligned so the low offset bits do not
++# collide with the base.
++.balign MMUPAGE_SIZE
+ .global swapper_pg_dir
+ swapper_pg_dir:
+ 	.space	MMUPAGE_SIZE
+-- 
+2.54.0
+

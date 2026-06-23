@@ -1,0 +1,67 @@
+From 5b6a8e33765283d9bded33d122338cd05c5fbbf2 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 30 Apr 2026 15:46:07 +0200
+Subject: [PATCH 077/174] =?UTF-8?q?ACPI/osl:=20skip=20kmap=20path=20on=20L?=
+ =?UTF-8?q?oongArch=20=E2=80=94=20fixes=20PGCL=20DSDT=20load=20failure?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Under PGCL (PAGE_MMUSHIFT > 0), each struct page covers PAGE_SIZE bytes
+which spans multiple MMUPAGEs.  The kmap path in acpi_map() computes
+pfn = pg_off >> MMUPAGE_SHIFT (a hardware-page PFN) and feeds it to
+pfn_to_page(), which expects a kernel-page PFN.  On LoongArch64 with
+PAGE_MMUSHIFT=4 the resulting struct page corresponds to a physical
+region 16x further into RAM than intended, kmap() returns garbage
+virtual memory, and the subsequent ACPI table read picks up nonsense
+bytes.  This manifested as DSDT loading with AE_BAD_HEADER:
+
+  ACPI Error: AE_BAD_HEADER, [DSDT] table load failed (...tbxfload-161)
+  ACPI Error: 1 table load failures, 0 successful (...tbxfload-208)
+
+Without DSDT, ACPI device enumeration aborts, the 8250 platform device
+behind the UART node is never created, ttyS0 never registers as a
+console, and all queued printk output stays buffered forever — the
+kernel boots and runs userspace silently.
+
+LoongArch64 has a direct-mapped window (DMW) at 0x9000_0000_0000_0000;
+ioremap()/ioremap_cache() resolve in O(1) without a page-table walk and
+without the kmap-side struct-page indexing assumption that PGCL
+violates.  Add CONFIG_LOONGARCH to the existing arm64/riscv list that
+forces should_use_kmap() to 0, routing ACPI table mappings through
+ioremap.
+
+Fix verified on QEMU loongarch64 -M virt with PAGE_MMUSHIFT=4: DSDT now
+parses, ttyS0 console registers, kernel produces normal output, and
+the kmm selftests pass with 19/19 + 12/12 (matches mainline).
+---
+ drivers/acpi/osl.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/acpi/osl.c b/drivers/acpi/osl.c
+index e48c8b205d72..234cc392c8b9 100644
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -282,8 +282,17 @@ acpi_map_lookup_virt(void __iomem *virt, acpi_size size)
+ 	return NULL;
+ }
+ 
+-#if defined(CONFIG_ARM64) || defined(CONFIG_RISCV)
+-/* ioremap will take care of cache attributes */
++#if defined(CONFIG_ARM64) || defined(CONFIG_RISCV) || defined(CONFIG_LOONGARCH)
++/*
++ * ioremap will take care of cache attributes (LoongArch uses the DMW
++ * direct-mapped window, ioremap is essentially free there).
++ *
++ * The kmap path is also unsafe under PGCL (PAGE_MMUSHIFT > 0): each
++ * struct page covers PAGE_SIZE bytes which spans multiple MMUPAGEs, so
++ * pfn_to_page(pg_off >> MMUPAGE_SHIFT) and the per-MMUPAGE offset
++ * arithmetic in acpi_os_map_iomem() would read from a wrong physical
++ * region.  Routing LoongArch through ioremap dodges that.
++ */
+ #define should_use_kmap(pfn)   0
+ #else
+ #define should_use_kmap(pfn)   page_is_ram(pfn)
+-- 
+2.54.0
+

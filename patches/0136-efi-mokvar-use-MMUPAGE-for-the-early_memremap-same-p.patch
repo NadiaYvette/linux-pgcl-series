@@ -1,0 +1,40 @@
+From 937565d0ec166e454a16a9d1f53101ff7146399e Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 11 Jun 2026 12:33:10 +0200
+Subject: [PATCH 136/174] efi/mokvar: use MMUPAGE for the early_memremap
+ same-page check under PGCL
+
+efi_mokvar_table_init() walks the MOK config table with early_memremap() and skips re-mapping when the current and next entry headers fall within the same page.  early_memremap() is fixmap-backed and maps MMUPAGE_SIZE hardware pages, so the "still mapped" test must use MMUPAGE_MASK, not PAGE_MASK: under page clustering PAGE_SIZE spans several MMUPAGEs, and two entries in the same PAGE but different MMUPAGEs would skip the remap and fault on the unmapped MMUPAGE.  Real shim/secure-boot firmware ships a multi-entry MOK table, so this faulted in early boot on x86_64 hardware while QEMU's empty table hid it.  Identity when PAGE_MMUSHIFT == 0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ drivers/firmware/efi/mokvar-table.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/firmware/efi/mokvar-table.c b/drivers/firmware/efi/mokvar-table.c
+index 6842aa96d704..a1ecba593994 100644
+--- a/drivers/firmware/efi/mokvar-table.c
++++ b/drivers/firmware/efi/mokvar-table.c
+@@ -161,11 +161,17 @@ void __init efi_mokvar_table_init(void)
+ 
+ 		/*
+ 		 * Don't bother remapping if the current entry header and the
+-		 * next one end on the same page.
++		 * next one end within the same early_memremap window.  That
++		 * window is fixmap-backed and therefore MMUPAGE_SIZE-granular,
++		 * so the "still mapped" test must use MMUPAGE_MASK, not
++		 * PAGE_MASK: under page clustering PAGE_SIZE spans several
++		 * MMUPAGEs, and two entries in the same PAGE but different
++		 * MMUPAGEs would otherwise skip the remap and fault on the
++		 * unmapped MMUPAGE.  Identity when PAGE_MMUSHIFT == 0.
+ 		 */
+ 		next_entry = (void *)((unsigned long)mokvar_entry + size);
+ 		if (((((unsigned long)(mokvar_entry + 1) - 1) ^
+-		      ((unsigned long)(next_entry + 1) - 1)) & PAGE_MASK) == 0) {
++		      ((unsigned long)(next_entry + 1) - 1)) & MMUPAGE_MASK) == 0) {
+ 			mokvar_entry = next_entry;
+ 			goto next;
+ 		}
+-- 
+2.54.0
+

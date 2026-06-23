@@ -1,0 +1,232 @@
+From 3f56d69f98c432f8bec64df6585fd00eb4c33ab3 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 02:56:23 +0200
+Subject: [PATCH 083/174] Phase 2b: folio_pte_batch_flags returns struct with
+ kind classification
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Refactor folio_pte_batch_flags to return a struct folio_pte_batch_result
+{ nr, kind } instead of a bare unsigned int.  This is the foundational
+API change for the Phase 2 sub-PMD superpage batch-aware refactor: it
+lets callers distinguish three batch classifications without relying on
+nr==1 or other indirect signals.
+
+  enum folio_pte_batch_kind {
+      BATCH_KIND_SINGLE,        /* nr == 1; per-PTE fast path */
+      BATCH_KIND_PGCL_CLUSTER,  /* PGCL clustering batch */
+      BATCH_KIND_MTHP,          /* sub-PMD superpage batch */
+  };
+
+  struct folio_pte_batch_result {
+      unsigned int nr;
+      enum folio_pte_batch_kind kind;
+  };
+
+For Phase 2b, folio_pte_batch_flags() emits SINGLE iff nr == 1 and
+MTHP otherwise.  PGCL_CLUSTER will be produced by pgcl_pte_batch()
+(Phase 2c) once batch-aware walkers can act on the distinction.
+This commit is purely a structural/ABI refactor — semantically the
+returned nr is unchanged.
+
+Updated all 8 call sites of folio_pte_batch_flags to extract .nr:
+  mm/madvise.c, mm/memory.c, mm/mprotect.c, mm/mremap.c, mm/rmap.c,
+  mm/util.c (folio_pte_batch wrapper), mm/vmscan.c (2 sites).
+
+The returned struct is 8 bytes (uint+enum), well within all relevant
+ABI register-return thresholds; expected zero binary impact at
+inlining boundaries.
+
+Verified: aarch64 PGCL={0,2,4} kernels build clean; PGCL=4
++ THP=always test run shows cow.c selftest PASS, LTP 69p/0f/32s,
+zero BUG/Bad-rss/Oops events.  PGCL=0/2 + THP=on issues are
+documented pre-existing (see project_aarch64_pgcl0_rss.md) and
+will be addressed in Phase 2c when batch-aware walkers begin
+acting on PGCL_CLUSTER.
+
+Documentation/mm/sub-pmd-superpages.rst (Phase 2a, e4ec2f7060b5)
+contains the broader design context.
+---
+ mm/internal.h | 43 ++++++++++++++++++++++++++++++++++++++++---
+ mm/madvise.c  |  2 +-
+ mm/memory.c   |  2 +-
+ mm/mprotect.c |  2 +-
+ mm/mremap.c   |  2 +-
+ mm/rmap.c     |  2 +-
+ mm/util.c     |  2 +-
+ mm/vmscan.c   |  4 ++--
+ 8 files changed, 48 insertions(+), 11 deletions(-)
+
+diff --git a/mm/internal.h b/mm/internal.h
+index 5225a9f74a16..a2798f3c364d 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -305,6 +305,37 @@ static inline pte_t __pte_batch_clear_ignored(pte_t pte, fpb_t flags)
+ 	return pte_mkold(pte);
+ }
+ 
++/**
++ * enum folio_pte_batch_kind - classification of a detected PTE batch.
++ *
++ * @BATCH_KIND_SINGLE: nr == 1; no batching benefit available.  Callers
++ *	may take a per-PTE fast path.
++ * @BATCH_KIND_PGCL_CLUSTER: batch is a PGCL clustering: nr consecutive
++ *	hardware PTEs covering one kernel page (sub-PAGE_SIZE granularity).
++ *	Used by callers that need to choose PGCL-aware locking/contract
++ *	behavior.  (Phase 2 expansion: currently produced only by
++ *	pgcl_pte_batch(); folio_pte_batch_flags() does not yet emit this
++ *	kind.)
++ * @BATCH_KIND_MTHP: batch spans multiple kernel pages of one large
++ *	(sub-PMD superpage / mTHP) folio.  Callers should hold folio_lock
++ *	for atomicity if processing rmap or refcount.
++ */
++enum folio_pte_batch_kind {
++	BATCH_KIND_SINGLE,
++	BATCH_KIND_PGCL_CLUSTER,
++	BATCH_KIND_MTHP,
++};
++
++/**
++ * struct folio_pte_batch_result - return value of folio_pte_batch_flags().
++ * @nr: number of table entries in the batch (>= 1).
++ * @kind: classification of the batch.  @BATCH_KIND_SINGLE iff @nr == 1.
++ */
++struct folio_pte_batch_result {
++	unsigned int nr;
++	enum folio_pte_batch_kind kind;
++};
++
+ /**
+  * folio_pte_batch_flags - detect a PTE batch for a large folio
+  * @folio: The large folio to detect a PTE batch for.
+@@ -333,9 +364,11 @@ static inline pte_t __pte_batch_clear_ignored(pte_t pte, fpb_t flags)
+  * This function will be inlined to optimize based on the input parameters;
+  * consider using folio_pte_batch() instead if applicable.
+  *
+- * Return: the number of table entries in the batch.
++ * Return: a &struct folio_pte_batch_result with @nr (the number of table
++ *	   entries in the batch) and @kind (the batch classification, see
++ *	   &enum folio_pte_batch_kind).
+  */
+-static inline unsigned int folio_pte_batch_flags(struct folio *folio,
++static inline struct folio_pte_batch_result folio_pte_batch_flags(struct folio *folio,
+ 		struct vm_area_struct *vma, pte_t *ptep, pte_t *ptentp,
+ 		unsigned int max_nr, fpb_t flags)
+ {
+@@ -387,7 +420,11 @@ static inline unsigned int folio_pte_batch_flags(struct folio *folio,
+ 	if (any_dirty)
+ 		*ptentp = pte_mkdirty(*ptentp);
+ 
+-	return min(nr, max_nr);
++	nr = min(nr, max_nr);
++	return (struct folio_pte_batch_result){
++		.nr = nr,
++		.kind = (nr == 1) ? BATCH_KIND_SINGLE : BATCH_KIND_MTHP,
++	};
+ }
+ 
+ unsigned int folio_pte_batch(struct folio *folio, pte_t *ptep, pte_t pte,
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 7c72b4a3e761..651b942c8156 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -347,7 +347,7 @@ static inline int madvise_folio_pte_batch(unsigned long addr, unsigned long end,
+ 	int max_nr = (end - addr) / MMUPAGE_SIZE;
+ 
+ 	return folio_pte_batch_flags(folio, NULL, ptep, ptentp, max_nr,
+-				     FPB_MERGE_YOUNG_DIRTY);
++				     FPB_MERGE_YOUNG_DIRTY).nr;
+ }
+ 
+ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
+diff --git a/mm/memory.c b/mm/memory.c
+index 834ba23a32ce..290ce662e5ee 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1182,7 +1182,7 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 		if (vma_soft_dirty_enabled(src_vma))
+ 			flags |= FPB_RESPECT_SOFT_DIRTY;
+ 
+-		nr = folio_pte_batch_flags(folio, src_vma, src_pte, &pte, max_nr, flags);
++		nr = folio_pte_batch_flags(folio, src_vma, src_pte, &pte, max_nr, flags).nr;
+ 		folio_ref_add(folio, nr);
+ 		if (folio_test_anon(folio)) {
+ 			if (unlikely(folio_try_dup_anon_rmap_ptes(folio, page,
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 3e389580d0c4..ae1b2e283e5b 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -118,7 +118,7 @@ static int mprotect_folio_pte_batch(struct folio *folio, pte_t *ptep,
+ #endif
+ 	}
+ 
+-	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr_ptes, flags);
++	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr_ptes, flags).nr;
+ }
+ 
+ /* Set nr_ptes number of ptes, starting from idx */
+diff --git a/mm/mremap.c b/mm/mremap.c
+index a5515455d41c..31bf28717331 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -197,7 +197,7 @@ static int mremap_folio_pte_batch(struct vm_area_struct *vma, unsigned long addr
+ 	if (!folio_test_large(folio))
+ 		return 1;
+ 
+-	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, FPB_RESPECT_WRITE);
++	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, FPB_RESPECT_WRITE).nr;
+ }
+ 
+ static int move_ptes(struct pagetable_move_control *pmc,
+diff --git a/mm/rmap.c b/mm/rmap.c
+index e0c7f5b0f46b..ee31edceb464 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1977,7 +1977,7 @@ static inline unsigned int folio_unmap_pte_batch(struct folio *folio,
+ 	 * appropriate FPB flags.
+ 	 */
+ 	return folio_pte_batch_flags(folio, vma, pvmw->pte, &pte, max_nr,
+-				     FPB_RESPECT_WRITE | FPB_RESPECT_SOFT_DIRTY);
++				     FPB_RESPECT_WRITE | FPB_RESPECT_SOFT_DIRTY).nr;
+ }
+ 
+ /*
+diff --git a/mm/util.c b/mm/util.c
+index 9109bbbf8d7f..dcd27bacb6b5 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -1556,7 +1556,7 @@ EXPORT_SYMBOL(mmap_action_complete);
+ unsigned int folio_pte_batch(struct folio *folio, pte_t *ptep, pte_t pte,
+ 		unsigned int max_nr)
+ {
+-	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, 0);
++	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, 0).nr;
+ }
+ #endif /* CONFIG_MMU */
+ 
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 5d24439548bb..212a8f20ae65 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3517,7 +3517,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
+ 			const unsigned int max_nr = (end - addr) >> PAGE_SHIFT;
+ 
+ 			nr = folio_pte_batch_flags(folio, NULL, cur_pte, &ptent,
+-						   max_nr, FPB_MERGE_YOUNG_DIRTY);
++						   max_nr, FPB_MERGE_YOUNG_DIRTY).nr;
+ 			total += nr - 1;
+ 			walk->mm_stats[MM_LEAF_TOTAL] += nr - 1;
+ 		}
+@@ -4261,7 +4261,7 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr)
+ 			const unsigned int max_nr = (end - addr) >> PAGE_SHIFT;
+ 
+ 			nr = folio_pte_batch_flags(folio, NULL, pte, &ptent,
+-						   max_nr, FPB_MERGE_YOUNG_DIRTY);
++						   max_nr, FPB_MERGE_YOUNG_DIRTY).nr;
+ 		}
+ 
+ 		if (!test_and_clear_young_ptes_notify(vma, addr, pte, nr))
+-- 
+2.54.0
+

@@ -1,0 +1,315 @@
+From 1ce5c8a8ba65ae6244723c501fd7deb595da810b Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 26 Mar 2026 15:19:35 +0100
+Subject: [PATCH 048/174] PGCL: fix TLB flush stride, LDT mapping granularity,
+ and PAGEMAP_SCAN walk
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TLB flush functions on x86_64, arm64, and powerpc used PAGE_SHIFT/PAGE_SIZE
+as the INVLPG/tlbiel stride for PTE-level invalidations. With PGCL
+(PAGE_MMUSHIFT=4), PAGE_SHIFT=16 (64KB) but hardware TLB entries are 4KB
+(MMUPAGE_SIZE). This caused INVLPG to skip 15 of 16 TLB entries, leaving
+stale translations that broke mremap(MREMAP_DONTUNMAP) and other operations
+requiring precise TLB invalidation.
+
+x86_64 fixes:
+- flush_tlb_range: PAGE_SHIFT → MMUPAGE_SHIFT stride
+- flush_tlb_page: PAGE_SIZE/PAGE_SHIFT → MMUPAGE_SIZE/MMUPAGE_SHIFT
+- flush_tlb_kernel_range: PAGE_SHIFT → MMUPAGE_SHIFT
+- ldt.c map/unmap: PAGE_SIZE → MMUPAGE_SIZE for PTE iteration and flush,
+  with proper vmalloc sub-page PFN computation
+
+arm64 fix:
+- hugetlb.h __flush_hugetlb_tlb_range: CONT_PTE_SIZE and default cases
+  passed PAGE_SIZE stride to __flush_tlb_range, changed to MMUPAGE_SIZE
+
+powerpc fixes:
+- radix_tlb.c radix__flush_tlb_collapsed_pmd: PAGE_SIZE → MMUPAGE_SIZE
+  for tlbiel loop stride in all three code paths
+- nohash/tlb.c flush_tlb_range: single-page optimization used PAGE_SIZE
+  comparison, changed to MMUPAGE_SIZE/MMUPAGE_MASK
+
+Also fixes:
+- fs/proc/task_mmu.c PAGEMAP_SCAN ioctl: PTE walker stepped PAGE_SIZE
+  instead of MMUPAGE_SIZE, missing sub-page entries in soft-dirty tracking
+- mm/mremap.c: update stale comment about set_ptes nr convention
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm64/include/asm/hugetlb.h     |  4 ++--
+ arch/powerpc/mm/book3s64/radix_tlb.c |  8 ++++----
+ arch/powerpc/mm/nohash/tlb.c         |  2 +-
+ arch/x86/include/asm/tlbflush.h      |  4 ++--
+ arch/x86/kernel/ldt.c                | 20 +++++++++++++-------
+ arch/x86/mm/tlb.c                    |  2 +-
+ fs/proc/task_mmu.c                   | 22 +++++++++++-----------
+ mm/mremap.c                          |  8 ++++----
+ 8 files changed, 38 insertions(+), 32 deletions(-)
+
+diff --git a/arch/arm64/include/asm/hugetlb.h b/arch/arm64/include/asm/hugetlb.h
+index d038ff14d16c..fdbb2c5d05f6 100644
+--- a/arch/arm64/include/asm/hugetlb.h
++++ b/arch/arm64/include/asm/hugetlb.h
+@@ -84,10 +84,10 @@ static inline void __flush_hugetlb_tlb_range(struct vm_area_struct *vma,
+ 		__flush_tlb_range(vma, start, end, PMD_SIZE, 2, flags);
+ 		break;
+ 	case CONT_PTE_SIZE:
+-		__flush_tlb_range(vma, start, end, PAGE_SIZE, 3, flags);
++		__flush_tlb_range(vma, start, end, MMUPAGE_SIZE, 3, flags);
+ 		break;
+ 	default:
+-		__flush_tlb_range(vma, start, end, PAGE_SIZE, TLBI_TTL_UNKNOWN, flags);
++		__flush_tlb_range(vma, start, end, MMUPAGE_SIZE, TLBI_TTL_UNKNOWN, flags);
+ 	}
+ }
+ 
+diff --git a/arch/powerpc/mm/book3s64/radix_tlb.c b/arch/powerpc/mm/book3s64/radix_tlb.c
+index 7de5760164a9..2e51a1f6b6fd 100644
+--- a/arch/powerpc/mm/book3s64/radix_tlb.c
++++ b/arch/powerpc/mm/book3s64/radix_tlb.c
+@@ -1317,7 +1317,7 @@ void radix__flush_tlb_collapsed_pmd(struct mm_struct *mm, unsigned long addr)
+ 		return;
+ 
+ 	/* 4k page size, just blow the world */
+-	if (PAGE_SIZE == 0x1000) {
++	if (MMUPAGE_SIZE == 0x1000) {
+ 		radix__flush_all_mm(mm);
+ 		return;
+ 	}
+@@ -1329,7 +1329,7 @@ void radix__flush_tlb_collapsed_pmd(struct mm_struct *mm, unsigned long addr)
+ 	smp_mb(); /* see radix__flush_tlb_mm */
+ 	type = flush_type_needed(mm, false);
+ 	if (type == FLUSH_TYPE_LOCAL) {
+-		_tlbiel_va_range(addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
++		_tlbiel_va_range(addr, end, pid, MMUPAGE_SIZE, mmu_virtual_psize, true);
+ 	} else if (type == FLUSH_TYPE_GLOBAL) {
+ 		if (!mmu_has_feature(MMU_FTR_GTSE)) {
+ 			unsigned long tgt, type, pg_sizes;
+@@ -1343,10 +1343,10 @@ void radix__flush_tlb_collapsed_pmd(struct mm_struct *mm, unsigned long addr)
+ 			pseries_rpt_invalidate(pid, tgt, type, pg_sizes,
+ 					       addr, end);
+ 		} else if (cputlb_use_tlbie())
+-			_tlbie_va_range(addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
++			_tlbie_va_range(addr, end, pid, MMUPAGE_SIZE, mmu_virtual_psize, true);
+ 		else
+ 			_tlbiel_va_range_multicast(mm,
+-					addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
++					addr, end, pid, MMUPAGE_SIZE, mmu_virtual_psize, true);
+ 	}
+ 
+ 	preempt_enable();
+diff --git a/arch/powerpc/mm/nohash/tlb.c b/arch/powerpc/mm/nohash/tlb.c
+index 0a650742f3a0..f7e801da46cf 100644
+--- a/arch/powerpc/mm/nohash/tlb.c
++++ b/arch/powerpc/mm/nohash/tlb.c
+@@ -317,7 +317,7 @@ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		     unsigned long end)
+ 
+ {
+-	if (end - start == PAGE_SIZE && !(start & ~PAGE_MASK))
++	if (end - start == MMUPAGE_SIZE && !(start & ~MMUPAGE_MASK))
+ 		flush_tlb_page(vma, start);
+ 	else
+ 		flush_tlb_mm(vma->vm_mm);
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index 0545fe75c3fa..5e550c9a077f 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -332,7 +332,7 @@ static inline bool mm_in_asid_transition(struct mm_struct *mm) { return false; }
+ 	flush_tlb_mm_range((vma)->vm_mm, start, end,			\
+ 			   ((vma)->vm_flags & VM_HUGETLB)		\
+ 				? huge_page_shift(hstate_vma(vma))	\
+-				: PAGE_SHIFT, true)
++				: MMUPAGE_SHIFT, true)
+ 
+ extern void flush_tlb_all(void);
+ extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+@@ -342,7 +342,7 @@ extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
+ 
+ static inline void flush_tlb_page(struct vm_area_struct *vma, unsigned long a)
+ {
+-	flush_tlb_mm_range(vma->vm_mm, a, a + PAGE_SIZE, PAGE_SHIFT, false);
++	flush_tlb_mm_range(vma->vm_mm, a, a + MMUPAGE_SIZE, MMUPAGE_SHIFT, false);
+ }
+ 
+ static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
+diff --git a/arch/x86/kernel/ldt.c b/arch/x86/kernel/ldt.c
+index 40c5bf97dd5c..38efec6d3adb 100644
+--- a/arch/x86/kernel/ldt.c
++++ b/arch/x86/kernel/ldt.c
+@@ -306,18 +306,24 @@ map_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt, int slot)
+ 
+ 	is_vmalloc = is_vmalloc_addr(ldt->entries);
+ 
+-	nr_pages = DIV_ROUND_UP(ldt->nr_entries * LDT_ENTRY_SIZE, PAGE_SIZE);
++	nr_pages = DIV_ROUND_UP(ldt->nr_entries * LDT_ENTRY_SIZE, MMUPAGE_SIZE);
+ 
+ 	for (i = 0; i < nr_pages; i++) {
+-		unsigned long offset = i << PAGE_SHIFT;
++		unsigned long offset = i << MMUPAGE_SHIFT;
+ 		const void *src = (char *)ldt->entries + offset;
+ 		unsigned long pfn;
+ 		pgprot_t pte_prot;
+ 		pte_t pte, *ptep;
+ 
+ 		va = (unsigned long)ldt_slot_va(slot) + offset;
+-		pfn = is_vmalloc ? vmalloc_to_pfn(src) :
+-			page_to_pfn(virt_to_page(src));
++		if (is_vmalloc) {
++			struct page *page = vmalloc_to_page(src);
++			pfn = page_to_pfn(page) * PAGE_MMUCOUNT +
++				(((unsigned long)src >> MMUPAGE_SHIFT) &
++				 (PAGE_MMUCOUNT - 1));
++		} else {
++			pfn = __pa(src) >> MMUPAGE_SHIFT;
++		}
+ 		/*
+ 		 * Treat the PTI LDT range as a *userspace* range.
+ 		 * get_locked_pte() will allocate all needed pagetables
+@@ -358,10 +364,10 @@ static void unmap_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt)
+ 	if (!boot_cpu_has(X86_FEATURE_PTI))
+ 		return;
+ 
+-	nr_pages = DIV_ROUND_UP(ldt->nr_entries * LDT_ENTRY_SIZE, PAGE_SIZE);
++	nr_pages = DIV_ROUND_UP(ldt->nr_entries * LDT_ENTRY_SIZE, MMUPAGE_SIZE);
+ 
+ 	for (i = 0; i < nr_pages; i++) {
+-		unsigned long offset = i << PAGE_SHIFT;
++		unsigned long offset = i << MMUPAGE_SHIFT;
+ 		spinlock_t *ptl;
+ 		pte_t *ptep;
+ 
+@@ -374,7 +380,7 @@ static void unmap_ldt_struct(struct mm_struct *mm, struct ldt_struct *ldt)
+ 	}
+ 
+ 	va = (unsigned long)ldt_slot_va(ldt->slot);
+-	flush_tlb_mm_range(mm, va, va + nr_pages * PAGE_SIZE, PAGE_SHIFT, false);
++	flush_tlb_mm_range(mm, va, va + nr_pages * MMUPAGE_SIZE, MMUPAGE_SHIFT, false);
+ }
+ 
+ #else /* !CONFIG_MITIGATION_PAGE_TABLE_ISOLATION */
+diff --git a/arch/x86/mm/tlb.c b/arch/x86/mm/tlb.c
+index af43d177087e..01520b9dc8cc 100644
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -1531,7 +1531,7 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 
+ 	guard(preempt)();
+ 
+-	info = get_flush_tlb_info(NULL, start, end, PAGE_SHIFT, false,
++	info = get_flush_tlb_info(NULL, start, end, MMUPAGE_SHIFT, false,
+ 				  TLB_GENERATION_INVALID);
+ 
+ 	if (info->end == TLB_FLUSH_ALL)
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 63efbde9c1cb..01deb4997fb2 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -2546,7 +2546,7 @@ static void pagemap_scan_backout_range(struct pagemap_scan_private *p,
+ 	else
+ 		cur_buf->start = cur_buf->end = 0;
+ 
+-	p->found_pages -= (end - addr) / PAGE_SIZE;
++	p->found_pages -= (end - addr) / MMUPAGE_SIZE;
+ }
+ #endif
+ 
+@@ -2658,11 +2658,11 @@ static int pagemap_scan_output(unsigned long categories,
+ 
+ 	categories &= p->arg.return_mask;
+ 
+-	n_pages = (*end - addr) / PAGE_SIZE;
++	n_pages = (*end - addr) / MMUPAGE_SIZE;
+ 	if (check_add_overflow(p->found_pages, n_pages, &total_pages) ||
+ 	    total_pages > p->arg.max_pages) {
+ 		size_t n_too_much = total_pages - p->arg.max_pages;
+-		*end -= n_too_much * PAGE_SIZE;
++		*end -= n_too_much * MMUPAGE_SIZE;
+ 		n_pages -= n_too_much;
+ 		ret = -ENOSPC;
+ 	}
+@@ -2756,7 +2756,7 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
+ 
+ 	if ((p->arg.flags & PM_SCAN_WP_MATCHING) && !p->vec_out) {
+ 		/* Fast path for performing exclusive WP */
+-		for (addr = start; addr != end; pte++, addr += PAGE_SIZE) {
++		for (addr = start; addr != end; pte++, addr += MMUPAGE_SIZE) {
+ 			pte_t ptent = ptep_get(pte);
+ 
+ 			if ((pte_present(ptent) && pte_uffd_wp(ptent)) ||
+@@ -2765,7 +2765,7 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
+ 			make_uffd_wp_pte(vma, addr, pte, ptent);
+ 			if (!flush_end)
+ 				start = addr;
+-			flush_end = addr + PAGE_SIZE;
++			flush_end = addr + MMUPAGE_SIZE;
+ 		}
+ 		goto flush_and_return;
+ 	}
+@@ -2773,8 +2773,8 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
+ 	if (!p->arg.category_anyof_mask && !p->arg.category_inverted &&
+ 	    p->arg.category_mask == PAGE_IS_WRITTEN &&
+ 	    p->arg.return_mask == PAGE_IS_WRITTEN) {
+-		for (addr = start; addr < end; pte++, addr += PAGE_SIZE) {
+-			unsigned long next = addr + PAGE_SIZE;
++		for (addr = start; addr < end; pte++, addr += MMUPAGE_SIZE) {
++			unsigned long next = addr + MMUPAGE_SIZE;
+ 			pte_t ptent = ptep_get(pte);
+ 
+ 			if ((pte_present(ptent) && pte_uffd_wp(ptent)) ||
+@@ -2794,11 +2794,11 @@ static int pagemap_scan_pmd_entry(pmd_t *pmd, unsigned long start,
+ 		goto flush_and_return;
+ 	}
+ 
+-	for (addr = start; addr != end; pte++, addr += PAGE_SIZE) {
++	for (addr = start; addr != end; pte++, addr += MMUPAGE_SIZE) {
+ 		pte_t ptent = ptep_get(pte);
+ 		unsigned long categories = p->cur_vma_category |
+ 					   pagemap_page_category(p, vma, addr, ptent);
+-		unsigned long next = addr + PAGE_SIZE;
++		unsigned long next = addr + MMUPAGE_SIZE;
+ 
+ 		if (!pagemap_scan_is_interesting_page(categories, p))
+ 			continue;
+@@ -2942,7 +2942,7 @@ static int pagemap_scan_get_args(struct pm_scan_arg *arg,
+ 	arg->vec = untagged_addr((unsigned long)arg->vec);
+ 
+ 	/* Validate memory pointers */
+-	if (!IS_ALIGNED(arg->start, PAGE_SIZE))
++	if (!IS_ALIGNED(arg->start, MMUPAGE_SIZE))
+ 		return -EINVAL;
+ 	if (!access_ok((void __user *)(long)arg->start, arg->end - arg->start))
+ 		return -EFAULT;
+@@ -2955,7 +2955,7 @@ static int pagemap_scan_get_args(struct pm_scan_arg *arg,
+ 		return -EFAULT;
+ 
+ 	/* Fixup default values */
+-	arg->end = ALIGN(arg->end, PAGE_SIZE);
++	arg->end = ALIGN(arg->end, MMUPAGE_SIZE);
+ 	arg->walk_end = 0;
+ 	if (!arg->max_pages)
+ 		arg->max_pages = ULONG_MAX;
+diff --git a/mm/mremap.c b/mm/mremap.c
+index 02c6dd7a2e42..a5515455d41c 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -309,10 +309,10 @@ static int move_ptes(struct pagetable_move_control *pmc,
+ 			}
+ #if PAGE_MMUSHIFT
+ 			/*
+-			 * With PGCL, set_ptes(nr>1) treats nr as kernel
+-			 * page count (writes nr*PAGE_MMUCOUNT PTEs).
+-			 * When nr comes from pgcl_pte_batch (MMUPAGE
+-			 * count), write individual PTEs instead.
++			 * With PGCL, pgcl_pte_batch returns an MMUPAGE
++			 * count of contiguous sub-page PTEs within the
++			 * same kernel page. Write individual PTEs with
++			 * sub-page offset increments.
+ 			 */
+ 			if (nr_ptes > 1) {
+ 				int j;
+-- 
+2.54.0
+

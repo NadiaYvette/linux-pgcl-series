@@ -1,0 +1,46 @@
+From 2d9b06e40174045170fc452c78d5ec2fa9cd5b9e Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 31 Mar 2026 23:54:46 +0200
+Subject: [PATCH 056/174] PGCL: fix futex EFAULT on shared mappings with
+ PAGE_MMUSHIFT>0
+
+get_futex_key() rounded the GUP lookup address down to PAGE_SIZE (64KB)
+via `address -= key->both.offset`. With PGCL, VMAs are MMUPAGE-aligned
+(4KB), so this could push the address below the VMA start, causing
+GUP to fail with -EFAULT on shared mappings.
+
+Fix by rounding down to MMUPAGE_SIZE instead. The offset field still
+records the position within a kernel page for key discrimination.
+
+Fixes fork04, mincore04, and all LTP checkpoint-using tests.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ kernel/futex/core.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/futex/core.c b/kernel/futex/core.c
+index ff2a4fb2993f..3e4a5d406c25 100644
+--- a/kernel/futex/core.c
++++ b/kernel/futex/core.c
+@@ -564,11 +564,16 @@ int get_futex_key(u32 __user *uaddr, unsigned int flags, union futex_key *key,
+ 
+ 	/*
+ 	 * The futex address must be "naturally" aligned.
++	 *
++	 * The offset records the position within a kernel page for key
++	 * discrimination, but we round the address down to MMUPAGE_SIZE
++	 * for the GUP lookup because VMAs are MMUPAGE-aligned — the
++	 * PAGE-aligned address may fall below the VMA start.
+ 	 */
+ 	key->both.offset = address % PAGE_SIZE;
+ 	if (unlikely((address % size) != 0))
+ 		return -EINVAL;
+-	address -= key->both.offset;
++	address -= address % MMUPAGE_SIZE;
+ 
+ 	if (unlikely(!access_ok(uaddr, size)))
+ 		return -EFAULT;
+-- 
+2.54.0
+

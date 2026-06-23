@@ -1,0 +1,94 @@
+From c713bd379a4afc5e46db233e5f8b223611bb766a Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 10 May 2026 00:32:48 +0200
+Subject: [PATCH 104/174] vmlinux.lds: fall back when MMUPAGE_SIZE not exposed;
+ expose it on mips/loongarch
+
+Commit a507d4db5a39 ("vmlinux.lds.h: align .text.hot at MMUPAGE
+granularity, not PAGE_SIZE") used MMUPAGE_SIZE directly inside
+TEXT_TEXT.  That breaks any arch whose vmlinux.lds.S preprocesses
+without MMUPAGE_SIZE in scope -- e.g. mips, which synthesizes its
+linker-script PAGE_SIZE from asm-offsets via _PAGE_SIZE rather than
+including <asm/page.h> -- with:
+
+  ld:./arch/mips/kernel/vmlinux.lds:N:
+    undefined symbol `MMUPAGE_SIZE' referenced in expression
+
+Wrap the alignment in LDS_ALIGN_TLB_PAGE() and fall back to
+ALIGN(PAGE_SIZE) when MMUPAGE_SIZE isn't visible -- correct on
+non-PGCL kernels and matches the previous behavior on arches that
+haven't surfaced MMUPAGE_SIZE to their lds yet.
+
+Add `#define MMUPAGE_SIZE _MMUPAGE_SIZE` to mips and loongarch lds so
+they pick up the optimization (they already DEFINE(_MMUPAGE_SIZE)
+in asm-offsets).  Other PGCL-aware arches that include <asm/page.h>
+directly in their lds.S already see MMUPAGE_SIZE without changes.
+
+mips64 PGCL=6 now boots: pgcl-test 19/0, pgcl-stress 12/0.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/loongarch/kernel/vmlinux.lds.S |  1 +
+ arch/mips/kernel/vmlinux.lds.S      |  1 +
+ include/asm-generic/vmlinux.lds.h   | 13 ++++++++++++-
+ 3 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/arch/loongarch/kernel/vmlinux.lds.S b/arch/loongarch/kernel/vmlinux.lds.S
+index 463333cde6dd..961e984d5bab 100644
+--- a/arch/loongarch/kernel/vmlinux.lds.S
++++ b/arch/loongarch/kernel/vmlinux.lds.S
+@@ -10,6 +10,7 @@
+  * padding and misaligns PE/COFF sections relative to PECOFF_SEGMENT_ALIGN.
+  */
+ #define PAGE_SIZE _MMUPAGE_SIZE
++#define MMUPAGE_SIZE _MMUPAGE_SIZE
+ #define RO_EXCEPTION_TABLE_ALIGN	4
+ 
+ #ifdef CONFIG_32BIT
+diff --git a/arch/mips/kernel/vmlinux.lds.S b/arch/mips/kernel/vmlinux.lds.S
+index 579b2cc1995a..db257d7d8a23 100644
+--- a/arch/mips/kernel/vmlinux.lds.S
++++ b/arch/mips/kernel/vmlinux.lds.S
+@@ -3,6 +3,7 @@
+ #include <asm/thread_info.h>
+ 
+ #define PAGE_SIZE _PAGE_SIZE
++#define MMUPAGE_SIZE _MMUPAGE_SIZE
+ 
+ /*
+  * Put .bss..swapper_pg_dir as the first thing in .bss. This will
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index a286823fe29a..219e57d52b99 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -567,7 +567,18 @@
+  * aligning on it wastes up to PAGE_SIZE - 1 bytes here -- enough on
+  * parisc/PGCL=6 to push the trap-vector branch to intr_extint past the
+  * 19-bit displacement field.
++ *
++ * Many arch lds files don't expose MMUPAGE_SIZE to the linker-script
++ * preprocessor (they synthesize PAGE_SIZE from asm-offsets via a private
++ * symbol like _PAGE_SIZE).  Fall back to PAGE_SIZE when MMUPAGE_SIZE
++ * isn't visible -- correct on non-PGCL kernels and matches the previous
++ * behavior on arches that haven't surfaced MMUPAGE_SIZE to their lds yet.
+  */
++#ifdef MMUPAGE_SIZE
++#define LDS_ALIGN_TLB_PAGE()	. = ALIGN(MMUPAGE_SIZE)
++#else
++#define LDS_ALIGN_TLB_PAGE()	. = ALIGN(PAGE_SIZE)
++#endif
+ 
+ /*
+  * Non-instrumentable text section
+@@ -613,7 +624,7 @@
+ 		*(.text.unknown .text.unknown.*)			\
+ 		TEXT_SPLIT						\
+ 		TEXT_UNLIKELY						\
+-		. = ALIGN(MMUPAGE_SIZE);				\
++		LDS_ALIGN_TLB_PAGE();					\
+ 		TEXT_HOT						\
+ 		*(TEXT_MAIN .text.fixup)				\
+ 		NOINSTR_TEXT						\
+-- 
+2.54.0
+

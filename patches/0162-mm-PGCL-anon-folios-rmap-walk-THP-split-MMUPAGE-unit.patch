@@ -1,0 +1,424 @@
+From 65012352725e71280689293a3e4f70f962cefd50 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 18 Jun 2026 13:44:47 +0200
+Subject: [PATCH 162/174] mm: PGCL anon folios + rmap walk + THP split ->
+ MMUPAGE-unit mapcount
+
+Complete the MMUPAGE-uniform rmap mapcount conversion begun for file folios
+(703e74d). Convert the anonymous fault/fork/COW/zap paths, the rmap walk
+(reclaim/migration), and the THP split paths to count mappings in hardware
+(MMUPAGE) PTE units instead of kernel-page (Contract-A) units, so the whole
+kernel uses one mapcount contract.
+
+Previously anon large folios mixed units: the fault and zap paths counted
+PAGE_MMUCOUNT sub-PTEs per cluster while the rmap walk and the THP PMD-split
+still counted one-per-cluster. On a THP COW/split the walk (unmap_folio ->
+try_to_migrate_one) removed only 1/cluster, the split saw a not-fully-unmapped
+folio, force-reset _mapcount to -1, the Contract-A remap re-added 1, and a
+later MMUPAGE zap then removed PAGE_MMUCOUNT, underflowing the folio counters
+by ~PAGE_MMUCOUNT (-64 at PAGE_MMUSHIFT=6) -> "BUG: Bad page" / "nonzero
+mapcount" on free.
+
+  - mm/memory.c: anon fault (map_anon_folio_pte_nopf), swap-in (do_swap_page),
+    fork (copy_present_ptes), COW (wp_page_copy) and zap (zap_present_ptes)
+    count sub-PTEs per cluster via folio_{add,remove}_rmap_subptes().
+  - mm/rmap.c: try_to_unmap_one() + try_to_migrate_one() large-folio branch
+    remove pvmw.nr_mmupages sub-PTEs per yield; the helper's per-page -1
+    sentinel handles first/last _nr_pages_mapped across gapped yields, so the
+    Contract-A pgcl_rmap_fire_kpage_event last-present scan is no longer needed.
+  - mm/migrate.c: remove_migration_pte() re-adds the matching count (anon: one
+    folio_add_anon_rmap_pte to set the per-cluster PageAnonExclusive flag + the
+    helper for the rest; file: the helper).
+  - mm/huge_memory.c: __split_huge_pmd_locked() both !freeze branches
+    (do_huge_pmd_wp_page COW) add the remaining PAGE_MMUCOUNT-1 sub-PTEs per
+    cluster after folio_add_anon_rmap_ptes().
+  - include/linux/rmap.h: __folio_large_mapcount_sanity_checks() bound scaled
+    by PAGE_MMUCOUNT (a single add may carry one cluster's sub-PTEs; a fully
+    PTE-mapped folio has folio_large_nr_pages() * PAGE_MMUCOUNT mappings).
+
+All changes are gated #if PAGE_MMUSHIFT (or multiply by PAGE_MMUCOUNT == 1 at
+shift 0), preserving the Newton limit. Verified x86_64 PAGE_MMUSHIFT=6 with
+DEBUG_VM: anon fork/COW/THP-split stress + file leak-probe clean, no underflow;
+PAGE_MMUSHIFT=0 build clean; 20-arch PAGE_MMUSHIFT=6 matrix shows zero
+mapcount/rmap regressions.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ include/linux/rmap.h | 11 +++++-
+ mm/huge_memory.c     | 40 +++++++++++++++-----
+ mm/memory.c          | 87 +++++++++++++++++++++++++++++++-------------
+ mm/migrate.c         | 32 +++++++++++++---
+ mm/rmap.c            | 72 +++++++++++-------------------------
+ 5 files changed, 150 insertions(+), 92 deletions(-)
+
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 38c4cc998998..8675378d588f 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -144,9 +144,16 @@ static inline void __folio_large_mapcount_sanity_checks(const struct folio *foli
+ 	 * folio in a single MM as "exclusively mapped". This is primarily
+ 	 * a check on 32bit, where we currently reduce the size of the per-MM
+ 	 * mapcount to a short.
++	 *
++	 * PGCL: mapcount counts hardware (MMUPAGE) PTEs, so a fully PTE-mapped
++	 * folio has folio_large_nr_pages() * PAGE_MMUCOUNT mappings and a
++	 * single add may carry up to one cluster's PAGE_MMUCOUNT sub-PTEs.
++	 * PAGE_MMUCOUNT == 1 at PAGE_MMUSHIFT == 0, so this is the mainline
++	 * bound there (Newton limit).
+ 	 */
+-	VM_WARN_ON_ONCE(diff > folio_large_nr_pages(folio));
+-	VM_WARN_ON_ONCE(folio_large_nr_pages(folio) - 1 > MM_ID_MAPCOUNT_MAX);
++	VM_WARN_ON_ONCE(diff > folio_large_nr_pages(folio) * PAGE_MMUCOUNT);
++	VM_WARN_ON_ONCE(folio_large_nr_pages(folio) * PAGE_MMUCOUNT - 1 >
++			MM_ID_MAPCOUNT_MAX);
+ 
+ 	VM_WARN_ON_ONCE(folio_mm_id(folio, 0) == MM_ID_DUMMY &&
+ 			folio->_mm_id_mapcount[0] != -1);
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 74cdaeb4c4cd..f937b7e11aa9 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3201,14 +3201,25 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 
+ 			folio_add_anon_rmap_ptes(folio, page, HPAGE_PMD_NR,
+ 						 vma, haddr, rmap_flags);
++#if PAGE_MMUSHIFT
+ 			/*
+-			 * PGCL Contract A (large folios): mapcount stays in
+-			 * kernel-page units, so folio_add_anon_rmap_ptes(..,
+-			 * HPAGE_PMD_NR, ..) recorded the right count and the
+-			 * post-split PTE-mapped folio is zapped one rmap event
+-			 * per kernel page.  The HPAGE_PMD_MMUNR MMUPAGE PTE
+-			 * references were taken via folio_ref_add above.
++			 * PGCL MMUPAGE: the PMD->PTE split maps each of the
++			 * HPAGE_PMD_NR clusters by PAGE_MMUCOUNT sub-PTEs.
++			 * folio_add_anon_rmap_ptes() accounted one sub-PTE per
++			 * cluster (and propagated PageAnonExclusive); add the
++			 * remaining PAGE_MMUCOUNT-1 per cluster so the mapcount
++			 * matches the MMUPAGE zap/reclaim/migrate removal.  The
++			 * HPAGE_PMD_MMUNR PTE references were taken via
++			 * folio_ref_add above.
+ 			 */
++			{
++				int c;
++
++				for (c = 0; c < HPAGE_PMD_NR; c++)
++					folio_add_rmap_subptes(folio, page + c,
++							PAGE_MMUCOUNT - 1, vma);
++			}
++#endif
+ 		}
+ 	} else {
+ 		/*
+@@ -3276,11 +3287,22 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 				rmap_flags |= RMAP_EXCLUSIVE;
+ 			folio_add_anon_rmap_ptes(folio, page, HPAGE_PMD_NR,
+ 						 vma, haddr, rmap_flags);
++#if PAGE_MMUSHIFT
+ 			/*
+-			 * PGCL Contract A (large folios): kernel-page-unit
+-			 * mapcount; no per-PTE fixup (refs taken per-PTE via
+-			 * folio_ref_add above).  See the !freeze branch.
++			 * PGCL MMUPAGE: folio_add_anon_rmap_ptes() accounted one
++			 * sub-PTE per cluster; add the remaining PAGE_MMUCOUNT-1
++			 * per cluster so the PTE-mapped folio's mapcount matches
++			 * the MMUPAGE zap/reclaim/migrate removal (mirror of the
++			 * device-private !freeze branch above).
+ 			 */
++			{
++				int c;
++
++				for (c = 0; c < HPAGE_PMD_NR; c++)
++					folio_add_rmap_subptes(folio, page + c,
++							PAGE_MMUCOUNT - 1, vma);
++			}
++#endif
+ 		}
+ 	}
+ 
+diff --git a/mm/memory.c b/mm/memory.c
+index fcc4c7813d4b..c41e852d2de8 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1321,13 +1321,28 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 				int i;
+ 
+ 				/*
+-				 * order-0: per-PTE mapcount (the dup above passed
+-				 * nr_pages=1 since all sub-PTEs share one struct
+-				 * page).  Large folios already counted once per
+-				 * kernel page (Contract A), so add nothing here.
++				 * MMUPAGE-uniform: mapcount counts hardware PTEs.
++				 * The dup above (folio_try_dup_anon_rmap_ptes nr=1)
++				 * added 1 for first_frag and 0 for a later fragment
++				 * (a kernel page split across pgcl_pte_batch runs by a
++				 * gap); add the remainder so this batch's nr sub-PTEs
++				 * are all counted.  folio_add_rmap_subptes() handles
++				 * order-0 (_mapcount) and large (_large_mapcount +
++				 * per-page, no _nr_pages_mapped re-bump since the page
++				 * is already mapped) and updates the MMUPAGE stat.
+ 				 */
++#if PAGE_MMUSHIFT
++				{
++					unsigned int add = first_frag ? (nr - 1) : nr;
++
++					if (add)
++						folio_add_rmap_subptes(folio, page,
++								       add, dst_vma);
++				}
++#else
+ 				if (!folio_test_large(folio))
+ 					atomic_add(nr - 1, &folio->_mapcount);
++#endif
+ 
+ 				for (i = 0; i < nr; i++) {
+ 					pte_t p = ptep_get(src_pte + i);
+@@ -1960,9 +1975,9 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
+ 			 * event iff none remain mapped.  order-0 folios have no
+ 			 * _large_mapcount and keep per-PTE counting.
+ 			 */
+-			if (folio_test_large(folio) && !folio_test_anon(folio)) {
++			if (folio_test_large(folio)) {
+ 				/*
+-				 * FILE large folio: MMUPAGE-uniform mapcount --
++				 * Large folio (anon + file): MMUPAGE-uniform mapcount --
+ 				 * remove this batch's nr sub-PTEs from the cluster
+ 				 * page's _mapcount (pgcl_pte_batch groups by kpfn).
+ 				 * Straddle / partial / non-cluster-aligned all balance
+@@ -4470,17 +4485,15 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 				 */
+ 				update_mmu_cache_range(vmf, vma, a, ptep, 1);
+ 				/*
+-				 * order-0: one rmap event per PTE.  Large
+-				 * old_folios use Contract A — the faulting PTE's
+-				 * folio_remove_rmap_pte above already recorded
+-				 * the single kernel-page event, so neighbor PTEs
+-				 * in the same kernel page must not repeat it.
+-				 * extra still counts every neighbor PTE for the
+-				 * refcount fixup below (refs are per-PTE).
++				 * MMUPAGE-uniform: one rmap event per sub-PTE for
++				 * old_folio (order-0 AND large).  The faulting sub-PTE
++				 * was removed above; these neighbor removes clear the
++				 * rest of the kernel page's sub-PTEs from old_folio,
++				 * matching the per-sub-PTE add/zap.  extra also drives
++				 * the per-PTE refcount fixup below.
+ 				 */
+-				if (!folio_test_large(old_folio))
+-					folio_remove_rmap_pte(old_folio,
+-							      pte_page(pteval), vma);
++				folio_remove_rmap_pte(old_folio,
++						      pte_page(pteval), vma);
+ 				extra++;
+ 			}
+ 			if (extra) {
+@@ -5714,12 +5727,23 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		folio_put_swap(folio, nr_pages == 1 ? page : NULL);
+ 	}
+ 	/*
+-	 * PGCL Contract A (large folios): mapcount is kept in kernel-page
+-	 * units, so folio_add_anon_rmap_ptes(.., nr_pages, ..) already
+-	 * recorded the correct number of mappings — no per-PTE fixup.  The
+-	 * extra MMUPAGE PTE references were taken via folio_ref_add(nr_ptes
+-	 * - 1) above (refcount is per-PTE).
++	 * PGCL MMUPAGE-uniform: the anon rmap calls above set the Contract-A
++	 * base (one mapping per kernel page); for a large folio add the
++	 * remaining (PAGE_MMUCOUNT-1) sub-PTEs per cluster so mapcount counts
++	 * hardware PTEs, matching the per-sub-PTE zap.  folio_add_rmap_subptes
++	 * advances _large_mapcount + per-page _mapcount without re-bumping
++	 * _nr_pages_mapped (page already mapped).  MMUPAGE refs were taken via
++	 * folio_ref_add(nr_ptes-1).  order-0 (nr_pages==1) needs nothing.
+ 	 */
++#if PAGE_MMUSHIFT
++	if (nr_pages > 1) {
++		unsigned int c;
++
++		for (c = 0; c < nr_pages; c++)
++			folio_add_rmap_subptes(folio, page + c,
++					       PAGE_MMUCOUNT - 1, vma);
++	}
++#endif
+ 
+ 	VM_BUG_ON(!folio_test_anon(folio) ||
+ 			(pte_write(pte) && !PageAnonExclusive(page)));
+@@ -5983,12 +6007,23 @@ void map_anon_folio_pte_nopf(struct folio *folio, pte_t *pte,
+ 	folio_ref_add(folio, nr_ptes - 1);
+ 	folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
+ 	/*
+-	 * PGCL Contract A (large folios): folio_add_new_anon_rmap set each
+-	 * kernel page's _mapcount to 0 (= 1 mapping) and _large_mapcount to
+-	 * nr_pages — that is exactly the kernel-page-unit mapcount we want,
+-	 * so no per-PTE fixup.  The nr_ptes MMUPAGE references were taken via
+-	 * folio_ref_add(nr_ptes - 1) above (refcount is per-PTE).
++	 * PGCL MMUPAGE-uniform contract: mapcount counts hardware PTEs.
++	 * folio_add_new_anon_rmap() set the Contract-A base (one mapping per
++	 * kernel page); for a large folio each kernel page is mapped by
++	 * PAGE_MMUCOUNT sub-PTEs, so add the remaining (PAGE_MMUCOUNT-1) per
++	 * cluster.  folio_add_rmap_subptes() advances _large_mapcount + the
++	 * per-page _mapcount and does NOT re-bump _nr_pages_mapped (the page is
++	 * already mapped), matching the per-sub-PTE zap.  order-0 (nr_pages==1)
++	 * keeps its single sub-PTE here; do_anonymous_page clusters the rest.
++	 * The nr_ptes MMUPAGE refs were taken via folio_ref_add(nr_ptes-1).
+ 	 */
++	if (nr_pages > 1) {
++		unsigned int c;
++
++		for (c = 0; c < nr_pages; c++)
++			folio_add_rmap_subptes(folio, folio_page(folio, c),
++					       PAGE_MMUCOUNT - 1, vma);
++	}
+ 	folio_add_lru_vma(folio, vma);
+ 	set_ptes(vma->vm_mm, addr, pte, entry, nr_ptes);
+ 	update_mmu_cache_range(NULL, vma, addr, pte, nr_ptes);
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 48f172183758..bfa73c71c75b 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -484,14 +484,32 @@ static bool remove_migration_pte(struct folio *folio,
+ 							MMUPAGE_SHIFT) &
+ 							(PAGE_MMUCOUNT - 1)),
+ 						true);
+-#else
+-				bool first_frag = true;
+ #endif
+ 				if (folio_test_anon(folio)) {
+ 					if (folio_test_large(folio)) {
+-						if (first_frag)
+-							folio_add_anon_rmap_pte(folio, new, vma,
++#if PAGE_MMUSHIFT
++							/*
++							 * MMUPAGE: restore nr_pages sub-PTE counts for this
++							 * yield.  On the first restored fragment of the kernel
++							 * page, folio_add_anon_rmap_pte sets the per-cluster
++							 * PageAnonExclusive flag and accounts one sub-PTE; the
++							 * rest go through the bare count helper (the per-page -1
++							 * sentinel keeps _nr_pages_mapped right).  A later
++							 * fragment is defensive: migration restore is normally
++							 * single-yield per cluster.
++							 */
++							if (first_frag) {
++								folio_add_anon_rmap_pte(folio, new, vma,
+ 										pvmw.address, rmap_flags);
++								if (nr_pages > 1)
++									folio_add_rmap_subptes(folio, new,
++											nr_pages - 1, vma);
++							} else
++								folio_add_rmap_subptes(folio, new, nr_pages, vma);
++#else
++							folio_add_anon_rmap_pte(folio, new, vma,
++									pvmw.address, rmap_flags);
++#endif
+ 					} else
+ 						for (i = 0; i < nr_pages; i++)
+ 							folio_add_anon_rmap_pte(folio, new, vma,
+@@ -499,8 +517,12 @@ static bool remove_migration_pte(struct folio *folio,
+ 										rmap_flags);
+ 				} else {
+ 					if (folio_test_large(folio)) {
+-						if (first_frag)
++#if PAGE_MMUSHIFT
++							/* MMUPAGE: restore nr_pages file sub-PTEs. */
++							folio_add_rmap_subptes(folio, new, nr_pages, vma);
++#else
+ 							folio_add_file_rmap_pte(folio, new, vma);
++#endif
+ 					} else
+ 						for (i = 0; i < nr_pages; i++)
+ 							folio_add_file_rmap_pte(folio, new, vma);
+diff --git a/mm/rmap.c b/mm/rmap.c
+index edcafaf4efd6..e213e998613d 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -2498,34 +2498,20 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
+ 			hugetlb_remove_rmap(folio);
+ 		} else if (folio_test_large(folio)) {
+ 			/*
+-			 * PGCL Contract A (large folios): mapcount counts
+-			 * mappings at kernel-page granularity — one rmap event
+-			 * per kernel page.  A gapped cluster has its
+-			 * PAGE_MMUCOUNT sub-PTEs split across several PVMW yields;
+-			 * firing per yield would over-remove and underflow the
+-			 * folio counters (and a migration src/dst asymmetry then
+-			 * leaves a stale large_mapcount).  Fire only when this
+-			 * yield cleared the LAST present sub-PTE of the kernel
+-			 * page: this yield's PTEs are already cleared above, so
+-			 * scan the full window and emit the event iff none remain
+-			 * present.  Mirror of the zap last-present edge.  Non-PGCL:
+-			 * one PTE per kernel page so the window has a single slot.
++			 * PGCL MMUPAGE: mapcount counts mappings at hardware
++			 * (MMUPAGE) granularity — one count per sub-PTE.  This
++			 * yield cleared nr_pages (== pvmw.nr_mmupages) sub-PTEs
++			 * of one cluster page, so remove exactly that many
++			 * sub-PTE mappings.  A gapped cluster whose sub-PTEs are
++			 * split across several PVMW yields removes its present
++			 * sub-PTEs per yield, summing to the correct total; the
++			 * helper's per-page -1 sentinel detects first/last
++			 * (_nr_pages_mapped) across partial yields, so no
++			 * last-present scan is needed.  Non-PGCL: one PTE per
++			 * kernel page, nr_pages == 1, so this is one removal.
+ 			 */
+ #if PAGE_MMUSHIFT
+-			/*
+-			 * Anchor on the physical sub-index of the cleared run
+-			 * (pteval holds the old PTE for the present case), match
+-			 * pte_pfn, and bound to this pte table — robust to
+-			 * MMUPAGE-misaligned mappings and PMD-boundary straddles.
+-			 */
+-			unsigned int psub = (unsigned int)((pte_val(pteval) /
+-				__phys_to_pte_val(MMUPAGE_SIZE)) &
+-				(PAGE_MMUCOUNT - 1));
+-
+-			if (pgcl_rmap_fire_kpage_event(pvmw.pte, address,
+-						       page_to_pfn(subpage),
+-						       psub, false))
+-				folio_remove_rmap_pte(folio, subpage, vma);
++			folio_remove_rmap_subptes(folio, subpage, nr_pages, vma);
+ #else
+ 			folio_remove_rmap_pte(folio, subpage, vma);
+ #endif
+@@ -2957,32 +2943,18 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
+ 			hugetlb_remove_rmap(folio);
+ 		} else if (folio_test_large(folio)) {
+ 			/*
+-			 * PGCL Contract A (large folios): one rmap event per
+-			 * kernel page.  A gapped cluster's PAGE_MMUCOUNT sub-PTEs
+-			 * are split across several PVMW yields; firing per yield
+-			 * over-removes.  Because migration on a gapped folio
+-			 * removes from the src folio here but re-adds to the dst
+-			 * folio in remove_migration_pte, the per-yield error does
+-			 * not self-cancel and leaks a nonzero large_mapcount.  This
+-			 * yield's PTEs are now migration entries (non-present), so
+-			 * fire only when no sub-PTE of the kernel page remains
+-			 * present — the last-present edge, mirroring zap and
+-			 * try_to_unmap_one.  Non-PGCL: a single-slot window.
++			 * PGCL MMUPAGE: one count per sub-PTE.  This yield turned
++			 * nr_pages (== pvmw.nr_mmupages) sub-PTEs of one cluster
++			 * page into migration entries, so remove exactly that many
++			 * sub-PTE mappings from the src folio.  remove_migration_pte
++			 * re-adds the same per-yield count to the dst folio, so the
++			 * src/dst accounting matches even for a gapped cluster whose
++			 * sub-PTEs span several yields; the helper's per-page -1
++			 * sentinel handles first/last (_nr_pages_mapped).  Non-PGCL:
++			 * nr_pages == 1, one removal.
+ 			 */
+ #if PAGE_MMUSHIFT
+-			/*
+-			 * Physical-sub-index anchor (pteval is the old PTE; the
+-			 * migration entry lives in swp_pte), pte_pfn match, pte
+-			 * table bounded — handles misaligned/straddling pages.
+-			 */
+-			unsigned int psub = (unsigned int)((pte_val(pteval) /
+-				__phys_to_pte_val(MMUPAGE_SIZE)) &
+-				(PAGE_MMUCOUNT - 1));
+-
+-			if (pgcl_rmap_fire_kpage_event(pvmw.pte, address,
+-						       page_to_pfn(subpage),
+-						       psub, false))
+-				folio_remove_rmap_pte(folio, subpage, vma);
++			folio_remove_rmap_subptes(folio, subpage, nr_pages, vma);
+ #else
+ 			folio_remove_rmap_pte(folio, subpage, vma);
+ #endif
+-- 
+2.54.0
+

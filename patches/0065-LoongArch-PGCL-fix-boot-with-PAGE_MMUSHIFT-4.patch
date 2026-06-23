@@ -1,0 +1,236 @@
+From 2336f91ace8a260625f16a4f54d8b9d350659e41 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 2 Apr 2026 12:49:10 +0200
+Subject: [PATCH 065/174] LoongArch PGCL: fix boot with PAGE_MMUSHIFT=4
+
+Fix multiple PGCL-related boot issues for LoongArch64 with
+PAGE_SIZE_16KB and PAGE_MMUSHIFT=4 (PAGE_SIZE=256KB, MMUPAGE=16KB):
+
+- pgtable.h: p4d_bad/pud_bad/pmd_bad use ~MMUPAGE_MASK (page tables
+  are MMUPAGE-aligned, not PAGE-aligned)
+- vmlinux.lds.S: redefine PAGE_SIZE to MMUPAGE_SIZE for linker
+  alignment; add ALIGN(_PAGE_SIZE) before PERCPU_SECTION to satisfy
+  percpu allocator's offset_in_page() check
+- relocate.c: KASLR offset aligned to PAGE_SIZE instead of hardcoded
+  64KB, preventing percpu misalignment after relocation
+- vdso.c: BUG_ON uses MMUPAGE_ALIGNED (vDSO is MMUPAGE-aligned)
+- vdso.S: .balign MMUPAGE_SIZE (hardware page granularity)
+- init.c: page table allocation uses MMUPAGE_SIZE; invalid page
+  tables use MMUPAGE_SIZE alignment instead of __page_aligned_bss
+- traps.c: stack dump uses THREAD_SIZE not PAGE_SIZE
+- asm-offsets.c: export _MMUPAGE_SIZE for linker script
+
+Tested: boots on QEMU la464, 19/19 pgcl-test PASS, 12/12 pgcl-stress
+PASS, mm-selftests running.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/loongarch/include/asm/pgtable.h |  6 +++---
+ arch/loongarch/kernel/asm-offsets.c  |  1 +
+ arch/loongarch/kernel/relocate.c     |  6 +++---
+ arch/loongarch/kernel/traps.c        |  2 +-
+ arch/loongarch/kernel/vdso.c         |  2 +-
+ arch/loongarch/kernel/vmlinux.lds.S  | 14 +++++++++++++-
+ arch/loongarch/mm/init.c             | 14 +++++++-------
+ arch/loongarch/vdso/vdso.S           |  4 ++--
+ 8 files changed, 31 insertions(+), 18 deletions(-)
+
+diff --git a/arch/loongarch/include/asm/pgtable.h b/arch/loongarch/include/asm/pgtable.h
+index 71a5bd6ccca0..1d3c8c16c094 100644
+--- a/arch/loongarch/include/asm/pgtable.h
++++ b/arch/loongarch/include/asm/pgtable.h
+@@ -168,7 +168,7 @@ static inline int p4d_none(p4d_t p4d)
+ 
+ static inline int p4d_bad(p4d_t p4d)
+ {
+-	return p4d_val(p4d) & ~PAGE_MASK;
++	return p4d_val(p4d) & ~MMUPAGE_MASK;
+ }
+ 
+ static inline int p4d_present(p4d_t p4d)
+@@ -214,7 +214,7 @@ static inline int pud_none(pud_t pud)
+ 
+ static inline int pud_bad(pud_t pud)
+ {
+-	return pud_val(pud) & ~PAGE_MASK;
++	return pud_val(pud) & ~MMUPAGE_MASK;
+ }
+ 
+ static inline int pud_present(pud_t pud)
+@@ -252,7 +252,7 @@ static inline int pmd_none(pmd_t pmd)
+ 
+ static inline int pmd_bad(pmd_t pmd)
+ {
+-	return (pmd_val(pmd) & ~PAGE_MASK);
++	return (pmd_val(pmd) & ~MMUPAGE_MASK);
+ }
+ 
+ static inline int pmd_present(pmd_t pmd)
+diff --git a/arch/loongarch/kernel/asm-offsets.c b/arch/loongarch/kernel/asm-offsets.c
+index 2cc953f113ac..a96050ca72cb 100644
+--- a/arch/loongarch/kernel/asm-offsets.c
++++ b/arch/loongarch/kernel/asm-offsets.c
+@@ -213,6 +213,7 @@ static void __used output_mm_defines(void)
+ 	BLANK();
+ 	DEFINE(_PAGE_SHIFT, PAGE_SHIFT);
+ 	DEFINE(_PAGE_SIZE, PAGE_SIZE);
++	DEFINE(_MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 	BLANK();
+ }
+ 
+diff --git a/arch/loongarch/kernel/relocate.c b/arch/loongarch/kernel/relocate.c
+index 4b61a9632a98..635d3a16a357 100644
+--- a/arch/loongarch/kernel/relocate.c
++++ b/arch/loongarch/kernel/relocate.c
+@@ -214,10 +214,10 @@ static inline void __init *determine_relocation_address(void)
+ 
+ 	kernel_length = (unsigned long)_end - (unsigned long)_text;
+ 
+-	random_offset = get_random_boot() << 16;
++	random_offset = get_random_boot() << PAGE_SHIFT;
+ 	random_offset &= (CONFIG_RANDOMIZE_BASE_MAX_OFFSET - 1);
+ 	if (random_offset < kernel_length)
+-		random_offset += ALIGN(kernel_length, 0xffff);
++		random_offset += ALIGN(kernel_length, PAGE_SIZE - 1);
+ 
+ 	return RELOCATED_KASLR(destination);
+ }
+@@ -252,7 +252,7 @@ static inline int __init relocation_addr_valid(void *location_new)
+ 	unsigned long kernel_start, kernel_size;
+ 	unsigned long initrd_start, initrd_size = 0;
+ 
+-	if ((unsigned long)location_new & 0x00000ffff)
++	if ((unsigned long)location_new & (PAGE_SIZE - 1))
+ 		return 0; /* Inappropriately aligned new location */
+ 
+ 	if ((unsigned long)location_new < (unsigned long)_end)
+diff --git a/arch/loongarch/kernel/traps.c b/arch/loongarch/kernel/traps.c
+index 5d49b742e3bf..4eb7a8b25298 100644
+--- a/arch/loongarch/kernel/traps.c
++++ b/arch/loongarch/kernel/traps.c
+@@ -109,7 +109,7 @@ static void show_stacktrace(struct task_struct *task,
+ 
+ 	printk("%sStack :", loglvl);
+ 	i = 0;
+-	while ((unsigned long) sp & (PAGE_SIZE - 1)) {
++	while ((unsigned long) sp & (THREAD_SIZE - 1)) {
+ 		if (i && ((i % (64 / field)) == 0)) {
+ 			pr_cont("\n");
+ 			printk("%s       ", loglvl);
+diff --git a/arch/loongarch/kernel/vdso.c b/arch/loongarch/kernel/vdso.c
+index c4c99f6dce86..cfd23b6453d4 100644
+--- a/arch/loongarch/kernel/vdso.c
++++ b/arch/loongarch/kernel/vdso.c
+@@ -46,7 +46,7 @@ static int __init init_vdso(void)
+ {
+ 	unsigned long i, cpu, pfn;
+ 
+-	BUG_ON(!PAGE_ALIGNED(vdso_info.vdso));
++	BUG_ON(!MMUPAGE_ALIGNED(vdso_info.vdso));
+ 
+ 	for_each_possible_cpu(cpu)
+ 		vdso_k_arch_data->pdata[cpu].node = cpu_to_node(cpu);
+diff --git a/arch/loongarch/kernel/vmlinux.lds.S b/arch/loongarch/kernel/vmlinux.lds.S
+index 840d944c2f73..463333cde6dd 100644
+--- a/arch/loongarch/kernel/vmlinux.lds.S
++++ b/arch/loongarch/kernel/vmlinux.lds.S
+@@ -4,7 +4,12 @@
+ #include <asm/thread_info.h>
+ #include <asm/orc_lookup.h>
+ 
+-#define PAGE_SIZE _PAGE_SIZE
++/*
++ * Linker script alignment uses MMUPAGE_SIZE (hardware page), not kernel
++ * PAGE_SIZE. With PGCL, PAGE_SIZE can be 256KB which creates excessive
++ * padding and misaligns PE/COFF sections relative to PECOFF_SEGMENT_ALIGN.
++ */
++#define PAGE_SIZE _MMUPAGE_SIZE
+ #define RO_EXCEPTION_TABLE_ALIGN	4
+ 
+ #ifdef CONFIG_32BIT
+@@ -92,6 +97,13 @@ SECTIONS
+ 	}
+ 
+ #ifdef CONFIG_SMP
++	/*
++	 * PGCL: PERCPU_SECTION uses PAGE_SIZE (redefined to MMUPAGE_SIZE
++	 * above) for alignment, but the percpu allocator checks
++	 * offset_in_page() with the real kernel PAGE_SIZE. Force the
++	 * real PAGE_SIZE alignment here.
++	 */
++	. = ALIGN(_PAGE_SIZE);
+ 	PERCPU_SECTION(1 << CONFIG_L1_CACHE_SHIFT)
+ #endif
+ 
+diff --git a/arch/loongarch/mm/init.c b/arch/loongarch/mm/init.c
+index f10758f5b168..eb4f7794434d 100644
+--- a/arch/loongarch/mm/init.c
++++ b/arch/loongarch/mm/init.c
+@@ -175,7 +175,7 @@ pte_t * __init populate_kernel_pte(unsigned long addr)
+ 	pmd_t *pmd;
+ 
+ 	if (p4d_none(p4dp_get(p4d))) {
+-		pud = memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
++		pud = memblock_alloc_or_panic(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 		p4d_populate(&init_mm, p4d, pud);
+ #ifndef __PAGETABLE_PUD_FOLDED
+ 		pud_init(pud);
+@@ -184,7 +184,7 @@ pte_t * __init populate_kernel_pte(unsigned long addr)
+ 
+ 	pud = pud_offset(p4d, addr);
+ 	if (pud_none(pudp_get(pud))) {
+-		pmd = memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
++		pmd = memblock_alloc_or_panic(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 		pud_populate(&init_mm, pud, pmd);
+ #ifndef __PAGETABLE_PMD_FOLDED
+ 		pmd_init(pmd);
+@@ -195,7 +195,7 @@ pte_t * __init populate_kernel_pte(unsigned long addr)
+ 	if (!pmd_present(pmdp_get(pmd))) {
+ 		pte_t *pte;
+ 
+-		pte = memblock_alloc_or_panic(PAGE_SIZE, PAGE_SIZE);
++		pte = memblock_alloc_or_panic(MMUPAGE_SIZE, MMUPAGE_SIZE);
+ 		pmd_populate_kernel(&init_mm, pmd, pte);
+ 		kernel_pte_init(pte);
+ 	}
+@@ -234,16 +234,16 @@ void __init __set_fixmap(enum fixed_addresses idx,
+  */
+ pgd_t swapper_pg_dir[_PTRS_PER_PGD] __section(".bss..swapper_pg_dir");
+ 
+-pgd_t invalid_pg_dir[_PTRS_PER_PGD] __page_aligned_bss;
++pgd_t invalid_pg_dir[_PTRS_PER_PGD] __section(".bss..page_aligned") __aligned(MMUPAGE_SIZE);
+ #ifndef __PAGETABLE_PUD_FOLDED
+-pud_t invalid_pud_table[PTRS_PER_PUD] __page_aligned_bss;
++pud_t invalid_pud_table[PTRS_PER_PUD] __section(".bss..page_aligned") __aligned(MMUPAGE_SIZE);
+ EXPORT_SYMBOL(invalid_pud_table);
+ #endif
+ #ifndef __PAGETABLE_PMD_FOLDED
+-pmd_t invalid_pmd_table[PTRS_PER_PMD] __page_aligned_bss;
++pmd_t invalid_pmd_table[PTRS_PER_PMD] __section(".bss..page_aligned") __aligned(MMUPAGE_SIZE);
+ EXPORT_SYMBOL(invalid_pmd_table);
+ #endif
+-pte_t invalid_pte_table[PTRS_PER_PTE] __page_aligned_bss;
++pte_t invalid_pte_table[PTRS_PER_PTE] __section(".bss..page_aligned") __aligned(MMUPAGE_SIZE);
+ EXPORT_SYMBOL(invalid_pte_table);
+ 
+ #if defined(CONFIG_EXECMEM) && defined(MODULES_VADDR)
+diff --git a/arch/loongarch/vdso/vdso.S b/arch/loongarch/vdso/vdso.S
+index 46789bade6ff..a0924bd2dbc7 100644
+--- a/arch/loongarch/vdso/vdso.S
++++ b/arch/loongarch/vdso/vdso.S
+@@ -13,10 +13,10 @@
+ 	__PAGE_ALIGNED_DATA
+ 
+ 	.globl vdso_start, vdso_end
+-	.balign PAGE_SIZE
++	.balign MMUPAGE_SIZE
+ vdso_start:
+ 	.incbin "arch/loongarch/vdso/vdso.so"
+-	.balign PAGE_SIZE
++	.balign MMUPAGE_SIZE
+ vdso_end:
+ 
+ 	.previous
+-- 
+2.54.0
+

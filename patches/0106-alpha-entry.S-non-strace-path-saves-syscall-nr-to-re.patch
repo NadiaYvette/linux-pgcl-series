@@ -1,0 +1,72 @@
+From 820901a7f007be990ce624773106113844ffe70f Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 10 May 2026 13:51:30 +0200
+Subject: [PATCH 106/174] alpha: entry.S non-strace path saves syscall nr to
+ regs->r1/r2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Commit 55b22075f7840 ("alpha: add support for SECCOMP and SECCOMP_FILTER")
+reworked entSys to consistently track the syscall state in regs->r1
+(current/mutable) and regs->r2 (original, preserved for restart).  It
+correctly populates both slots in the strace path (after
+syscall_trace_enter returns the possibly-modified nr) but the
+non-strace fast path -- the common case -- doesn't set them at all.
+sp+8 and sp+16 retain whatever PAL entry left in $1/$2.
+
+The syscall return path then loads $18 from sp+16 in $syscall_error
+to thread the original syscall nr through ret_from_sys_call →
+do_work_pending → do_signal as the C `r0` parameter.  When that
+loaded value happens to be zero (the common case if $2 was zero at
+PAL entry), do_signal()'s `if (r0)` guard skips the ERESTART
+restart/EINTR conversion entirely and ERESTARTSYS=512 leaks straight
+to userspace's errno on every signal-interrupted syscall.
+
+Reproduced on alpha LTP: every test that uses SAFE_WAITPID after the
+test framework installs SIGALRM/SIGINT/SIGTERM/SIGUSR1 handlers
+TBROK'd with "waitpid(N,...) failed: 512 (512)" and a kernel without
+this fix runs alpha LTP at 19p/55f/27s instead of the expected
+73p/1f/27s.
+
+Fix: in entSys, after SAVE_ALL, also store $0 (the PAL-provided
+syscall nr) into regs->r1 (sp+8) and regs->r2 (sp+16) BEFORE the
+strace branch, so both paths see the right values.  The strace path
+still updates sp+8 from syscall_trace_enter's return; sp+16 retains
+the original nr for restart, exactly as the seccomp commit's
+comments promised.
+
+After this fix:
+  alpha PGCL=4: LTP 74p/0f/27s
+  alpha PGCL=6: LTP 73p/1f/27s
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/alpha/kernel/entry.S | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/arch/alpha/kernel/entry.S b/arch/alpha/kernel/entry.S
+index 09c9042abde4..65fb010ad7cf 100644
+--- a/arch/alpha/kernel/entry.S
++++ b/arch/alpha/kernel/entry.S
+@@ -549,6 +549,17 @@ entSys:
+ 	stq	$17, SP_OFF+32($sp)
+ 	s8addq	$0, $5, $5
+ 	stq	$18, SP_OFF+40($sp)
++	/* Save the syscall number into regs->r1 (mutable) and regs->r2
++	 * (preserved for restart).  Without this the strace path sets
++	 * regs->r1 itself but the non-strace fast path leaves both slots
++	 * holding whatever PAL entry put in $1/$2 -- garbage from the
++	 * caller's perspective.  $syscall_error then loads $18 from
++	 * regs->r2 to drive ERESTART restart, and the garbage value
++	 * (often zero) suppresses do_signal()'s `if (r0)` ERESTART
++	 * conversion, leaking ERESTARTSYS=512 into userspace errno.
++	 */
++	stq	$0, 8($sp)		/* regs->r1 = current syscall nr */
++	stq	$0, 16($sp)		/* regs->r2 = original syscall nr */
+ 	.cfi_rel_offset	$16, SP_OFF+24
+ 	.cfi_rel_offset	$17, SP_OFF+32
+ 	.cfi_rel_offset	$18, SP_OFF+40
+-- 
+2.54.0
+

@@ -1,0 +1,59 @@
+From 0a6b966e3288edf829cbcc1f33a5247975470e00 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 10 Jun 2026 12:49:34 +0200
+Subject: [PATCH 132/174] mm/mincore: avoid 32-bit overflow of end in
+ do_mincore() under PGCL
+
+do_mincore() computes the walk end as
+
+    end = min(vma->vm_end, addr + (pages << MMUPAGE_SHIFT));
+
+where pages can be as large as PAGE_SIZE entries (one __get_free_page
+buffer's worth). On a 32-bit kernel with page clustering enabled the
+shift PAGE_SIZE << MMUPAGE_SHIFT is (1 << PAGE_SHIFT) << MMUPAGE_SHIFT;
+at e.g. m68k PAGE_SHIFT=18 (PAGE_MMUSHIFT=6) that is a 1 GiB span. For a
+high mapping (addr near the top of the 32-bit address space) addr + span
+wraps below vma->vm_end, so the min() picks the wrapped value and
+walk_page_range() is handed start > end, returning -EINVAL instead of the
+expected -ENOMEM.
+
+LTP mincore01 setup4 hits exactly this: it calls mincore() with
+len = RLIMIT_AS - addr + pagesize and expects ENOMEM, but gets EINVAL.
+Mainline never trips it because the per-iteration chunk is only
+PAGE_SIZE entries * PAGE_SIZE = 16 MiB and does not wrap.
+
+Saturate the addition on overflow so the subsequent min() always yields
+a sane end.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ mm/mincore.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/mm/mincore.c b/mm/mincore.c
+index f7a497510b4a..85f045abb828 100644
+--- a/mm/mincore.c
++++ b/mm/mincore.c
+@@ -254,7 +254,18 @@ static long do_mincore(unsigned long addr, unsigned long pages, unsigned char *v
+ 	vma = vma_lookup(current->mm, addr);
+ 	if (!vma)
+ 		return -ENOMEM;
+-	end = min(vma->vm_end, addr + (pages << MMUPAGE_SHIFT));
++	/*
++	 * pages << MMUPAGE_SHIFT can be as large as
++	 * PAGE_SIZE << MMUPAGE_SHIFT = (1 << PAGE_SHIFT) << MMUPAGE_SHIFT,
++	 * which on PGCL=6 / 32-bit (e.g. m68k PAGE_SHIFT=18) is 1 GiB
++	 * — easily overflows addr + size to wrap below vma->vm_end.
++	 * Saturate on overflow so the subsequent min() yields a sane end.
++	 */
++	end = addr + (pages << MMUPAGE_SHIFT);
++	if (end < addr)
++		end = vma->vm_end;
++	else
++		end = min(vma->vm_end, end);
+ 	if (!can_do_mincore(vma)) {
+ 		unsigned long pages = DIV_ROUND_UP(end - addr, MMUPAGE_SIZE);
+ 		memset(vec, 1, pages);
+-- 
+2.54.0
+

@@ -1,0 +1,53 @@
+From c03f7b1b4b743ea9add9d01d31ddc26dde6dad4a Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 9 May 2026 21:43:36 +0200
+Subject: [PATCH 101/174] vmlinux.lds.h: align .text.hot at MMUPAGE
+ granularity, not PAGE_SIZE
+
+The TEXT_TEXT macro inserts a `. = ALIGN(PAGE_SIZE)` before TEXT_HOT to
+put .text.hot at a TLB-page boundary (locality optimization).  The TLB
+operates on hardware MMU pages -- MMUPAGE_SIZE -- not on the kernel's
+allocation-granularity PAGE_SIZE, so MMUPAGE_SIZE is the right
+alignment.  Without PGCL the two are equal and behavior is unchanged;
+with PGCL the slack here can be up to PAGE_SIZE - 1 bytes, which on
+parisc/PGCL=6 was big enough by itself to be a problem (combined with
+similar PAGE_SIZE alignments in arch code).
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ include/asm-generic/vmlinux.lds.h | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 60c8c22fd3e4..a286823fe29a 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -559,6 +559,16 @@
+ 	__end_rodata = .;
+ 
+ 
++/*
++ * Place .text.hot at a TLB-page boundary for the locality benefit.  The
++ * alignment is what's needed by the MMU, not what the kernel uses for its
++ * page allocator, so MMUPAGE_SIZE is the right granularity: under page
++ * clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE can be many MMU-pages, and
++ * aligning on it wastes up to PAGE_SIZE - 1 bytes here -- enough on
++ * parisc/PGCL=6 to push the trap-vector branch to intr_extint past the
++ * 19-bit displacement field.
++ */
++
+ /*
+  * Non-instrumentable text section
+  */
+@@ -603,7 +613,7 @@
+ 		*(.text.unknown .text.unknown.*)			\
+ 		TEXT_SPLIT						\
+ 		TEXT_UNLIKELY						\
+-		. = ALIGN(PAGE_SIZE);					\
++		. = ALIGN(MMUPAGE_SIZE);				\
+ 		TEXT_HOT						\
+ 		*(TEXT_MAIN .text.fixup)				\
+ 		NOINSTR_TEXT						\
+-- 
+2.54.0
+

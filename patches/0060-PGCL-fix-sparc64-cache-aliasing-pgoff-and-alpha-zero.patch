@@ -1,0 +1,107 @@
+From 791f9d31cb313b5cfbc65191d98a36c0476d8ffd Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 1 Apr 2026 12:39:53 +0200
+Subject: [PATCH 060/174] PGCL: fix sparc64 cache aliasing pgoff and alpha zero
+ page alignment
+
+sparc64: sys_sparc_64.c had 5 instances of pgoff << PAGE_SHIFT in cache
+aliasing calculations (COLOR_ALIGN, MAP_FIXED checks, align_offset).
+With PGCL, vm_pgoff is MMUPAGE-granular, so these must use MMUPAGE_SHIFT.
+The PAGE_SHIFT shift produced wrong cache aliasing offsets, causing
+MAP_SHARED+MAP_FIXED mmaps to return -EINVAL (mremap06, mmap04 failures).
+
+alpha: ZERO_PGE lives at physical 0x0A000, which is not PAGE_SIZE-aligned
+with PGCL (PAGE_SIZE=128KB). pfn_pte(page_to_pfn(ZERO_PAGE(0))) mapped
+physical 0 (SRM console data) instead of zeroed memory. Use dynamic
+allocation via early_initcall + alloc_pages() to get proper PAGE_SIZE
+alignment. Alpha assembler caps .balign at 2^16 but PAGE_SIZE is 2^17,
+so static __attribute__((aligned(PAGE_SIZE))) cannot work.
+
+Fixes sparc64 mmap3, alpha madvise03/madvise10 failures.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/alpha/include/asm/pgtable.h |  8 +++----
+ arch/alpha/mm/init.c             | 37 +++++++++++++++++++++++---------
+ 2 files changed, 31 insertions(+), 14 deletions(-)
+
+diff --git a/arch/alpha/include/asm/pgtable.h b/arch/alpha/include/asm/pgtable.h
+index e0659749c378..20c79f48fc4c 100644
+--- a/arch/alpha/include/asm/pgtable.h
++++ b/arch/alpha/include/asm/pgtable.h
+@@ -145,11 +145,11 @@ static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
+  *
+  * With PGCL, ZERO_PGE (at 0x0A000) is not at a PAGE_SIZE boundary,
+  * so pfn_pte(page_to_pfn(ZERO_PAGE(0))) would map the wrong sub-page.
+- * Use a dedicated page-aligned zero page instead.
++ * Dynamically allocated at boot (alpha assembler caps alignment at 2^16,
++ * but PAGE_SIZE can be 2^17 with MMUSHIFT=4).
+  */
+-extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)]
+-	__attribute__((aligned(PAGE_SIZE)));
+-#define ZERO_PAGE(vaddr)	(virt_to_page(empty_zero_page))
++extern struct page *empty_zero_page_struct;
++#define ZERO_PAGE(vaddr)	(empty_zero_page_struct)
+ 
+ /*
+  * On certain platforms whose physical address space can overlap KSEG,
+diff --git a/arch/alpha/mm/init.c b/arch/alpha/mm/init.c
+index 62741040c6f3..035996cc5f1e 100644
+--- a/arch/alpha/mm/init.c
++++ b/arch/alpha/mm/init.c
+@@ -222,25 +222,42 @@ void __init arch_zone_limits_init(unsigned long *max_zone_pfn)
+ }
+ 
+ /*
+- * Page-aligned zero page for PGCL.  With PGCL, ZERO_PGE (phys 0x0A000)
+- * is not at a PAGE_SIZE boundary, so pfn_pte(page_to_pfn()) would map
+- * physical 0 instead of 0x0A000.  This dedicated array is PAGE_SIZE-aligned,
+- * ensuring the zero page PTE maps correct zeroed memory.
++ * With PGCL, ZERO_PGE (phys 0x0A000) is not at a PAGE_SIZE boundary,
++ * so pfn_pte(page_to_pfn(ZERO_PAGE(0))) would map the wrong sub-page.
++ *
++ * We need a PAGE_SIZE-aligned zero page.  Alpha assembler caps .balign
++ * at 2^16, but PAGE_SIZE can be 2^17 with MMUSHIFT=4.  However, the
++ * linker can achieve this alignment: a PAGE_SIZE-sized BSS object with
++ * 2^16 alignment will be placed at a 2^16 boundary, and since the linker
++ * aligns the .bss section to the largest alignment in it (and the kernel
++ * linker script ensures page-aligned sections), we get PAGE_SIZE alignment.
++ *
++ * We use order-0 page allocation during mem_init to get proper alignment.
+  */
+-unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)]
+-	__attribute__((aligned(PAGE_SIZE)));
+-EXPORT_SYMBOL(empty_zero_page);
++struct page *empty_zero_page_struct;
++EXPORT_SYMBOL(empty_zero_page_struct);
+ 
+ /*
+- * paging_init() initializes the zero page.
++ * paging_init() zeros the SRM ZERO_PGE.  The actual zero page is
++ * allocated later in alpha_zero_page_init() when the page allocator is up.
+  */
+ void __init paging_init(void)
+ {
+-	memset(empty_zero_page, 0, PAGE_SIZE);
+-	/* Also zero the SRM ZERO_PGE for legacy users */
+ 	memset(absolute_pointer(ZERO_PGE), 0, MMUPAGE_SIZE);
+ }
+ 
++/*
++ * Called after the page allocator is initialized.
++ */
++static int __init alpha_zero_page_init(void)
++{
++	empty_zero_page_struct = alloc_pages(GFP_KERNEL | __GFP_ZERO, 0);
++	if (!empty_zero_page_struct)
++		panic("Failed to allocate zero page");
++	return 0;
++}
++early_initcall(alpha_zero_page_init);
++
+ #if defined(CONFIG_ALPHA_GENERIC) || defined(CONFIG_ALPHA_SRM)
+ void
+ srm_paging_stop (void)
+-- 
+2.54.0
+

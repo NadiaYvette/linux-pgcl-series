@@ -1,0 +1,94 @@
+From a69c1d06df901714b5fe9e0f2188b133562eef74 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 29 Apr 2026 07:27:43 +0200
+Subject: [PATCH 075/174] microblaze: fix THREAD_SIZE_ORDER vs THREAD_SIZE
+ mismatch with PGCL
+
+The microblaze stack allocator uses THREAD_SIZE_ORDER PAGE_SIZE pages,
+but THREAD_SIZE is the mask used by current_thread_info() to find
+thread_info from any stack pointer.  These two must agree, or the
+mask returns a stale boundary that is not the start of the stack
+allocation.
+
+Without PGCL: PAGE_SIZE = 4KB, THREAD_SIZE_ORDER = 1, so 8KB
+allocation, and THREAD_SIZE = 8KB matches.
+
+With PGCL (PAGE_MMUSHIFT > 0): PAGE_SIZE = 64KB, THREAD_SIZE_ORDER = 1,
+so 128KB allocation; the hardcoded 8KB THREAD_SIZE then gives a mask
+that lands well above the actual thread_info, returning a pointer to
+random pre-thread_info memory.  do_notify_resume() and other code
+that reads current_thread_info()->flags then reads garbage and
+diverges into unintended kernel paths (often a kernel page fault and
+panic).
+
+Switch microblaze to PAGE_SIZE-based stack when PGCL is on:
+THREAD_SHIFT = PAGE_SHIFT, THREAD_SIZE = PAGE_SIZE, allocation
+order 0 (one PAGE).  The traditional 8KB-out-of-two-4KB-pages stack
+remains the default without PGCL.
+
+Also un-#if-0 the diagnostic pr_warn in full_exception() so kernel-
+mode exceptions are always logged with type/FSR/PC/ESR.  This was
+gated behind #if 0 historically but is invaluable for debugging
+exception storms (especially before console init, where it lands
+in the printk ring buffer for inspection).
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/microblaze/include/asm/thread_info.h | 21 ++++++++++++++++++++-
+ arch/microblaze/kernel/exceptions.c       |  2 --
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/arch/microblaze/include/asm/thread_info.h b/arch/microblaze/include/asm/thread_info.h
+index 0153f7c2717c..5e326eae05c2 100644
+--- a/arch/microblaze/include/asm/thread_info.h
++++ b/arch/microblaze/include/asm/thread_info.h
+@@ -8,10 +8,29 @@
+ 
+ #ifdef __KERNEL__
+ 
+-/* we have 8k stack */
++#include <vdso/page.h>
++
++/*
++ * Thread stack is allocated as (1 << THREAD_SIZE_ORDER) PAGE_SIZE pages,
++ * but THREAD_SIZE is the mask used to find thread_info from any stack
++ * pointer.  These must agree, otherwise current_thread_info() returns
++ * a stale boundary that is not the start of the allocation.
++ *
++ * For PGCL kernels (PAGE_MMUSHIFT > 0) PAGE_SIZE is larger than the
++ * MMUPAGE, and a single PAGE already exceeds the 8K stack we want.
++ * Use PAGE_SIZE for both so the mask matches the allocation; the small
++ * waste is harmless on a 128MB target.  Without PGCL keep the
++ * traditional 8K stack out of two 4K pages.
++ */
++#if PAGE_MMUSHIFT > 0
++#define THREAD_SHIFT		PAGE_SHIFT
++#define THREAD_SIZE		PAGE_SIZE
++#define THREAD_SIZE_ORDER	0
++#else
+ #define THREAD_SHIFT		13
+ #define THREAD_SIZE		(1 << THREAD_SHIFT)
+ #define THREAD_SIZE_ORDER	1
++#endif
+ 
+ #ifndef __ASSEMBLER__
+ # include <linux/types.h>
+diff --git a/arch/microblaze/kernel/exceptions.c b/arch/microblaze/kernel/exceptions.c
+index fd153d5fab98..032752c4dbab 100644
+--- a/arch/microblaze/kernel/exceptions.c
++++ b/arch/microblaze/kernel/exceptions.c
+@@ -71,11 +71,9 @@ asmlinkage void full_exception(struct pt_regs *regs, unsigned int type,
+ {
+ 	addr = regs->pc;
+ 
+-#if 0
+ 	pr_warn("Exception %02x in %s mode, FSR=%08x PC=%08x ESR=%08x\n",
+ 			type, user_mode(regs) ? "user" : "kernel", fsr,
+ 			(unsigned int) regs->pc, (unsigned int) regs->esr);
+-#endif
+ 
+ 	switch (type & 0x1F) {
+ 	case MICROBLAZE_ILL_OPCODE_EXCEPTION:
+-- 
+2.54.0
+

@@ -1,0 +1,66 @@
+From f5ba70d080cfc1fde94145f2c94bdb0d13ea05a5 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 10 Jun 2026 17:58:30 +0200
+Subject: [PATCH 135/174] mm/shmem: scale default tmpfs max_inodes by
+ PAGE_MMUCOUNT under PGCL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+shmem_default_max_inodes() derives the default tmpfs inode budget from
+totalram_pages(). Under page clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE is
+PAGE_MMUCOUNT times the hardware base page, so totalram_pages() — a count
+of large cluster pages — is PAGE_MMUCOUNT times smaller than the base-page
+count. The inode budget shrinks with it: on a 512MB m68k at
+PAGE_MMUSHIFT=6 (256KB pages) the default max_inodes drops to ~960 instead
+of ~60000.
+
+An inode's footprint (BOGO_INODE_SIZE = 1024 bytes) is independent of
+PAGE_SIZE, so counting the budget in cluster pages is wrong and needlessly
+starves tmpfs of inodes. File-heavy workloads then hit ENOSPC far below
+where they should: LTP fork09 opens files until EMFILE (the fd limit, the
+documented stop condition) but instead gets ENOSPC at ~1002 files and
+reports TBROK.
+
+Count the budget in MMUPAGE (hardware base page) units so it tracks actual
+memory; identical to current behaviour when PAGE_MMUSHIFT == 0.
+max_blocks() is left unchanged: it is a byte-size limit expressed in
+PAGE-sized blocks, so totalram_pages()/2 already caps tmpfs at half of RAM
+regardless of page size.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ mm/shmem.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 6cfca69bfbae..6ea92d20dc11 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -150,9 +150,21 @@ static unsigned long shmem_default_max_blocks(void)
+ 
+ static unsigned long shmem_default_max_inodes(void)
+ {
+-	unsigned long nr_pages = totalram_pages();
++	/*
++	 * The default inode budget is a file count, and an inode's footprint
++	 * (BOGO_INODE_SIZE) is independent of PAGE_SIZE.  totalram_pages()
++	 * counts kernel pages, which under page clustering (PAGE_MMUSHIFT > 0)
++	 * are PAGE_MMUCOUNT times larger than the hardware base page; counting
++	 * the budget in those large pages starves tmpfs of inodes (e.g. ~960
++	 * instead of ~60000 on a 512MB box at PAGE_MMUSHIFT=6), making file-
++	 * heavy workloads hit ENOSPC long before the fd limit.  Count in
++	 * MMUPAGE units so the budget tracks real memory; identity when
++	 * PAGE_MMUSHIFT == 0.
++	 */
++	unsigned long nr_pages = totalram_pages() << PAGE_MMUSHIFT;
++	unsigned long nr_high = totalhigh_pages() << PAGE_MMUSHIFT;
+ 
+-	return min3(nr_pages - totalhigh_pages(), nr_pages / 2,
++	return min3(nr_pages - nr_high, nr_pages / 2,
+ 			ULONG_MAX / BOGO_INODE_SIZE);
+ }
+ #endif
+-- 
+2.54.0
+

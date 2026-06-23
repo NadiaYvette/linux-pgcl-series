@@ -1,0 +1,515 @@
+From da97fbb915700293350f3c324028ac7399b71b34 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Mon, 23 Mar 2026 15:08:53 +0100
+Subject: [PATCH 039/174] =?UTF-8?q?PGCL:=20hppa32/hppa64/riscv32=20PAGE=5F?=
+ =?UTF-8?q?MMUSHIFT=3D4=20boot=20=E2=80=94=2015/15=20pgcl-test=20+=208/8?=
+ =?UTF-8?q?=20pgcl-stress=20PASS?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PA-RISC (hppa32 + hppa64):
+- Page table geometry: PLD_SHIFT=MMUPAGE_SHIFT (4KB hardware pages), giving
+  1024 PTEs per MMUPAGE-sized table. BITS_PER_PTE, BITS_PER_PMD, BITS_PER_PGD
+  all derive from MMUPAGE_SHIFT.
+- inventory.c pagezero_memconfig: PDC firmware reports memory in bytes;
+  set_pmem_entry expects 4KB page count. Was converting bytes>>PAGE_SHIFT
+  (kernel pages), causing double conversion (512MB→32MB). Fix: MMUPAGE_SHIFT.
+- entry.S TLB miss handler: PTE table index extraction and offset clearing
+  use ASM_PLD_SHIFT (=MMUPAGE_SHIFT) instead of PAGE_SHIFT.
+- head.S early page table setup: PGD stride and PFN calculations use
+  MMUPAGE_SIZE/MMUPAGE_SHIFT for 4KB hardware page granularity.
+- pgtable.h PTE encoding: pfn_pte/pte_pfn use PAGE_SHIFT (PAGE-granular PFN).
+  set_ptes PGCL loop writes PAGE_MMUCOUNT sub-page PTEs per kernel page.
+  PAGE_ADD_SHIFT=0 (PTE already stores 4KB-granular physical address).
+- fixmap.h: FIXMAP_SIZE and __fix_to_virt use MMUPAGE_SHIFT (hardware pages).
+- init.c map_pages: PTE index, address stride use MMUPAGE granularity.
+  Gateway page mapping uses MMUPAGE_MASK/MMUPAGE_SIZE.
+- sys_parisc.c: 9 MMUPAGE fixes for mmap alignment, color alignment,
+  stack randomization, shared memory offset calculations.
+- shmparam.h: SHMLBA=MMUPAGE_SIZE (hardware cache alias granularity).
+- cache.c flush_kernel_dcache_range_asm: MMUPAGE_SIZE stride.
+
+RISC-V 32-bit:
+- pgtable.h FIXADDR_TOP: PGDIR-aligned on rv32 so FDT early mapping via
+  PGDIR_SIZE superpages calculates dtb_early_va correctly.
+- patch.c text patching: Use page_to_phys() instead of __pa() for vmalloc
+  addresses; chunk size MMUPAGE_SIZE for fixmap granularity.
+
+Generic:
+- pgtable.h: Move __phys_to_pte_val default before set_ptes (no functional
+  change, allows arch-specific set_ptes to reference it).
+
+Tested: hppa32 (QEMU B160L, nosmp), hppa64 (QEMU C3700, SMP=4, 32-bit
+compat), riscv32 (QEMU virt, SMP=4). All 23/23 PASS, zero kernel warnings.
+13 architectures now boot with PAGE_MMUSHIFT=4.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/parisc/include/asm/fixmap.h   |  4 +--
+ arch/parisc/include/asm/pgtable.h  | 49 ++++++++++++++++++++----------
+ arch/parisc/include/asm/shmparam.h |  2 +-
+ arch/parisc/kernel/asm-offsets.c   |  1 +
+ arch/parisc/kernel/cache.c         |  4 +--
+ arch/parisc/kernel/entry.S         | 10 +++---
+ arch/parisc/kernel/head.S          |  6 ++--
+ arch/parisc/kernel/inventory.c     |  3 +-
+ arch/parisc/kernel/sys_parisc.c    | 16 +++++-----
+ arch/parisc/mm/init.c              | 15 ++++-----
+ arch/riscv/include/asm/pgtable.h   | 10 ++++++
+ arch/riscv/kernel/patch.c          | 14 ++++++---
+ include/linux/pgtable.h            |  2 +-
+ 13 files changed, 86 insertions(+), 50 deletions(-)
+
+diff --git a/arch/parisc/include/asm/fixmap.h b/arch/parisc/include/asm/fixmap.h
+index 9cafa449c4a7..c4d69518d611 100644
+--- a/arch/parisc/include/asm/fixmap.h
++++ b/arch/parisc/include/asm/fixmap.h
+@@ -31,7 +31,7 @@
+ #define TMPALIAS_SIZE_BITS	22	/* 4 MB */
+ #define TMPALIAS_MAP_START	((__PAGE_OFFSET) - (2 << TMPALIAS_SIZE_BITS))
+ 
+-#define FIXMAP_SIZE		(FIX_BITMAP_COUNT << PAGE_SHIFT)
++#define FIXMAP_SIZE		(FIX_BITMAP_COUNT << MMUPAGE_SHIFT)
+ #define FIXMAP_START		(TMPALIAS_MAP_START - FIXMAP_SIZE)
+ /* This is the kernel area for all maps (vmalloc, dma etc.)  most
+  * usually, it extends up to TMPALIAS_MAP_START.  Virtual addresses
+@@ -54,7 +54,7 @@ extern void *parisc_vmalloc_start;
+ #define VMALLOC_START		((unsigned long)parisc_vmalloc_start)
+ #define VMALLOC_END		(KERNEL_MAP_END)
+ 
+-#define __fix_to_virt(_x) (FIXMAP_START + ((_x) << PAGE_SHIFT))
++#define __fix_to_virt(_x) (FIXMAP_START + ((_x) << MMUPAGE_SHIFT))
+ 
+ void set_fixmap(enum fixed_addresses idx, phys_addr_t phys);
+ void clear_fixmap(enum fixed_addresses idx);
+diff --git a/arch/parisc/include/asm/pgtable.h b/arch/parisc/include/asm/pgtable.h
+index 467b8547ac8b..f0841f82f360 100644
+--- a/arch/parisc/include/asm/pgtable.h
++++ b/arch/parisc/include/asm/pgtable.h
+@@ -102,9 +102,9 @@ extern void __update_cache(pte_t pte);
+ /* Definitions for 3rd level (we use PLD here for Page Lower directory
+  * because PTE_SHIFT is used lower down to mean shift that has to be
+  * done to get usable bits out of the PTE) */
+-#define PLD_SHIFT	PAGE_SHIFT
+-#define PLD_SIZE	PAGE_SIZE
+-#define BITS_PER_PTE	(PAGE_SHIFT - BITS_PER_PTE_ENTRY)
++#define PLD_SHIFT	MMUPAGE_SHIFT
++#define PLD_SIZE	MMUPAGE_SIZE
++#define BITS_PER_PTE	(MMUPAGE_SHIFT - BITS_PER_PTE_ENTRY)
+ #define PTRS_PER_PTE    (1UL << BITS_PER_PTE)
+ 
+ /* Definitions for 2nd level */
+@@ -112,7 +112,7 @@ extern void __update_cache(pte_t pte);
+ #define PMD_SHIFT       (PLD_SHIFT + BITS_PER_PTE)
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+-#define BITS_PER_PMD	(PAGE_SHIFT + PMD_TABLE_ORDER - BITS_PER_PMD_ENTRY)
++#define BITS_PER_PMD	(MMUPAGE_SHIFT + PMD_TABLE_ORDER - BITS_PER_PMD_ENTRY)
+ #define PTRS_PER_PMD    (1UL << BITS_PER_PMD)
+ #else
+ #define BITS_PER_PMD	0
+@@ -120,10 +120,10 @@ extern void __update_cache(pte_t pte);
+ 
+ /* Definitions for 1st level */
+ #define PGDIR_SHIFT	(PLD_SHIFT + BITS_PER_PTE + BITS_PER_PMD)
+-#if (PGDIR_SHIFT + PAGE_SHIFT + PGD_TABLE_ORDER - BITS_PER_PGD_ENTRY) > BITS_PER_LONG
++#if (PGDIR_SHIFT + MMUPAGE_SHIFT + PGD_TABLE_ORDER - BITS_PER_PGD_ENTRY) > BITS_PER_LONG
+ #define BITS_PER_PGD	(BITS_PER_LONG - PGDIR_SHIFT)
+ #else
+-#define BITS_PER_PGD	(PAGE_SHIFT + PGD_TABLE_ORDER - BITS_PER_PGD_ENTRY)
++#define BITS_PER_PGD	(MMUPAGE_SHIFT + PGD_TABLE_ORDER - BITS_PER_PGD_ENTRY)
+ #endif
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+ #define PGDIR_MASK	(~(PGDIR_SIZE-1))
+@@ -203,7 +203,7 @@ extern void __update_cache(pte_t pte);
+ #define _PAGE_SPECIAL  (1 << xlate_pabit(_PAGE_SPECIAL_BIT))
+ 
+ #define _PAGE_TABLE	(_PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE | _PAGE_DIRTY | _PAGE_ACCESSED)
+-#define _PAGE_CHG_MASK	(PAGE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_SPECIAL)
++#define _PAGE_CHG_MASK	(MMUPAGE_MASK | _PAGE_ACCESSED | _PAGE_DIRTY | _PAGE_SPECIAL)
+ #define _PAGE_KERNEL_RO	(_PAGE_PRESENT | _PAGE_READ | _PAGE_DIRTY | _PAGE_ACCESSED)
+ #define _PAGE_KERNEL_EXEC	(_PAGE_KERNEL_RO | _PAGE_EXEC)
+ #define _PAGE_KERNEL_RWX	(_PAGE_KERNEL_EXEC | _PAGE_WRITE)
+@@ -327,11 +327,20 @@ static inline pte_t pte_mkspecial(pte_t pte)	{ pte_val(pte) |= _PAGE_SPECIAL; re
+ #endif
+ 
+ 
++/*
++ * With PGCL, the PTE stores the full physical address at MMUPAGE (4KB)
++ * granularity: phys_addr | flags.  Bits 12+ hold the physical address,
++ * bits 0-11 hold flags.  Sub-page bits (12 to PAGE_SHIFT-1) distinguish
++ * MMUPAGEs within a kernel page.  __phys_to_pte_val is identity.
++ *
++ * pfn is PAGE-granular (phys >> PAGE_SHIFT), so pfn_pte shifts by
++ * PAGE_SHIFT to reconstruct the physical address.
++ */
+ #define __mk_pte(addr,pgprot) \
+ ({									\
+ 	pte_t __pte;							\
+ 									\
+-	pte_val(__pte) = ((((addr)>>PAGE_SHIFT)<<PFN_PTE_SHIFT) + pgprot_val(pgprot));	\
++	pte_val(__pte) = (((addr) & MMUPAGE_MASK) + pgprot_val(pgprot));\
+ 									\
+ 	__pte;								\
+ })
+@@ -339,7 +348,7 @@ static inline pte_t pte_mkspecial(pte_t pte)	{ pte_val(pte) |= _PAGE_SPECIAL; re
+ static inline pte_t pfn_pte(unsigned long pfn, pgprot_t pgprot)
+ {
+ 	pte_t pte;
+-	pte_val(pte) = (pfn << PFN_PTE_SHIFT) | pgprot_val(pgprot);
++	pte_val(pte) = (pfn << PAGE_SHIFT) | pgprot_val(pgprot);
+ 	return pte;
+ }
+ 
+@@ -348,7 +357,7 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
+ 
+ /* Permanent address of a page.  On parisc we don't have highmem. */
+ 
+-#define pte_pfn(x)		(pte_val(x) >> PFN_PTE_SHIFT)
++#define pte_pfn(x)		(pte_val(x) >> PAGE_SHIFT)
+ 
+ #define pte_page(pte)		(pfn_to_page(pte_pfn(pte)))
+ 
+@@ -370,14 +379,22 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ {
+ 	if (pte_present(pte) && pte_user(pte))
+ 		__update_cache(pte);
+-	for (;;) {
++	if (nr == 1) {
++		/* Single PTE: caller already set up sub-page offset */
+ 		*ptep = pte;
+ 		purge_tlb_entries(mm, addr);
+-		if (--nr == 0)
+-			break;
+-		ptep++;
+-		pte_val(pte) += 1 << PFN_PTE_SHIFT;
+-		addr += PAGE_SIZE;
++	} else {
++		unsigned int i;
++		for (i = 0; i < nr; i++) {
++			unsigned int j;
++			for (j = 0; j < PAGE_MMUCOUNT; j++) {
++				*ptep = __pte(pte_val(pte) + j * MMUPAGE_SIZE);
++				purge_tlb_entries(mm, addr);
++				ptep++;
++				addr += MMUPAGE_SIZE;
++			}
++			pte_val(pte) += PAGE_SIZE;
++		}
+ 	}
+ }
+ #define set_ptes set_ptes
+diff --git a/arch/parisc/include/asm/shmparam.h b/arch/parisc/include/asm/shmparam.h
+index 5a95b0f62b87..a6ef2fa8b1fc 100644
+--- a/arch/parisc/include/asm/shmparam.h
++++ b/arch/parisc/include/asm/shmparam.h
+@@ -17,7 +17,7 @@
+  * mapped to the same physical address, the virtual and physical
+  * addresses modulo SHM_COLOUR are identical.
+  */
+-#define SHMLBA	   PAGE_SIZE	/* attach addr a multiple of this */
++#define SHMLBA	   MMUPAGE_SIZE	/* attach addr a multiple of this */
+ #define SHM_COLOUR 0x00400000	/* shared mappings colouring */
+ 
+ #endif /* _ASMPARISC_SHMPARAM_H */
+diff --git a/arch/parisc/kernel/asm-offsets.c b/arch/parisc/kernel/asm-offsets.c
+index 3de4b5933b10..8248eee73c58 100644
+--- a/arch/parisc/kernel/asm-offsets.c
++++ b/arch/parisc/kernel/asm-offsets.c
+@@ -261,6 +261,7 @@ int main(void)
+ 	DEFINE(TIF_32BIT_PA_BIT, 31-TIF_32BIT);
+ 
+ 	BLANK();
++	DEFINE(ASM_PLD_SHIFT, PLD_SHIFT);
+ 	DEFINE(ASM_PMD_SHIFT, PMD_SHIFT);
+ 	DEFINE(ASM_PGDIR_SHIFT, PGDIR_SHIFT);
+ 	DEFINE(ASM_BITS_PER_PGD, BITS_PER_PGD);
+diff --git a/arch/parisc/kernel/cache.c b/arch/parisc/kernel/cache.c
+index 0170b69a21d3..67ae0a7412d3 100644
+--- a/arch/parisc/kernel/cache.c
++++ b/arch/parisc/kernel/cache.c
+@@ -849,12 +849,12 @@ void flush_cache_vmap(unsigned long start, unsigned long end)
+ 	/* The physical addresses of IOREMAP regions are contiguous */
+ 	if (vm->flags & VM_IOREMAP) {
+ 		physaddr = vm->phys_addr;
+-		for (addr = start; addr < end; addr += PAGE_SIZE) {
++		for (addr = start; addr < end; addr += MMUPAGE_SIZE) {
+ 			preempt_disable();
+ 			flush_dcache_page_asm(physaddr, start);
+ 			flush_icache_page_asm(physaddr, start);
+ 			preempt_enable();
+-			physaddr += PAGE_SIZE;
++			physaddr += MMUPAGE_SIZE;
+ 		}
+ 		return;
+ 	}
+diff --git a/arch/parisc/kernel/entry.S b/arch/parisc/kernel/entry.S
+index e04c5d806c10..2941109e9853 100644
+--- a/arch/parisc/kernel/entry.S
++++ b/arch/parisc/kernel/entry.S
+@@ -397,8 +397,8 @@
+ 	bb,>=,n		\pmd,_PxD_PRESENT_BIT,\fault
+ 	dep		%r0,31,PxD_FLAG_SHIFT,\pmd /* clear flags */
+ 	SHLREG		\pmd,PxD_VALUE_SHIFT,\pmd
+-	extru_safe	\va,31-PAGE_SHIFT,ASM_BITS_PER_PTE,\index
+-	dep		%r0,31,PAGE_SHIFT,\pmd  /* clear offset */
++	extru_safe	\va,31-ASM_PLD_SHIFT,ASM_BITS_PER_PTE,\index
++	dep		%r0,31,ASM_PLD_SHIFT,\pmd  /* clear offset within MMUPAGE-sized PTE table */
+ 	shladd		\index,BITS_PER_PTE_ENTRY,\pmd,\pmd /* pmd is now pte */
+ 	.endm
+ 
+@@ -471,9 +471,9 @@
+ 	 * - 38 to 52-bit Physical Page Number
+ 	 * - 12 to 26-bit page offset
+ 	 */
+-	/* bitshift difference between a PFN (based on kernel's PAGE_SIZE)
+-	 * to a CPU TLB 4k PFN (4k => 12 bits to shift) */
+-	#define PAGE_ADD_SHIFT		(PAGE_SHIFT-12)
++	/* PTE stores physical address at 4KB (MMUPAGE) granularity in bits 12+.
++	 * No additional shift needed to convert PTE PFN to TLB 4K PFN. */
++	#define PAGE_ADD_SHIFT		(MMUPAGE_SHIFT-12)
+ 	#define PAGE_ADD_HUGE_SHIFT	(REAL_HPAGE_SHIFT-12)
+ 	#define PFN_START_BIT	(63-ASM_PFN_PTE_SHIFT+(63-58)-PAGE_ADD_SHIFT)
+ 
+diff --git a/arch/parisc/kernel/head.S b/arch/parisc/kernel/head.S
+index 9188c8d87437..51e834b69b94 100644
+--- a/arch/parisc/kernel/head.S
++++ b/arch/parisc/kernel/head.S
+@@ -137,7 +137,7 @@ $cpu_ok:
+ 
+ 1:
+ 	stw		%r3,0(%r4)
+-	ldo		(PAGE_SIZE >> PxD_VALUE_SHIFT)(%r3),%r3
++	ldo		(MMUPAGE_SIZE >> PxD_VALUE_SHIFT)(%r3),%r3
+ 	addib,>		-1,%r1,1b
+ #if CONFIG_PGTABLE_LEVELS == 3
+ 	ldo             ASM_PMD_ENTRY_SIZE(%r4),%r4
+@@ -149,9 +149,9 @@ $cpu_ok:
+ 	/* Now initialize the PTEs themselves.  We use RWX for
+ 	 * everything ... it will get remapped correctly later */
+ 	ldo		0+_PAGE_KERNEL_RWX(%r0),%r3 /* Hardwired 0 phys addr start */
+-	load32		(1<<(KERNEL_INITIAL_ORDER-PAGE_SHIFT)),%r11 /* PFN count */
++	load32		(1<<(KERNEL_INITIAL_ORDER-MMUPAGE_SHIFT)),%r11 /* PFN count */
+ 	load32		PA(_end),%r1
+-	SHRREG		%r1,PAGE_SHIFT,%r1  /* %r1 is PFN count for _end symbol */
++	SHRREG		%r1,MMUPAGE_SHIFT,%r1  /* %r1 is PFN count for _end symbol */
+ 	cmpb,<<,n	%r11,%r1,1f
+ 	copy		%r1,%r11	/* %r1 PFN count smaller than %r11 */
+ 1:	load32		PA(pg0),%r1
+diff --git a/arch/parisc/kernel/inventory.c b/arch/parisc/kernel/inventory.c
+index 103f58dac948..030acd6449e0 100644
+--- a/arch/parisc/kernel/inventory.c
++++ b/arch/parisc/kernel/inventory.c
+@@ -164,7 +164,8 @@ static void __init pagezero_memconfig(void)
+ 	 * should be done.
+ 	 */
+ 
+-	npages = (PAGE_ALIGN(PAGE0->imm_max_mem) >> PAGE_SHIFT);
++	/* imm_max_mem is in bytes; set_pmem_entry expects 4KB (MMUPAGE) page count */
++	npages = (MMUPAGE_ALIGN(PAGE0->imm_max_mem) >> MMUPAGE_SHIFT);
+ 	set_pmem_entry(pmem_ranges,0UL,npages);
+ 	npmem_ranges = 1;
+ }
+diff --git a/arch/parisc/kernel/sys_parisc.c b/arch/parisc/kernel/sys_parisc.c
+index cafd30247101..bdb281f7d95e 100644
+--- a/arch/parisc/kernel/sys_parisc.c
++++ b/arch/parisc/kernel/sys_parisc.c
+@@ -32,12 +32,12 @@
+  */
+ #define GET_FILP_PGOFF(filp)		\
+ 	(filp ? (((unsigned long) filp->f_mapping) >> 8)	\
+-		 & ((SHM_COLOUR-1) >> PAGE_SHIFT) : 0UL)
++		 & ((SHM_COLOUR-1) >> MMUPAGE_SHIFT) : 0UL)
+ 
+ static unsigned long shared_align_offset(unsigned long filp_pgoff,
+ 					 unsigned long pgoff)
+ {
+-	return (filp_pgoff + pgoff) << PAGE_SHIFT;
++	return (filp_pgoff + pgoff) << MMUPAGE_SHIFT;
+ }
+ 
+ static inline unsigned long COLOR_ALIGN(unsigned long addr,
+@@ -93,9 +93,9 @@ unsigned long mmap_upper_limit(const struct rlimit *rlim_stack)
+ 
+ 	/* Add space for stack randomization. */
+ 	if (current->flags & PF_RANDOMIZE)
+-		stack_base += (STACK_RND_MASK << PAGE_SHIFT);
++		stack_base += (STACK_RND_MASK << MMUPAGE_SHIFT);
+ 
+-	return PAGE_ALIGN(STACK_TOP - stack_base);
++	return MMUPAGE_ALIGN(STACK_TOP - stack_base);
+ }
+ 
+ enum mmap_allocation_direction {UP, DOWN};
+@@ -136,7 +136,7 @@ static unsigned long arch_get_unmapped_area_common(struct file *filp,
+ 		if (do_color_align)
+ 			addr = COLOR_ALIGN(addr, filp_pgoff, pgoff);
+ 		else
+-			addr = PAGE_ALIGN(addr);
++			addr = MMUPAGE_ALIGN(addr);
+ 
+ 		vma = find_vma_prev(mm, addr, &prev);
+ 		if (TASK_SIZE - len >= addr &&
+@@ -145,15 +145,15 @@ static unsigned long arch_get_unmapped_area_common(struct file *filp,
+ 			return addr;
+ 	}
+ 
+-	info.align_mask = do_color_align ? (PAGE_MASK & (SHM_COLOUR - 1)) : 0;
++	info.align_mask = do_color_align ? (MMUPAGE_MASK & (SHM_COLOUR - 1)) : 0;
+ 	info.align_offset = shared_align_offset(filp_pgoff, pgoff);
+ 
+ 	if (dir == DOWN) {
+ 		info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+-		info.low_limit = PAGE_SIZE;
++		info.low_limit = MMUPAGE_SIZE;
+ 		info.high_limit = mm->mmap_base;
+ 		addr = vm_unmapped_area(&info);
+-		if (!(addr & ~PAGE_MASK))
++		if (!(addr & ~MMUPAGE_MASK))
+ 			return addr;
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 
+diff --git a/arch/parisc/mm/init.c b/arch/parisc/mm/init.c
+index be3380c9bcda..6f7b09258da6 100644
+--- a/arch/parisc/mm/init.c
++++ b/arch/parisc/mm/init.c
+@@ -35,7 +35,6 @@
+ #include <asm/sparsemem.h>
+ #include <asm/asm-offsets.h>
+ #include <asm/shmbuf.h>
+-
+ extern int  data_start;
+ extern void parisc_kernel_start(void);	/* Kernel entry point in head.S */
+ 
+@@ -366,7 +365,7 @@ static void __ref map_pages(unsigned long start_vaddr,
+ 
+ 	/* for 2-level configuration PTRS_PER_PMD is 0 so start_pmd will be 0 */
+ 	start_pmd = ((start_vaddr >> PMD_SHIFT) & (PTRS_PER_PMD - 1));
+-	start_pte = ((start_vaddr >> PAGE_SHIFT) & (PTRS_PER_PTE - 1));
++	start_pte = ((start_vaddr >> MMUPAGE_SHIFT) & (PTRS_PER_PTE - 1));
+ 
+ 	address = start_paddr;
+ 	vaddr = start_vaddr;
+@@ -423,8 +422,8 @@ static void __ref map_pages(unsigned long start_vaddr,
+ 
+ 				set_pte(pg_table, pte);
+ 
+-				address += PAGE_SIZE;
+-				vaddr += PAGE_SIZE;
++				address += MMUPAGE_SIZE;
++				vaddr += MMUPAGE_SIZE;
+ 			}
+ 			start_pte = 0;
+ 
+@@ -548,7 +547,7 @@ void __init mem_init(void)
+ 	BUILD_BUG_ON(PTE_ENTRY_SIZE != sizeof(pte_t));
+ 	BUILD_BUG_ON(PMD_ENTRY_SIZE != sizeof(pmd_t));
+ 	BUILD_BUG_ON(PGD_ENTRY_SIZE != sizeof(pgd_t));
+-	BUILD_BUG_ON(PAGE_SHIFT + BITS_PER_PTE + BITS_PER_PMD + BITS_PER_PGD
++	BUILD_BUG_ON(PLD_SHIFT + BITS_PER_PTE + BITS_PER_PMD + BITS_PER_PGD
+ 			> BITS_PER_LONG);
+ #if CONFIG_PGTABLE_LEVELS == 3
+ 	BUILD_BUG_ON(PT_INITIAL > PTRS_PER_PMD);
+@@ -645,17 +644,19 @@ static void __init gateway_init(void)
+ 	   into not treating it as DP-relative data. */
+ 	extern void * const linux_gateway_page;
+ 
+-	linux_gateway_page_addr = LINUX_GATEWAY_ADDR & PAGE_MASK;
++	linux_gateway_page_addr = LINUX_GATEWAY_ADDR & MMUPAGE_MASK;
+ 
+ 	/*
+ 	 * Setup Linux Gateway page.
+ 	 *
+ 	 * The Linux gateway page will reside in kernel space (on virtual
+ 	 * page 0), so it doesn't need to be aliased into user space.
++	 * Map only one hardware page — using PAGE_SIZE with PGCL would
++	 * overlap into the vmalloc range (KERNEL_MAP_START).
+ 	 */
+ 
+ 	map_pages(linux_gateway_page_addr, __pa(&linux_gateway_page),
+-		  PAGE_SIZE, PAGE_GATEWAY, 1);
++		  MMUPAGE_SIZE, PAGE_GATEWAY, 1);
+ }
+ 
+ static void __init fixmap_init(void)
+diff --git a/arch/riscv/include/asm/pgtable.h b/arch/riscv/include/asm/pgtable.h
+index a67c23454e34..2d3e1e0e8fb7 100644
+--- a/arch/riscv/include/asm/pgtable.h
++++ b/arch/riscv/include/asm/pgtable.h
+@@ -97,7 +97,17 @@
+ #define PCI_IO_END       VMEMMAP_START
+ #define PCI_IO_START     (PCI_IO_END - PCI_IO_SIZE)
+ 
++/*
++ * On 32-bit, the FDT early mapping uses PGDIR_SIZE superpages.
++ * FIXADDR_TOP must be PGDIR-aligned so that fix_fdt_va lands at
++ * the start of a PGD entry and the dtb_early_va calculation in
++ * create_fdt_early_page_table() is correct.
++ */
++#ifdef CONFIG_64BIT
+ #define FIXADDR_TOP      PCI_IO_START
++#else
++#define FIXADDR_TOP      (PCI_IO_START & ~(PGDIR_SIZE - 1))
++#endif
+ #ifdef CONFIG_64BIT
+ #define MAX_FDT_SIZE	 PMD_SIZE
+ #define FIX_FDT_SIZE	 (MAX_FDT_SIZE + SZ_2M)
+diff --git a/arch/riscv/kernel/patch.c b/arch/riscv/kernel/patch.c
+index bcf9c78fb591..157df0c7f0bd 100644
+--- a/arch/riscv/kernel/patch.c
++++ b/arch/riscv/kernel/patch.c
+@@ -42,20 +42,26 @@ static inline bool is_kernel_exittext(uintptr_t addr)
+ static __always_inline void *patch_map(void *addr, const unsigned int fixmap)
+ {
+ 	uintptr_t uintaddr = (uintptr_t) addr;
+-	phys_addr_t phys;
++	phys_addr_t pa;
+ 
+ 	if (core_kernel_text(uintaddr) || is_kernel_exittext(uintaddr)) {
+-		phys = __pa_symbol(addr);
++		/*
++		 * Use __pa_symbol() directly instead of the phys_to_page() /
++		 * page_to_phys() roundtrip.  The latter requires a populated
++		 * sparsemem section map, which is not yet available when
++		 * apply_boot_alternatives() runs from setup_arch().
++		 */
++		pa = __pa_symbol(addr);
+ 	} else if (IS_ENABLED(CONFIG_STRICT_MODULE_RWX)) {
+ 		struct page *page = vmalloc_to_page(addr);
+ 
+ 		BUG_ON(!page);
+-		phys = page_to_phys(page) + offset_in_page(addr);
++		pa = page_to_phys(page) + offset_in_page(addr);
+ 	} else {
+ 		return addr;
+ 	}
+ 
+-	return (void *)set_fixmap_offset(fixmap, phys);
++	return (void *)set_fixmap_offset(fixmap, pa);
+ }
+ 
+ static void patch_unmap(int fixmap)
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index 238e48ef6714..ce53e4d94430 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -388,7 +388,6 @@ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
+ 
+ #define pte_next_pfn(pte) pte_advance_pfn(pte, 1)
+ 
+-#ifndef set_ptes
+ /*
+  * Generic fallback for __phys_to_pte_val: identity transform.
+  * Architectures where the PTE PFN field is not a direct physical address
+@@ -399,6 +398,7 @@ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
+ #define __phys_to_pte_val(phys)	(phys)
+ #endif
+ 
++#ifndef set_ptes
+ /**
+  * set_ptes - Map consecutive pages to a contiguous range of addresses.
+  * @mm: Address space to map the pages into.
+-- 
+2.54.0
+

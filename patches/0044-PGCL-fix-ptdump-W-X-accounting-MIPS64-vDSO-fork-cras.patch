@@ -1,0 +1,201 @@
+From 26f4297936edad32892712f03f485d4c0d4bff86 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 26 Mar 2026 00:28:37 +0100
+Subject: [PATCH 044/174] PGCL: fix ptdump W+X accounting, MIPS64 vDSO fork
+ crash, block layer PAGE_SECTORS
+
+Three categories of PGCL fixes:
+
+1. ptdump W+X page counting: All arch ptdump code divided address
+   ranges by PAGE_SIZE instead of MMUPAGE_SIZE when counting W+X
+   pages. The page table walker steps at MMUPAGE granularity, so
+   the divisor must match. Fixes arm64 (2 locations), powerpc (2),
+   riscv (1).
+
+2. MIPS64 vDSO crash after fork: arch_setup_additional_pages() and
+   vvar_fault() used PAGE_SIZE for vDSO layout calculations instead
+   of MMUPAGE_SIZE. The vDSO/vvar mappings are at hardware page
+   granularity. With PAGE_MMUSHIFT=4 the layout was 16x too spread
+   out, causing child processes to SIGSEGV on clock_gettime after
+   fork. Fixes arch/mips/kernel/vdso.c (4 locations),
+   lib/vdso/datastore.c (1), arch/mips/include/asm/vdso/vdso.h (1).
+
+3. Block layer blk_validate_limits: The minimum max_hw_sectors check
+   used PAGE_SECTORS (kernel page size) instead of MMUPAGE_SECTORS
+   (hardware page size). With large PAGE_SIZE (e.g. 256KB on
+   loongarch64), this rejected valid devices. Add MMUPAGE_SECTORS
+   define and use it in the validation.
+
+Tested: x86_64 19/19+13/13, arm64 19/19+12/12, riscv64 19/19+12/12,
+s390x 19/19+13/13, ppc64 19/19+13/13 (SMP=4), sparc64 19/19+11/11,
+loongarch64 19/19+12/12 (blk_validate_limits warning eliminated).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm64/mm/ptdump.c                 | 4 ++--
+ arch/mips/include/asm/vdso/vdso.h      | 2 +-
+ arch/mips/kernel/vdso.c                | 8 ++++----
+ arch/powerpc/mm/ptdump/hashpagetable.c | 2 +-
+ arch/powerpc/mm/ptdump/ptdump.c        | 2 +-
+ arch/riscv/mm/ptdump.c                 | 2 +-
+ block/blk-settings.c                   | 6 +++---
+ include/linux/blk_types.h              | 2 ++
+ lib/vdso/datastore.c                   | 2 +-
+ 9 files changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/arch/arm64/mm/ptdump.c b/arch/arm64/mm/ptdump.c
+index ab9899ca1e5f..f446f43e88db 100644
+--- a/arch/arm64/mm/ptdump.c
++++ b/arch/arm64/mm/ptdump.c
+@@ -170,7 +170,7 @@ static void note_prot_uxn(struct ptdump_pg_state *st, unsigned long addr)
+ 	WARN_ONCE(1, "arm64/mm: Found non-UXN mapping at address %p/%pS\n",
+ 		  (void *)st->start_address, (void *)st->start_address);
+ 
+-	st->uxn_pages += (addr - st->start_address) / PAGE_SIZE;
++	st->uxn_pages += (addr - st->start_address) / MMUPAGE_SIZE;
+ }
+ 
+ static void note_prot_wx(struct ptdump_pg_state *st, unsigned long addr)
+@@ -185,7 +185,7 @@ static void note_prot_wx(struct ptdump_pg_state *st, unsigned long addr)
+ 	WARN_ONCE(1, "arm64/mm: Found insecure W+X mapping at address %p/%pS\n",
+ 		  (void *)st->start_address, (void *)st->start_address);
+ 
+-	st->wx_pages += (addr - st->start_address) / PAGE_SIZE;
++	st->wx_pages += (addr - st->start_address) / MMUPAGE_SIZE;
+ }
+ 
+ void note_page(struct ptdump_state *pt_st, unsigned long addr, int level,
+diff --git a/arch/mips/include/asm/vdso/vdso.h b/arch/mips/include/asm/vdso/vdso.h
+index ef50d33f3439..cb5ec0efec87 100644
+--- a/arch/mips/include/asm/vdso/vdso.h
++++ b/arch/mips/include/asm/vdso/vdso.h
+@@ -67,7 +67,7 @@ static inline const struct vdso_time_data *get_vdso_time_data(void)
+ 
+ static inline void __iomem *get_gic(const struct vdso_time_data *data)
+ {
+-	return (void __iomem *)((unsigned long)data & PAGE_MASK) - PAGE_SIZE;
++	return (void __iomem *)((unsigned long)data & MMUPAGE_MASK) - MMUPAGE_SIZE;
+ }
+ 
+ #endif /* CONFIG_CLKSRC_MIPS_GIC */
+diff --git a/arch/mips/kernel/vdso.c b/arch/mips/kernel/vdso.c
+index 2fa4df3e46e4..cd4e3503dd19 100644
+--- a/arch/mips/kernel/vdso.c
++++ b/arch/mips/kernel/vdso.c
+@@ -64,7 +64,7 @@ static unsigned long vdso_base(void)
+ 
+ 	if (IS_ENABLED(CONFIG_MIPS_FP_SUPPORT)) {
+ 		/* Skip the delay slot emulation page */
+-		base += PAGE_SIZE;
++		base += MMUPAGE_SIZE;
+ 	}
+ 
+ 	if (current->flags & PF_RANDOMIZE) {
+@@ -107,8 +107,8 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 	 * only map a page even though the total area is 64K, as we only need
+ 	 * the counter registers at the start.
+ 	 */
+-	gic_size = mips_gic_present() ? PAGE_SIZE : 0;
+-	size = gic_size + VDSO_NR_PAGES * PAGE_SIZE + image->size;
++	gic_size = mips_gic_present() ? MMUPAGE_SIZE : 0;
++	size = gic_size + VDSO_NR_PAGES * MMUPAGE_SIZE + image->size;
+ 
+ 	/*
+ 	 * Find a region that's large enough for us to perform the
+@@ -135,7 +135,7 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 	}
+ 
+ 	data_addr = base + gic_size;
+-	vdso_addr = data_addr + VDSO_NR_PAGES * PAGE_SIZE;
++	vdso_addr = data_addr + VDSO_NR_PAGES * MMUPAGE_SIZE;
+ 
+ 	vma = vdso_install_vvar_mapping(mm, data_addr);
+ 	if (IS_ERR(vma)) {
+diff --git a/arch/powerpc/mm/ptdump/hashpagetable.c b/arch/powerpc/mm/ptdump/hashpagetable.c
+index 671d0dc00c6d..139cdac4d592 100644
+--- a/arch/powerpc/mm/ptdump/hashpagetable.c
++++ b/arch/powerpc/mm/ptdump/hashpagetable.c
+@@ -384,7 +384,7 @@ static void walk_pte(struct pg_state *st, pmd_t *pmd, unsigned long start)
+ 	int i, status;
+ 
+ 	for (i = 0; i < PTRS_PER_PTE; i++, pte++) {
+-		addr = start + i * PAGE_SIZE;
++		addr = start + i * MMUPAGE_SIZE;
+ 		pteval = pte_val(*pte);
+ 
+ 		if (addr < VMALLOC_END)
+diff --git a/arch/powerpc/mm/ptdump/ptdump.c b/arch/powerpc/mm/ptdump/ptdump.c
+index 0d499aebee72..3dc4a3acff70 100644
+--- a/arch/powerpc/mm/ptdump/ptdump.c
++++ b/arch/powerpc/mm/ptdump/ptdump.c
+@@ -195,7 +195,7 @@ static void note_prot_wx(struct pg_state *st, unsigned long addr)
+ 		  "powerpc/mm: Found insecure W+X mapping at address %p/%pS\n",
+ 		  (void *)st->start_address, (void *)st->start_address);
+ 
+-	st->wx_pages += (addr - st->start_address) / PAGE_SIZE;
++	st->wx_pages += (addr - st->start_address) / MMUPAGE_SIZE;
+ }
+ 
+ static void note_page_update_state(struct pg_state *st, unsigned long addr, int level, u64 val)
+diff --git a/arch/riscv/mm/ptdump.c b/arch/riscv/mm/ptdump.c
+index 34299c2b231f..dbfd5cf7c61b 100644
+--- a/arch/riscv/mm/ptdump.c
++++ b/arch/riscv/mm/ptdump.c
+@@ -272,7 +272,7 @@ static void note_prot_wx(struct pg_state *st, unsigned long addr)
+ 	WARN_ONCE(1, "riscv/mm: Found insecure W+X mapping at address %p/%pS\n",
+ 		  (void *)st->start_address, (void *)st->start_address);
+ 
+-	st->wx_pages += (addr - st->start_address) / PAGE_SIZE;
++	st->wx_pages += (addr - st->start_address) / MMUPAGE_SIZE;
+ }
+ 
+ static void note_page(struct ptdump_state *pt_st, unsigned long addr,
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 78c83817b9d3..cc006fb4dd28 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -381,12 +381,12 @@ int blk_validate_limits(struct queue_limits *lim)
+ 	 * value.
+ 	 *
+ 	 * The block layer relies on the fact that every driver can
+-	 * handle at lest a page worth of data per I/O, and needs the value
+-	 * aligned to the logical block size.
++	 * handle at least an MMU page worth of data per I/O, and needs
++	 * the value aligned to the logical block size.
+ 	 */
+ 	if (!lim->max_hw_sectors)
+ 		lim->max_hw_sectors = BLK_SAFE_MAX_SECTORS;
+-	if (WARN_ON_ONCE(lim->max_hw_sectors < PAGE_SECTORS))
++	if (WARN_ON_ONCE(lim->max_hw_sectors < MMUPAGE_SECTORS))
+ 		return -EINVAL;
+ 	logical_block_sectors = lim->logical_block_size >> SECTOR_SHIFT;
+ 	if (WARN_ON_ONCE(logical_block_sectors > lim->max_hw_sectors))
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 8808ee76e73c..558a872c863c 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -36,6 +36,8 @@ struct bio_crypt_ctx;
+ 
+ #define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+ #define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
++#define MMUPAGE_SECTORS_SHIFT	(MMUPAGE_SHIFT - SECTOR_SHIFT)
++#define MMUPAGE_SECTORS		(1 << MMUPAGE_SECTORS_SHIFT)
+ #define SECTOR_MASK		(PAGE_SECTORS - 1)
+ 
+ struct block_device {
+diff --git a/lib/vdso/datastore.c b/lib/vdso/datastore.c
+index caa3fe46ea61..a738ffec44c4 100644
+--- a/lib/vdso/datastore.c
++++ b/lib/vdso/datastore.c
+@@ -82,7 +82,7 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 			unsigned long addr;
+ 			vm_fault_t err;
+ 
+-			addr = vmf->address + VDSO_TIMENS_PAGE_OFFSET * PAGE_SIZE;
++			addr = vmf->address + VDSO_TIMENS_PAGE_OFFSET * MMUPAGE_SIZE;
+ 			err = vmf_insert_page(vma, addr, page);
+ 			if (unlikely(err & VM_FAULT_ERROR))
+ 				return err;
+-- 
+2.54.0
+

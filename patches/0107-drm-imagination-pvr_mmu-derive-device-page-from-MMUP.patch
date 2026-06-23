@@ -1,0 +1,63 @@
+From 364d1e0a7b7e11b678adede23f456107ed76f605 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Mon, 11 May 2026 10:57:56 +0200
+Subject: [PATCH 107/174] drm/imagination: pvr_mmu: derive device page from
+ MMUPAGE_SIZE
+
+The PowerVR/Rogue GPU MMU programs its page-table page size from the
+PVR_DEVICE_PAGE_SIZE constant.  pvr_mmu.c then has a static #if/#elif
+chain that maps the constant to the corresponding hardware register
+encoding (ROGUE_MMUCTRL_PAGE_SIZE_4KB / _16KB / _64KB / _256KB / _1MB
+/ _2MB) and #errors out for any other size.
+
+Defining PVR_DEVICE_PAGE_SIZE as the kernel allocation PAGE_SIZE
+worked at PGCL=4/6 (PAGE_SIZE = 64K / 256K -- both supported by the
+MMU) but breaks at PGCL=5 with a 4 KiB MMU base, where PAGE_SIZE is
+128K and the build fails as:
+
+  drivers/gpu/drm/imagination/pvr_mmu.c:57:3: error:
+    #error Unsupported device page size PVR_DEVICE_PAGE_SIZE
+
+The GPU MMU is a hardware MMU, so the right granularity is the
+hardware MMU page (MMUPAGE_SIZE) -- always one of the sizes the
+hardware-encoding switch knows about.  This builds at every PGCL
+shift and unchanged on non-PGCL kernels (where PAGE_SIZE ==
+MMUPAGE_SIZE).
+
+Verified by building aarch64 defconfig at PGCL=5 with
+CONFIG_DRM_POWERVR=m enabled, which now produces Image cleanly.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/imagination/pvr_mmu.h | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/imagination/pvr_mmu.h b/drivers/gpu/drm/imagination/pvr_mmu.h
+index a8ecd460168d..8007d8b35051 100644
+--- a/drivers/gpu/drm/imagination/pvr_mmu.h
++++ b/drivers/gpu/drm/imagination/pvr_mmu.h
+@@ -47,10 +47,17 @@ struct sg_table;
+  *    This value is derived from %PVR_DEVICE_PAGE_SIZE.
+  */
+ 
+-/* PVR_DEVICE_PAGE_SIZE determines the page size */
+-#define PVR_DEVICE_PAGE_SIZE (PAGE_SIZE)
+-#define PVR_DEVICE_PAGE_SHIFT (PAGE_SHIFT)
+-#define PVR_DEVICE_PAGE_MASK (PAGE_MASK)
++/* PVR_DEVICE_PAGE_SIZE determines the page size.  This is the GPU's
++ * MMU page size, which must be one of the hardware-supported sizes
++ * (SZ_4K, SZ_16K, SZ_64K, SZ_256K, SZ_1M, SZ_2M -- see pvr_mmu.c).
++ * Under PGCL the kernel PAGE_SIZE may be a multiple of the MMU page
++ * (e.g. 128K at PGCL=5 with a 4K MMU page), which would be rejected
++ * by the device MMU.  Use MMUPAGE_SIZE so the GPU programs the
++ * underlying hardware page size instead of the kernel-cluster size.
++ */
++#define PVR_DEVICE_PAGE_SIZE (MMUPAGE_SIZE)
++#define PVR_DEVICE_PAGE_SHIFT (MMUPAGE_SHIFT)
++#define PVR_DEVICE_PAGE_MASK (MMUPAGE_MASK)
+ 
+ /**
+  * DOC: Page table index utilities (constants)
+-- 
+2.54.0
+

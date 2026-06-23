@@ -1,0 +1,1127 @@
+From a1d19a0e3b51ca374df9b6137243251cf939e5bd Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 22 Mar 2026 12:31:33 +0100
+Subject: [PATCH 036/174] PGCL: alpha boot, mips TLB fixes, debug print
+ cleanup, arm32 regression fix
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Alpha PAGE_MMUSHIFT=4 boot support (8 files):
+- pgtable.h: PMD_SHIFT/PGDIR_SHIFT use MMUPAGE_SHIFT, pfn_pte/pte_pfn
+  handle hardware PFN ↔ kernel PFN conversion, add __phys_to_pte_val
+- mmu_context.h: pgd physical address uses MMUPAGE_SHIFT
+- entry.S/head.S: kernel page table setup uses MMUPAGE_SHIFT for
+  hardware PTE entries
+- osf_sys.c: mmap offset alignment uses MMUPAGE_SHIFT
+- setup.c/init.c/fault.c: MMUPAGE fixes for memory init and fault handling
+
+MIPS TLB exception handler fixes (tlbex.c, 7 locations):
+- Software TLB refill code uses hardware page size (MMUPAGE_SHIFT)
+  not kernel page size for PTE index calculation and page walk
+- PTRS_PER_PTE → MMUPAGE_SIZE/sizeof(pte_t) for hardware PTE count
+- HTW (Hardware Table Walker) page walk fields use MMUPAGE_SHIFT
+
+ARM32 regression fix (mmu.c):
+- Removing debug pr_alert left orphan 'if (addr >= 0xffff0000)' that
+  guarded the entire do-while PTE fill loop — all mappings below
+  0xffff0000 got zero PTEs, crashing in atomic_pool_init
+
+Debug print removal (11 files, ~95 prints):
+- Remove PGCL diagnostic prints from arm32, init/main.c, binfmt_elf.c,
+  workqueue.c, arch_topology.c, fdt.c, page_alloc.c, pgtable.h
+
+Alpha boots with 15/15 pgcl-test + 8/8 pgcl-stress PASS.
+8 architectures now boot with PAGE_MMUSHIFT=4.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/alpha/include/asm/mmu_context.h |  4 +-
+ arch/alpha/include/asm/pgtable.h     | 56 +++++++++++++++++++---------
+ arch/alpha/kernel/entry.S            | 43 ++++++++++++++-------
+ arch/alpha/kernel/head.S             | 18 +++++++--
+ arch/alpha/kernel/osf_sys.c          |  6 +--
+ arch/alpha/kernel/setup.c            | 13 ++++---
+ arch/alpha/mm/fault.c                |  2 +-
+ arch/alpha/mm/init.c                 | 32 ++++++++--------
+ arch/arm/kernel/irq.c                | 10 -----
+ arch/arm/kernel/setup.c              | 13 -------
+ arch/arm/kernel/smp.c                |  5 ---
+ arch/arm/mm/init.c                   |  6 ---
+ arch/arm/mm/mmu.c                    | 27 --------------
+ arch/mips/mm/tlbex.c                 | 14 +++----
+ drivers/base/arch_topology.c         |  7 ----
+ drivers/of/fdt.c                     |  2 -
+ fs/binfmt_elf.c                      | 11 ------
+ include/linux/pgtable.h              |  3 +-
+ init/main.c                          | 28 --------------
+ kernel/workqueue.c                   |  7 ----
+ 20 files changed, 123 insertions(+), 184 deletions(-)
+
+diff --git a/arch/alpha/include/asm/mmu_context.h b/arch/alpha/include/asm/mmu_context.h
+index eee8fe836a59..104a03a64b4a 100644
+--- a/arch/alpha/include/asm/mmu_context.h
++++ b/arch/alpha/include/asm/mmu_context.h
+@@ -200,7 +200,7 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ 		mm->context[i] = 0;
+ 	if (tsk != current)
+ 		task_thread_info(tsk)->pcb.ptbr
+-		  = ((unsigned long)mm->pgd - IDENT_ADDR) >> PAGE_SHIFT;
++		  = ((unsigned long)mm->pgd - IDENT_ADDR) >> MMUPAGE_SHIFT;
+ 	return 0;
+ }
+ 
+@@ -209,7 +209,7 @@ static inline void
+ enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
+ 	task_thread_info(tsk)->pcb.ptbr
+-	  = ((unsigned long)mm->pgd - IDENT_ADDR) >> PAGE_SHIFT;
++	  = ((unsigned long)mm->pgd - IDENT_ADDR) >> MMUPAGE_SHIFT;
+ }
+ 
+ #include <asm-generic/mmu_context.h>
+diff --git a/arch/alpha/include/asm/pgtable.h b/arch/alpha/include/asm/pgtable.h
+index 8e00cf9dc39d..1b42d64f6f7a 100644
+--- a/arch/alpha/include/asm/pgtable.h
++++ b/arch/alpha/include/asm/pgtable.h
+@@ -28,27 +28,29 @@ struct vm_area_struct;
+  */
+ #define set_pte(pteptr, pteval) ((*(pteptr)) = (pteval))
+ 
+-/* PMD_SHIFT determines the size of the area a second-level page table can map */
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT-3))
++/* PMD_SHIFT determines the size of the area a second-level page table can map.
++ * Alpha hardware page tables use hardware (MMU) page size, not kernel page size. */
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (MMUPAGE_SHIFT-3))
+ #define PMD_SIZE	(1UL << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+ 
+ /* PGDIR_SHIFT determines what a third-level page table entry can map */
+-#define PGDIR_SHIFT	(PAGE_SHIFT + 2*(PAGE_SHIFT-3))
++#define PGDIR_SHIFT	(MMUPAGE_SHIFT + 2*(MMUPAGE_SHIFT-3))
+ #define PGDIR_SIZE	(1UL << PGDIR_SHIFT)
+ #define PGDIR_MASK	(~(PGDIR_SIZE-1))
+ 
+ /*
+  * Entries per page directory level:  the Alpha is three-level, with
+- * all levels having a one-page page table.
++ * all levels having a one-hardware-page page table.
++ * Page table structures are sized by hardware (MMU) page size, not kernel page size.
+  */
+-#define PTRS_PER_PTE	(1UL << (PAGE_SHIFT-3))
+-#define PTRS_PER_PMD	(1UL << (PAGE_SHIFT-3))
+-#define PTRS_PER_PGD	(1UL << (PAGE_SHIFT-3))
++#define PTRS_PER_PTE	(1UL << (MMUPAGE_SHIFT-3))
++#define PTRS_PER_PMD	(1UL << (MMUPAGE_SHIFT-3))
++#define PTRS_PER_PGD	(1UL << (MMUPAGE_SHIFT-3))
+ #define USER_PTRS_PER_PGD	(TASK_SIZE / PGDIR_SIZE)
+ 
+-/* Number of pointers that fit on a page:  this will go away. */
+-#define PTRS_PER_PAGE	(1UL << (PAGE_SHIFT-3))
++/* Number of pointers that fit on a hardware page:  this will go away. */
++#define PTRS_PER_PAGE	(1UL << (MMUPAGE_SHIFT-3))
+ 
+ #ifdef CONFIG_ALPHA_LARGE_VMALLOC
+ #define VMALLOC_START		0xfffffe0000000000
+@@ -158,9 +160,9 @@ static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
+ #endif
+ #if defined(CONFIG_ALPHA_GENERIC) || \
+     (defined(CONFIG_ALPHA_EV6) && !defined(USE_48_BIT_KSEG))
+-#define KSEG_PFN	(0xc0000000000UL >> PAGE_SHIFT)
++#define KSEG_PFN	(0xc0000000000UL >> MMUPAGE_SHIFT)
+ #define PHYS_TWIDDLE(pfn) \
+-  ((((pfn) & KSEG_PFN) == (0x40000000000UL >> PAGE_SHIFT)) \
++  ((((pfn) & KSEG_PFN) == (0x40000000000UL >> MMUPAGE_SHIFT)) \
+   ? ((pfn) ^= KSEG_PFN) : (pfn))
+ #else
+ #define PHYS_TWIDDLE(pfn) (pfn)
+@@ -169,24 +171,42 @@ static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
+ /*
+  * Conversion functions:  convert a page and protection to a page entry,
+  * and a page entry and page directory to the page they refer to.
++ *
++ * Alpha hardware stores the hardware PFN (pa >> MMUPAGE_SHIFT) in PTE bits
++ * [63:32].  Kernel PFNs (pa >> PAGE_SHIFT) differ by PAGE_MMUCOUNT with PGCL.
++ * pfn_pte() takes a kernel PFN and converts to hardware PFN for the PTE.
++ * pte_pfn() extracts the hardware PFN and converts back to kernel PFN.
++ *
++ * __phys_to_pte_val(pa): convert physical byte address to raw PTE value
++ * encoding.  Alpha stores hardware PFN in bits[63:32], so:
++ *   __phys_to_pte_val(pa) = ((pa >> MMUPAGE_SHIFT) << 32)
+  */
+ #define page_to_pa(page)	(page_to_pfn(page) << PAGE_SHIFT)
+ #define PFN_PTE_SHIFT		32
+-#define pte_pfn(pte)		(pte_val(pte) >> PFN_PTE_SHIFT)
++#define pte_pfn(pte)		((pte_val(pte) >> PFN_PTE_SHIFT) >> PAGE_MMUSHIFT)
++#define __phys_to_pte_val(phys)	(((phys) >> MMUPAGE_SHIFT) << 32)
+ 
+ #define pte_page(pte)	pfn_to_page(pte_pfn(pte))
+ 
+ extern inline pte_t pfn_pte(unsigned long physpfn, pgprot_t pgprot)
+-{ pte_t pte; pte_val(pte) = (PHYS_TWIDDLE(physpfn) << 32) | pgprot_val(pgprot); return pte; }
++{ pte_t pte; unsigned long hw_pfn = physpfn << PAGE_MMUSHIFT; pte_val(pte) = (PHYS_TWIDDLE(hw_pfn) << 32) | pgprot_val(pgprot); return pte; }
++
++/* Advance PTE by nr kernel pages (not hardware pages).  Alpha stores hardware
++ * PFN in bits[63:32], and one kernel page = PAGE_MMUCOUNT hardware pages. */
++#define pte_advance_pfn pte_advance_pfn
++static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
++{
++	return __pte(pte_val(pte) + ((unsigned long)(nr << PAGE_MMUSHIFT) << PFN_PTE_SHIFT));
++}
+ 
+ extern inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
+ { pte_val(pte) = (pte_val(pte) & _PAGE_CHG_MASK) | pgprot_val(newprot); return pte; }
+ 
+ extern inline void pmd_set(pmd_t * pmdp, pte_t * ptep)
+-{ pmd_val(*pmdp) = _PAGE_TABLE | ((((unsigned long) ptep) - PAGE_OFFSET) << (32-PAGE_SHIFT)); }
++{ pmd_val(*pmdp) = _PAGE_TABLE | ((((unsigned long) ptep) - PAGE_OFFSET) << (32-MMUPAGE_SHIFT)); }
+ 
+ extern inline void pud_set(pud_t * pudp, pmd_t * pmdp)
+-{ pud_val(*pudp) = _PAGE_TABLE | ((((unsigned long) pmdp) - PAGE_OFFSET) << (32-PAGE_SHIFT)); }
++{ pud_val(*pudp) = _PAGE_TABLE | ((((unsigned long) pmdp) - PAGE_OFFSET) << (32-MMUPAGE_SHIFT)); }
+ 
+ 
+ extern void migrate_flush_tlb_page(struct vm_area_struct *vma,
+@@ -195,7 +215,7 @@ extern void migrate_flush_tlb_page(struct vm_area_struct *vma,
+ extern inline unsigned long
+ pmd_page_vaddr(pmd_t pmd)
+ {
+-	return ((pmd_val(pmd) & _PFN_MASK) >> (32-PAGE_SHIFT)) + PAGE_OFFSET;
++	return ((pmd_val(pmd) & _PFN_MASK) >> (32-MMUPAGE_SHIFT)) + PAGE_OFFSET;
+ }
+ 
+ #define pmd_pfn(pmd)	(pmd_val(pmd) >> 32)
+@@ -204,7 +224,7 @@ pmd_page_vaddr(pmd_t pmd)
+ 
+ extern inline pmd_t *pud_pgtable(pud_t pgd)
+ {
+-	return (pmd_t *)(PAGE_OFFSET + ((pud_val(pgd) & _PFN_MASK) >> (32-PAGE_SHIFT)));
++	return (pmd_t *)(PAGE_OFFSET + ((pud_val(pgd) & _PFN_MASK) >> (32-MMUPAGE_SHIFT)));
+ }
+ 
+ extern inline int pte_none(pte_t pte)		{ return !pte_val(pte); }
+@@ -265,7 +285,7 @@ extern inline pmd_t * pmd_offset(pud_t * dir, unsigned long address)
+ extern inline pte_t * pte_offset_kernel(pmd_t * dir, unsigned long address)
+ {
+ 	pte_t *ret = (pte_t *) pmd_page_vaddr(*dir)
+-		+ ((address >> PAGE_SHIFT) & (PTRS_PER_PAGE - 1));
++		+ ((address >> MMUPAGE_SHIFT) & (PTRS_PER_PAGE - 1));
+ 	smp_rmb(); /* see above */
+ 	return ret;
+ }
+diff --git a/arch/alpha/kernel/entry.S b/arch/alpha/kernel/entry.S
+index fcfd06529b12..09c9042abde4 100644
+--- a/arch/alpha/kernel/entry.S
++++ b/arch/alpha/kernel/entry.S
+@@ -11,11 +11,32 @@
+ #include <asm/errno.h>
+ #include <asm/unistd.h>
+ #include <linux/errno.h>
++#include <asm/page.h>
+ 
+ 	.text
+ 	.set noat
+ 	.cfi_sections	.debug_frame
+ 
++/*
++ * Load THREAD_SIZE - 1 into $8, for use with BIC to get current.
++ * THREAD_SIZE = 2*PAGE_SIZE may exceed 16-bit signed range, so use
++ * ldah+lda pair.  The low 16 bits of (2*PAGE_SIZE-1) are 0xffff when
++ * PAGE_SIZE >= 0x8000, which the assembler would expand as a large
++ * unsigned immediate rather than -1.  Use .if to emit the signed
++ * form explicitly:  when lo >= 0x8000, increment hi by 1 and negate lo.
++ * For  16KB (MMUSHIFT=0): hi=0, lo=0x3fff   → lda $8, 0x3fff($31)
++ * For 256KB (MMUSHIFT=4): hi=4, lo=-1       → ldah $8,4($31); lda $8,-1($8)
++ */
++.macro	LOAD_THREAD_MASK
++.if	((2*PAGE_SIZE - 1) & 0xffff) >= 0x8000
++	ldah	$8, (((2*PAGE_SIZE - 1) >> 16) + 1)($31)
++	lda	$8, (((2*PAGE_SIZE - 1) & 0xffff) - 0x10000)($8)
++.else
++	ldah	$8, ((2*PAGE_SIZE - 1) >> 16)($31)
++	lda	$8, ((2*PAGE_SIZE - 1) & 0xffff)($8)
++.endif
++.endm
++
+ .macro	CFI_START_OSF_FRAME	func
+ 	.align	4
+ 	.globl	\func
+@@ -234,7 +255,7 @@
+ 
+ CFI_START_OSF_FRAME entInt
+ 	SAVE_ALL
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	lda	$26, ret_from_sys_call
+ 	bic	$sp, $8, $8
+ 	mov	$sp, $19
+@@ -243,7 +264,7 @@ CFI_END_OSF_FRAME entInt
+ 
+ CFI_START_OSF_FRAME entArith
+ 	SAVE_ALL
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	lda	$26, ret_from_sys_call
+ 	bic	$sp, $8, $8
+ 	mov	$sp, $18
+@@ -271,7 +292,7 @@ CFI_START_OSF_FRAME entMM
+ 	.cfi_rel_offset	$15, 48
+ 	addq	$sp, 64, $19
+ /* handle the fault */
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	bic	$sp, $8, $8
+ 	jsr	$26, do_page_fault
+ /* reload the registers after the exception code played.  */
+@@ -297,7 +318,7 @@ CFI_END_OSF_FRAME entMM
+ 
+ CFI_START_OSF_FRAME entIF
+ 	SAVE_ALL
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	lda	$26, ret_from_sys_call
+ 	bic	$sp, $8, $8
+ 	mov	$sp, $17
+@@ -367,7 +388,7 @@ CFI_START_OSF_FRAME entUna
+ 	.cfi_rel_offset	$27, 27*8
+ 	.cfi_rel_offset	$28, 28*8
+ 	.cfi_rel_offset	$29, 29*8
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	stq	$31, 248($sp)
+ 	bic	$sp, $8, $8
+ 	jsr	$26, do_entUna
+@@ -453,7 +474,7 @@ entUnaUser:
+ 	.cfi_rel_offset	$13, 32
+ 	.cfi_rel_offset	$14, 40
+ 	.cfi_rel_offset	$15, 48
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	addq	$sp, 64, $19
+ 	bic	$sp, $8, $8
+ 	jsr	$26, do_entUnaUser
+@@ -478,7 +499,7 @@ CFI_END_OSF_FRAME entUna
+ 
+ CFI_START_OSF_FRAME entDbg
+ 	SAVE_ALL
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	lda	$26, ret_from_sys_call
+ 	bic	$sp, $8, $8
+ 	mov	$sp, $16
+@@ -517,11 +538,7 @@ CFI_END_OSF_FRAME entDbg
+ 	.cfi_rel_offset	$gp, 16
+ entSys:
+ 	SAVE_ALL
+-        ldq     $1, 0($sp)          /* syscall nr from saved r0 */
+-        stq     $1, 8($sp)          /* regs->r1 = shadow syscall nr */
+-        stq     $1, 16($sp)         /* regs->r2 = restart syscall nr */
+-
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	bic	$sp, $8, $8
+ 	lda	$4, NR_syscalls($31)
+ 	stq	$16, SP_OFF+24($sp)
+@@ -819,7 +836,7 @@ alpha_switch_to:
+ 	bsr	$26, __save_fpu
+ 1:
+ 	call_pal PAL_swpctx
+-	lda	$8, 0x3fff
++	LOAD_THREAD_MASK
+ 	UNDO_SWITCH_STACK
+ 	bic	$sp, $8, $8
+ 	mov	$17, $0
+diff --git a/arch/alpha/kernel/head.S b/arch/alpha/kernel/head.S
+index bb48a8ae4e79..559284809ecd 100644
+--- a/arch/alpha/kernel/head.S
++++ b/arch/alpha/kernel/head.S
+@@ -12,6 +12,7 @@
+ #include <asm/asm-offsets.h>
+ #include <asm/pal.h>
+ #include <asm/setup.h>
++#include <asm/page.h>
+ 
+ __HEAD
+ .globl _stext
+@@ -25,8 +26,9 @@ __start:
+ 1:	ldgp	$29,0($27)
+ 	/* We need to get current_task_info loaded up...  */
+ 	lda	$8,init_thread_union
+-	/* ... and find our stack ... */
+-	lda	$30,0x4000 - SIZEOF_PT_REGS($8)
++	/* ... and find our stack (THREAD_SIZE may exceed 16-bit lda range) ... */
++	ldah	$30,(2*PAGE_SIZE + 0x8000) >> 16 ($8)
++	lda	$30,((2*PAGE_SIZE) & 0xffff) - SIZEOF_PT_REGS ($30)
+ 	/* ... and then we can start the kernel.  */
+ 	jsr	$26,start_kernel
+ 	call_pal PAL_halt
+@@ -48,7 +50,17 @@ __smp_callin:
+ 	mov	$0,$16		# Install it.
+ 	call_pal PAL_swpctx
+ 
+-	lda	$8,0x3fff	# Find "current".
++	/* Find "current" — THREAD_SIZE may exceed 16-bit lda range.
++	 * (2*PAGE_SIZE-1) & 0xffff may be >= 0x8000 (= 0xffff for large PAGE_SIZE),
++	 * which the assembler would expand as a large unsigned immediate.
++	 * Use the sign-corrected form: when lo >= 0x8000, hi++ and lo -= 0x10000. */
++.if	((2*PAGE_SIZE - 1) & 0xffff) >= 0x8000
++	ldah	$8,(((2*PAGE_SIZE - 1) >> 16) + 1)($31)
++	lda	$8,(((2*PAGE_SIZE - 1) & 0xffff) - 0x10000)($8)
++.else
++	ldah	$8,((2*PAGE_SIZE - 1) >> 16)($31)
++	lda	$8,((2*PAGE_SIZE - 1) & 0xffff)($8)
++.endif
+ 	bic	$30,$8,$8
+ 	
+ 	jsr	$26,smp_callin
+diff --git a/arch/alpha/kernel/osf_sys.c b/arch/alpha/kernel/osf_sys.c
+index 7b6543d2cca3..fb4884cbd313 100644
+--- a/arch/alpha/kernel/osf_sys.c
++++ b/arch/alpha/kernel/osf_sys.c
+@@ -185,11 +185,11 @@ SYSCALL_DEFINE6(osf_mmap, unsigned long, addr, unsigned long, len,
+ 		printk("%s: unimplemented OSF mmap flags %04lx\n", 
+ 			current->comm, flags);
+ #endif
+-	if ((off + PAGE_ALIGN(len)) < off)
++	if ((off + MMUPAGE_ALIGN(len)) < off)
+ 		goto out;
+-	if (off & ~PAGE_MASK)
++	if (off & ~MMUPAGE_MASK)
+ 		goto out;
+-	ret = ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
++	ret = ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> MMUPAGE_SHIFT);
+  out:
+ 	return ret;
+ }
+diff --git a/arch/alpha/kernel/setup.c b/arch/alpha/kernel/setup.c
+index 4cbcfb1852d5..0b619da34082 100644
+--- a/arch/alpha/kernel/setup.c
++++ b/arch/alpha/kernel/setup.c
+@@ -301,19 +301,22 @@ setup_memory(void *kernel_end)
+ 		       i, cluster->usage, cluster->start_pfn,
+ 		       cluster->start_pfn + cluster->numpages);
+ 
+-		end = cluster->start_pfn + cluster->numpages;
++		/* cluster->start_pfn and numpages are in hardware (MMUPAGE)
++		 * units from the HWRPB. Convert to kernel page units for
++		 * max_low_pfn, and to physical bytes for memblock.  */
++		end = (cluster->start_pfn + cluster->numpages) >> PAGE_MMUSHIFT;
+ 		if (end > max_low_pfn)
+ 			max_low_pfn = end;
+ 
+-		memblock_add(PFN_PHYS(cluster->start_pfn),
+-			     cluster->numpages << PAGE_SHIFT);
++		memblock_add(cluster->start_pfn << MMUPAGE_SHIFT,
++			     cluster->numpages << MMUPAGE_SHIFT);
+ 
+ 		/* Bit 0 is console/PALcode reserved.  Bit 1 is
+ 		   non-volatile memory -- we might want to mark
+ 		   this for later.  */
+ 		if (cluster->usage & 3)
+-			memblock_reserve(PFN_PHYS(cluster->start_pfn),
+-				         cluster->numpages << PAGE_SHIFT);
++			memblock_reserve(cluster->start_pfn << MMUPAGE_SHIFT,
++				         cluster->numpages << MMUPAGE_SHIFT);
+ 	}
+ 
+ 	/*
+diff --git a/arch/alpha/mm/fault.c b/arch/alpha/mm/fault.c
+index a9816bbc9f34..5c7771d34839 100644
+--- a/arch/alpha/mm/fault.c
++++ b/arch/alpha/mm/fault.c
+@@ -49,7 +49,7 @@ __load_new_mm_context(struct mm_struct *next_mm)
+ 
+ 	pcb = &current_thread_info()->pcb;
+ 	pcb->asn = mmc & HARDWARE_ASN_MASK;
+-	pcb->ptbr = ((unsigned long) next_mm->pgd - IDENT_ADDR) >> PAGE_SHIFT;
++	pcb->ptbr = ((unsigned long) next_mm->pgd - IDENT_ADDR) >> MMUPAGE_SHIFT;
+ 
+ 	__reload_thread(pcb);
+ }
+diff --git a/arch/alpha/mm/init.c b/arch/alpha/mm/init.c
+index 9531cbc761c0..99b860cb316d 100644
+--- a/arch/alpha/mm/init.c
++++ b/arch/alpha/mm/init.c
+@@ -77,9 +77,10 @@ switch_to_system_map(void)
+ 	unsigned long original_pcb_ptr;
+ 
+ 	/* Initialize the kernel's page tables.  Linux puts the vptb in
+-	   the last slot of the L1 page table.  */
+-	memset(swapper_pg_dir, 0, PAGE_SIZE);
+-	newptbr = ((unsigned long) swapper_pg_dir - PAGE_OFFSET) >> PAGE_SHIFT;
++	   the last slot of the L1 page table.  The page table is one hardware
++	   page (MMUPAGE_SIZE), not a kernel page (PAGE_SIZE).  */
++	memset(swapper_pg_dir, 0, MMUPAGE_SIZE);
++	newptbr = ((unsigned long) swapper_pg_dir - PAGE_OFFSET) >> MMUPAGE_SHIFT;
+ 	pgd_val(swapper_pg_dir[1023]) =
+ 		(newptbr << 32) | pgprot_val(PAGE_KERNEL);
+ 
+@@ -152,17 +153,18 @@ callback_init(void * kernel_end)
+ 	   we need to allocate the PGD we use for vmalloc before we start
+ 	   forking other tasks.  */
+ 
++	/* Allocate two hardware pages for PUD and PMD page tables. */
+ 	two_pages = (void *)
+-	  (((unsigned long)kernel_end + ~PAGE_MASK) & PAGE_MASK);
+-	kernel_end = two_pages + 2*PAGE_SIZE;
+-	memset(two_pages, 0, 2*PAGE_SIZE);
++	  (((unsigned long)kernel_end + ~MMUPAGE_MASK) & MMUPAGE_MASK);
++	kernel_end = two_pages + 2*MMUPAGE_SIZE;
++	memset(two_pages, 0, 2*MMUPAGE_SIZE);
+ 
+ 	pgd = pgd_offset_k(VMALLOC_START);
+ 	p4d = p4d_offset(pgd, VMALLOC_START);
+ 	pud = pud_offset(p4d, VMALLOC_START);
+ 	pud_set(pud, (pmd_t *)two_pages);
+ 	pmd = pmd_offset(pud, VMALLOC_START);
+-	pmd_set(pmd, (pte_t *)(two_pages + PAGE_SIZE));
++	pmd_set(pmd, (pte_t *)(two_pages + MMUPAGE_SIZE));
+ 
+ 	if (alpha_using_srm) {
+ 		static struct vm_struct console_remap_vm;
+@@ -176,8 +178,8 @@ callback_init(void * kernel_end)
+ 
+ 		/* register the vm area */
+ 		console_remap_vm.flags = VM_ALLOC;
+-		console_remap_vm.size = nr_pages << PAGE_SHIFT;
+-		vm_area_register_early(&console_remap_vm, PAGE_SIZE);
++		console_remap_vm.size = nr_pages << MMUPAGE_SHIFT;
++		vm_area_register_early(&console_remap_vm, MMUPAGE_SIZE);
+ 
+ 		vaddr = (unsigned long)console_remap_vm.addr;
+ 
+@@ -188,18 +190,18 @@ callback_init(void * kernel_end)
+ 			crb->map[i].va = vaddr;
+ 			for (j = 0; j < crb->map[i].count; ++j) {
+ 				/* Newer consoles (especially on larger
+-				   systems) may require more pages of
+-				   PTEs. Grab additional pages as needed. */
++				   systems) may require more hardware pages of
++				   PTEs. Grab additional hardware pages as needed. */
+ 				if (pmd != pmd_offset(pud, vaddr)) {
+-					memset(kernel_end, 0, PAGE_SIZE);
++					memset(kernel_end, 0, MMUPAGE_SIZE);
+ 					pmd = pmd_offset(pud, vaddr);
+ 					pmd_set(pmd, (pte_t *)kernel_end);
+-					kernel_end += PAGE_SIZE;
++					kernel_end += MMUPAGE_SIZE;
+ 				}
+ 				set_pte(pte_offset_kernel(pmd, vaddr),
+ 					pfn_pte(pfn, PAGE_KERNEL));
+ 				pfn++;
+-				vaddr += PAGE_SIZE;
++				vaddr += MMUPAGE_SIZE;
+ 			}
+ 		}
+ 	}
+@@ -224,7 +226,7 @@ void __init arch_zone_limits_init(unsigned long *max_zone_pfn)
+  */
+ void __init paging_init(void)
+ {
+-	memset(absolute_pointer(ZERO_PGE), 0, PAGE_SIZE);
++	memset(absolute_pointer(ZERO_PGE), 0, MMUPAGE_SIZE);
+ }
+ 
+ #if defined(CONFIG_ALPHA_GENERIC) || defined(CONFIG_ALPHA_SRM)
+diff --git a/arch/arm/kernel/irq.c b/arch/arm/kernel/irq.c
+index 579177353906..8176225dc5d2 100644
+--- a/arch/arm/kernel/irq.c
++++ b/arch/arm/kernel/irq.c
+@@ -56,14 +56,9 @@ static void __init init_irq_stacks(void)
+ 	u8 *stack;
+ 	int cpu;
+ 
+-	pr_alert("PGCL: init_irq_stacks: THREAD_SIZE=%lu THREAD_ALIGN=%lu VMAP=%d\n",
+-		 (unsigned long)THREAD_SIZE, (unsigned long)THREAD_ALIGN,
+-		 IS_ENABLED(CONFIG_VMAP_STACK));
+ 	for_each_possible_cpu(cpu) {
+-		pr_alert("PGCL: irq_stack cpu=%d enter (order=%d sz=%d)\n", cpu, THREAD_SIZE_ORDER, THREAD_SIZE);
+ 		stack = (u8 *)__get_free_pages(GFP_KERNEL,
+ 					       THREAD_SIZE_ORDER);
+-		pr_alert("PGCL: irq_stack cpu=%d stack=%px\n", cpu, stack);
+ 		if (WARN_ON(!stack))
+ 			break;
+ 		per_cpu(irq_stack_ptr, cpu) = &stack[THREAD_SIZE];
+@@ -125,19 +120,14 @@ void __init init_IRQ(void)
+ {
+ 	int ret;
+ 
+-	pr_alert("PGCL: init_IRQ enter\n");
+ #ifdef CONFIG_IRQSTACKS
+-	pr_alert("PGCL: init_irq_stacks enter\n");
+ 	init_irq_stacks();
+-	pr_alert("PGCL: init_irq_stacks done\n");
+ #endif
+ 
+-	pr_alert("PGCL: irqchip_init enter\n");
+ 	if (IS_ENABLED(CONFIG_OF) && !machine_desc->init_irq)
+ 		irqchip_init();
+ 	else
+ 		machine_desc->init_irq();
+-	pr_alert("PGCL: irqchip_init done\n");
+ 
+ 	if (IS_ENABLED(CONFIG_OF) && IS_ENABLED(CONFIG_CACHE_L2X0) &&
+ 	    (machine_desc->l2c_aux_mask || machine_desc->l2c_aux_val)) {
+diff --git a/arch/arm/kernel/setup.c b/arch/arm/kernel/setup.c
+index d925bb3fa115..1fdc6a6e6f55 100644
+--- a/arch/arm/kernel/setup.c
++++ b/arch/arm/kernel/setup.c
+@@ -1105,9 +1105,6 @@ void __init setup_arch(char **cmdline_p)
+ 	if (atags_vaddr) {
+ 		mdesc = setup_machine_fdt(atags_vaddr);
+ 		if (mdesc) {
+-			pr_alert("PGCL: FDT at phys 0x%08x size 0x%x\n",
+-				 __atags_pointer,
+-				 fdt_totalsize(atags_vaddr));
+ 			memblock_reserve(__atags_pointer,
+ 					 fdt_totalsize(atags_vaddr));
+ 		}
+@@ -1153,20 +1150,14 @@ void __init setup_arch(char **cmdline_p)
+ 	 */
+ 	adjust_lowmem_bounds();
+ 	arm_memblock_init(mdesc);
+-	pr_alert("PGCL: arm_memblock_init done\n");
+ 	/* Memory may have been removed so recalculate the bounds. */
+ 	adjust_lowmem_bounds();
+-	pr_alert("PGCL: adjust_lowmem_bounds done\n");
+ 
+ 	early_ioremap_reset();
+-	pr_alert("PGCL: early_ioremap_reset done, calling paging_init\n");
+ 
+ 	paging_init(mdesc);
+-	pr_alert("PGCL: paging_init done\n");
+ 	kasan_init();
+-	pr_alert("PGCL: kasan_init done\n");
+ 	request_standard_resources(mdesc);
+-	pr_alert("PGCL: request_standard_resources done\n");
+ 
+ 	if (mdesc->restart) {
+ 		__arm_pm_restart = mdesc->restart;
+@@ -1174,12 +1165,9 @@ void __init setup_arch(char **cmdline_p)
+ 	}
+ 
+ 	unflatten_device_tree();
+-	pr_alert("PGCL: unflatten_device_tree done\n");
+ 
+ 	arm_dt_init_cpu_maps();
+-	pr_alert("PGCL: arm_dt_init_cpu_maps done\n");
+ 	psci_dt_init();
+-	pr_alert("PGCL: psci_dt_init done\n");
+ #ifdef CONFIG_SMP
+ 	if (is_smp()) {
+ 		if (!mdesc->smp_init || !mdesc->smp_init()) {
+@@ -1196,7 +1184,6 @@ void __init setup_arch(char **cmdline_p)
+ 	if (!is_smp())
+ 		hyp_mode_check();
+ 
+-	pr_alert("PGCL: smp init done\n");
+ 	reserve_crashkernel();
+ 
+ #ifdef CONFIG_VT
+diff --git a/arch/arm/kernel/smp.c b/arch/arm/kernel/smp.c
+index 338a0c267363..4e8e89a26ca3 100644
+--- a/arch/arm/kernel/smp.c
++++ b/arch/arm/kernel/smp.c
+@@ -393,11 +393,8 @@ static void smp_store_cpu_info(unsigned int cpuid)
+ 	cpu_info->loops_per_jiffy = loops_per_jiffy;
+ 	cpu_info->cpuid = read_cpuid_id();
+ 
+-	pr_alert("PGCL: store_cpu_topology\n");
+ 	store_cpu_topology(cpuid);
+-	pr_alert("PGCL: check_icache\n");
+ 	check_cpu_icache_size(cpuid);
+-	pr_alert("PGCL: store_cpu_info exit\n");
+ }
+ 
+ static void set_current(struct task_struct *cur)
+@@ -507,9 +504,7 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
+ {
+ 	unsigned int ncores = num_possible_cpus();
+ 
+-	pr_alert("PGCL: smp_prepare_cpus ncores=%d max_cpus=%d\n", ncores, max_cpus);
+ 	init_cpu_topology();
+-	pr_alert("PGCL: init_cpu_topology done\n");
+ 
+ 	smp_store_cpu_info(smp_processor_id());
+ 
+diff --git a/arch/arm/mm/init.c b/arch/arm/mm/init.c
+index b29fa0388499..e9c231a34407 100644
+--- a/arch/arm/mm/init.c
++++ b/arch/arm/mm/init.c
+@@ -180,10 +180,6 @@ void check_cpu_icache_size(int cpuid)
+ void __init arm_memblock_init(const struct machine_desc *mdesc)
+ {
+ 	/* Register the kernel text, kernel data and initrd with memblock. */
+-	pr_alert("PGCL: kernel phys 0x%08lx-0x%08lx size 0x%lx\n",
+-		 (unsigned long)__pa(KERNEL_START),
+-		 (unsigned long)__pa(KERNEL_END),
+-		 (unsigned long)(KERNEL_END - KERNEL_START));
+ 	memblock_reserve(__pa(KERNEL_START), KERNEL_END - KERNEL_START);
+ 
+ 	reserve_initrd_mem();
+@@ -471,8 +467,6 @@ void free_initmem(void)
+ 				}
+ 
+ 				if (has_pgtable) {
+-					pr_info("PGCL: free_initmem: skip %px (contains pgtable for L1[%d])\n",
+-						(void *)pos, i);
+ 					continue;
+ 				}
+ 				free_reserved_page(virt_to_page((void *)pos));
+diff --git a/arch/arm/mm/mmu.c b/arch/arm/mm/mmu.c
+index ede84d08f4ad..a702a801b370 100644
+--- a/arch/arm/mm/mmu.c
++++ b/arch/arm/mm/mmu.c
+@@ -758,18 +758,9 @@ static void __init alloc_init_pte(pmd_t *pmd, unsigned long addr,
+ 				  bool ng)
+ {
+ 	pte_t *pte = arm_pte_alloc(pmd, addr, type->prot_l1, alloc);
+-	if (addr >= 0xffff0000)
+-		pr_alert("PGCL: aip pte=%px addr=%08lx phys=%08x pmd=%08x base=%px idx=%lu\n",
+-			 pte, addr, (u32)phys, (u32)pmd_val(*pmd),
+-			 pmd_page_vaddr(*pmd), pte_index(addr));
+ 	do {
+ 		set_pte_ext(pte, __pte(phys | pgprot_val(__pgprot(type->prot_pte))),
+ 			    ng ? PTE_EXT_NG : 0);
+-		if (addr >= 0xffff0000) {
+-			u32 *hw = (u32 *)pte + PTRS_PER_PTE;
+-			pr_alert("PGCL: aip wrote pte@%px=%08x hw@%px=%08x\n",
+-				 pte, pte_val(*pte), hw, *hw);
+-		}
+ 		phys += MMUPAGE_SIZE;
+ 	} while (pte++, addr += MMUPAGE_SIZE, addr != end);
+ }
+@@ -1380,17 +1371,14 @@ static void __init devicemaps_init(const struct machine_desc *mdesc)
+ 	 * PAGE_SIZE alignment to avoid sub-page offset loss.
+ 	 */
+ 	vectors = memblock_alloc_or_panic(MMUPAGE_SIZE * 2, PAGE_SIZE);
+-	pr_alert("PGCL: devmaps vectors=%px\n", vectors);
+ 
+ 	early_trap_init(vectors);
+-	pr_alert("PGCL: devmaps early_trap_init done\n");
+ 
+ 	/*
+ 	 * Clear page table except top pmd used by early fixmaps
+ 	 */
+ 	for (addr = VMALLOC_START; addr < (FIXADDR_TOP & PMD_MASK); addr += PMD_SIZE)
+ 		pmd_clear(pmd_off_k(addr));
+-	pr_alert("PGCL: devmaps pmd_clear loop done\n");
+ 
+ 	if (__atags_pointer) {
+ 		/* create a read-only mapping of the device tree */
+@@ -1432,8 +1420,6 @@ static void __init devicemaps_init(const struct machine_desc *mdesc)
+ 	 */
+ 	{
+ 		phys_addr_t vphys = virt_to_phys(vectors);
+-		pr_alert("PGCL: devmaps vector mapping virt=%px phys=%pa\n",
+-			 vectors, &vphys);
+ 		map.pfn = __phys_to_pfn(vphys);
+ 		map.virtual = 0xffff0000;
+ 		map.length = MMUPAGE_SIZE * 2;
+@@ -1452,12 +1438,10 @@ static void __init devicemaps_init(const struct machine_desc *mdesc)
+ 		create_mapping(&map);
+ 	}
+ 
+-	pr_alert("PGCL: devmaps vector high done\n");
+ 
+ 	/*
+ 	 * Ask the machine support to map in the statically mapped devices.
+ 	 */
+-	pr_alert("PGCL: devmaps vector ro done, calling map_io\n");
+ 	if (mdesc->map_io)
+ 		mdesc->map_io();
+ 	else
+@@ -1741,8 +1725,6 @@ static void __init early_fixmap_shutdown(void)
+ 	int i;
+ 	unsigned long va = fix_to_virt(__end_of_permanent_fixed_addresses - 1);
+ 
+-	pr_alert("PGCL: fixmap va=0x%08lx, end=%d\n", va,
+-		 __end_of_permanent_fixed_addresses);
+ 	pte_offset_fixmap = pte_offset_late_fixmap;
+ 
+ 	/*
+@@ -1786,7 +1768,6 @@ static void __init early_fixmap_shutdown(void)
+ 		local_flush_tlb_kernel_range(va & PMD_MASK,
+ 					     (va & PMD_MASK) + PMD_SIZE);
+ 	}
+-	pr_alert("PGCL: fixmap remapped\n");
+ }
+ 
+ /*
+@@ -1803,26 +1784,18 @@ void __init paging_init(const struct machine_desc *mdesc)
+ 	pr_debug("physical kernel sections: 0x%08llx-0x%08llx\n",
+ 		 kernel_sec_start, kernel_sec_end);
+ 
+-	pr_alert("PGCL: prepare_page_table\n");
+ 	prepare_page_table();
+-	pr_alert("PGCL: map_lowmem\n");
+ 	map_lowmem();
+ 	memblock_set_current_limit(arm_lowmem_limit);
+-	pr_alert("PGCL: map_kernel\n");
+ 	map_kernel();
+-	pr_alert("PGCL: dma_contiguous_remap\n");
+ 	dma_contiguous_remap();
+-	pr_alert("PGCL: early_fixmap_shutdown\n");
+ 	early_fixmap_shutdown();
+-	pr_alert("PGCL: devicemaps_init\n");
+ 	devicemaps_init(mdesc);
+-	pr_alert("PGCL: kmap_init\n");
+ 	kmap_init();
+ 	tcm_init();
+ 
+ 	top_pmd = pmd_off_k(0xffff0000);
+ 
+-	pr_alert("PGCL: bootmem_init\n");
+ 	bootmem_init();
+ }
+ 
+diff --git a/arch/mips/mm/tlbex.c b/arch/mips/mm/tlbex.c
+index 69ea54bdc0c3..c90d4fe708f3 100644
+--- a/arch/mips/mm/tlbex.c
++++ b/arch/mips/mm/tlbex.c
+@@ -954,8 +954,8 @@ EXPORT_SYMBOL_GPL(build_get_pgde32);
+ 
+ static void build_adjust_context(u32 **p, unsigned int ctx)
+ {
+-	unsigned int shift = 4 - (PTE_T_LOG2 + 1) + PAGE_SHIFT - 12;
+-	unsigned int mask = (PTRS_PER_PTE / 2 - 1) << (PTE_T_LOG2 + 1);
++	unsigned int shift = 4 - (PTE_T_LOG2 + 1) + MMUPAGE_SHIFT - 12;
++	unsigned int mask = (MMUPAGE_SIZE / sizeof(pte_t) / 2 - 1) << (PTE_T_LOG2 + 1);
+ 
+ 	if (shift)
+ 		UASM_i_SRL(p, ctx, ctx, shift);
+@@ -1217,7 +1217,7 @@ build_fast_tlb_refill_handler (u32 **p, struct uasm_label **l,
+ 		build_tlb_write_entry(p, l, r, tlb_random);
+ 		uasm_l_leave(l, *p);
+ 		rv.restore_scratch = 1;
+-	} else if (PAGE_SHIFT == 14 || PAGE_SHIFT == 13)  {
++	} else if (MMUPAGE_SHIFT == 14 || MMUPAGE_SHIFT == 13)  {
+ 		build_tlb_write_entry(p, l, r, tlb_random);
+ 		uasm_l_leave(l, *p);
+ 		UASM_i_LW(p, scratch, scratchpad_offset(0), 0);
+@@ -2012,8 +2012,8 @@ build_r4000_tlbchange_handler_head(u32 **p, struct uasm_label **l,
+ 
+ 	UASM_i_MFC0(p, wr.r1, C0_BADVADDR);
+ 	UASM_i_LW(p, wr.r2, 0, wr.r2);
+-	UASM_i_SRL(p, wr.r1, wr.r1, PAGE_SHIFT - PTE_T_LOG2);
+-	uasm_i_andi(p, wr.r1, wr.r1, (PTRS_PER_PTE - 1) << PTE_T_LOG2);
++	UASM_i_SRL(p, wr.r1, wr.r1, MMUPAGE_SHIFT - PTE_T_LOG2);
++	uasm_i_andi(p, wr.r1, wr.r1, (MMUPAGE_SIZE / sizeof(pte_t) - 1) << PTE_T_LOG2);
+ 	UASM_i_ADDU(p, wr.r2, wr.r2, wr.r1);
+ 
+ #ifdef CONFIG_SMP
+@@ -2415,7 +2415,7 @@ static void config_htw_params(void)
+ 	pwfield |= PGDIR_SHIFT << MIPS_PWFIELD_GDI_SHIFT;
+ 	/* re-initialize the PTI field including the even/odd bit */
+ 	pwfield &= ~MIPS_PWFIELD_PTI_MASK;
+-	pwfield |= PAGE_SHIFT << MIPS_PWFIELD_PTI_SHIFT;
++	pwfield |= MMUPAGE_SHIFT << MIPS_PWFIELD_PTI_SHIFT;
+ 	if (CONFIG_PGTABLE_LEVELS >= 3) {
+ 		pwfield &= ~MIPS_PWFIELD_MDI_MASK;
+ 		pwfield |= PMD_SHIFT << MIPS_PWFIELD_MDI_SHIFT;
+@@ -2440,7 +2440,7 @@ static void config_htw_params(void)
+ 	}
+ 
+ 	pwsize = ilog2(PTRS_PER_PGD) << MIPS_PWSIZE_GDW_SHIFT;
+-	pwsize |= ilog2(PTRS_PER_PTE) << MIPS_PWSIZE_PTW_SHIFT;
++	pwsize |= ilog2(MMUPAGE_SIZE / sizeof(pte_t)) << MIPS_PWSIZE_PTW_SHIFT;
+ 	if (CONFIG_PGTABLE_LEVELS >= 3)
+ 		pwsize |= ilog2(PTRS_PER_PMD) << MIPS_PWSIZE_MDW_SHIFT;
+ 
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index a1e70a0b0333..8c5e47c28d9a 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -934,14 +934,10 @@ void __init init_cpu_topology(void)
+ {
+ 	int cpu, ret;
+ 
+-	pr_alert("PGCL: init_cpu_topology: reset\n");
+ 	reset_cpu_topology();
+-	pr_alert("PGCL: init_cpu_topology: parse_acpi\n");
+ 	ret = parse_acpi_topology();
+-	pr_alert("PGCL: init_cpu_topology: parse_dt ret=%d\n", ret);
+ 	if (!ret)
+ 		ret = of_have_populated_dt() && parse_dt_topology();
+-	pr_alert("PGCL: init_cpu_topology: dt done ret=%d\n", ret);
+ 
+ 	if (ret) {
+ 		/*
+@@ -953,16 +949,13 @@ void __init init_cpu_topology(void)
+ 	}
+ 
+ 	for_each_possible_cpu(cpu) {
+-		pr_alert("PGCL: init_cpu_topology: fetch_cache cpu=%d\n", cpu);
+ 		ret = fetch_cache_info(cpu);
+-		pr_alert("PGCL: init_cpu_topology: fetch_cache cpu=%d ret=%d\n", cpu, ret);
+ 		if (!ret)
+ 			continue;
+ 		else if (ret != -ENOENT)
+ 			pr_err("Early cacheinfo failed, ret = %d\n", ret);
+ 		return;
+ 	}
+-	pr_alert("PGCL: init_cpu_topology: done\n");
+ }
+ 
+ void store_cpu_topology(unsigned int cpuid)
+diff --git a/drivers/of/fdt.c b/drivers/of/fdt.c
+index 7e92cf413fa8..82f7327c59ea 100644
+--- a/drivers/of/fdt.c
++++ b/drivers/of/fdt.c
+@@ -1336,8 +1336,6 @@ static int __init of_fdt_raw_init(void)
+ 	if (!initial_boot_params)
+ 		return 0;
+ 
+-	pr_alert("PGCL: of_fdt_raw_init: initial_boot_params=%px totalsize=0x%x\n",
+-		 initial_boot_params, fdt_totalsize(initial_boot_params));
+ 	if (of_fdt_crc32 != crc32_be(~0, initial_boot_params,
+ 				     fdt_totalsize(initial_boot_params))) {
+ 		pr_warn("not creating '/sys/firmware/fdt': CRC check failed\n");
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index ff7c18b07553..9c054c77cdba 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -399,8 +399,6 @@ static unsigned long elf_map(struct file *filep, unsigned long addr,
+ 	} else
+ 		map_addr = vm_mmap(filep, addr, size, prot, type, off);
+ 
+-	pr_alert("PGCL: elf_map: addr=0x%lx size=0x%lx off=0x%lx prot=0x%x type=0x%x map_addr=0x%lx\n",
+-		 addr, size, off, prot, type, map_addr);
+ 
+ 	if ((type & MAP_FIXED_NOREPLACE) &&
+ 	    PTR_ERR((void *)map_addr) == -EEXIST)
+@@ -425,7 +423,6 @@ static unsigned long elf_load(struct file *filep, unsigned long addr,
+ 	if (eppnt->p_filesz) {
+ 		map_addr = elf_map(filep, addr, eppnt, prot, type, total_size);
+ 		if (BAD_ADDR(map_addr)) {
+-			pr_alert("PGCL: elf_load: elf_map failed addr=0x%lx map_addr=0x%lx\n", addr, map_addr);
+ 			return map_addr;
+ 		}
+ 		if (eppnt->p_memsz > eppnt->p_filesz) {
+@@ -439,9 +436,6 @@ static unsigned long elf_load(struct file *filep, unsigned long addr,
+ 			 * any errors if the segment isn't writable.
+ 			 */
+ 			if (padzero(zero_start) && (prot & PROT_WRITE)) {
+-				pr_alert("PGCL: elf_load: padzero failed at 0x%lx (map_addr=0x%lx pageoff=0x%lx filesz=0x%lx memsz=0x%lx prot=0x%x)\n",
+-					 zero_start, map_addr, (unsigned long)ELF_PAGEOFFSET(eppnt->p_vaddr),
+-					 (unsigned long)eppnt->p_filesz, (unsigned long)eppnt->p_memsz, prot);
+ 				return -EFAULT;
+ 			}
+ 		}
+@@ -1037,7 +1031,6 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),
+ 				 executable_stack);
+ 	if (retval < 0) {
+-		pr_alert("PGCL: setup_arg_pages failed: retval=%d\n", retval);
+ 		goto out_free_dentry;
+ 	}
+ 
+@@ -1201,8 +1194,6 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		if (BAD_ADDR(error)) {
+ 			retval = IS_ERR_VALUE(error) ?
+ 				PTR_ERR((void*)error) : -EINVAL;
+-			pr_alert("PGCL: elf_load failed: addr=0x%lx vaddr=0x%lx bias=0x%lx flags=0x%x error=0x%lx retval=%d\n",
+-				 load_bias + vaddr, vaddr, load_bias, elf_flags, error, retval);
+ 			goto out_free_dentry;
+ 		}
+ 
+@@ -1396,7 +1387,6 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 
+ 	/* error cleanup */
+ out_free_dentry:
+-	pr_alert("PGCL: load_elf_binary: out_free_dentry retval=%d\n", retval);
+ 	kfree(interp_elf_ex);
+ 	kfree(interp_elf_phdata);
+ out_free_file:
+@@ -1404,7 +1394,6 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	if (interpreter)
+ 		fput(interpreter);
+ out_free_ph:
+-	pr_alert("PGCL: load_elf_binary: out_free_ph retval=%d\n", retval);
+ 	kfree(elf_phdata);
+ 	goto out;
+ }
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index e0a85ea9f313..7024870fe79d 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -430,7 +430,8 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 
+ 			for (j = 0; j < PAGE_MMUCOUNT; j++) {
+ 				set_pte(ptep, __pte(pte_val(pte) +
+-						    j * MMUPAGE_SIZE));
++					__phys_to_pte_val((phys_addr_t)j *
++							  MMUPAGE_SIZE)));
+ 				ptep++;
+ 			}
+ 			if (i + 1 < nr)
+diff --git a/init/main.c b/init/main.c
+index 6eebc43a07b1..335a0055a208 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -719,11 +719,8 @@ static noinline void __ref __noreturn rest_init(void)
+ 	struct task_struct *tsk;
+ 	int pid;
+ 
+-	pr_alert("PGCL: rest_init enter\n");
+ 	rcu_scheduler_starting();
+-	pr_alert("PGCL: rest_init: user_mode_thread(kernel_init)\n");
+ 	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
+-	pr_alert("PGCL: rest_init: kernel_init pid=%d\n", pid);
+ 	/*
+ 	 * Pin init on the boot CPU. Task migration is not properly working
+ 	 * until sched_init_smp() has been run. It will set the allowed
+@@ -736,7 +733,6 @@ static noinline void __ref __noreturn rest_init(void)
+ 	rcu_read_unlock();
+ 
+ 	numa_default_policy();
+-	pr_alert("PGCL: rest_init: kernel_thread(kthreadd)\n");
+ 	pid = kernel_thread(kthreadd, NULL, NULL, CLONE_FS | CLONE_FILES);
+ 	rcu_read_lock();
+ 	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
+@@ -1121,9 +1117,7 @@ void start_kernel(void)
+ 	context_tracking_init();
+ 	/* init some links before init_ISA_irqs() */
+ 	early_irq_init();
+-	pr_alert("PGCL: early_irq_init done\n");
+ 	init_IRQ();
+-	pr_alert("PGCL: init_IRQ done\n");
+ 	tick_init();
+ 	rcu_init_nohz();
+ 	timers_init();
+@@ -1132,7 +1126,6 @@ void start_kernel(void)
+ 	softirq_init();
+ 	vdso_setup_data_pages();
+ 	timekeeping_init();
+-	pr_alert("PGCL: timekeeping_init done\n");
+ 	time_init();
+ 
+ 	/* This must be after timekeeping is initialized */
+@@ -1147,13 +1140,10 @@ void start_kernel(void)
+ 	call_function_init();
+ 	WARN(!irqs_disabled(), "Interrupts were enabled early\n");
+ 
+-	pr_alert("PGCL: time_init done, enabling IRQs\n");
+ 	early_boot_irqs_disabled = false;
+ 	local_irq_enable();
+-	pr_alert("PGCL: local_irq_enable done\n");
+ 
+ 	kmem_cache_init_late();
+-	pr_alert("PGCL: kmem_cache_init_late done\n");
+ 
+ 	/*
+ 	 * HACK ALERT! This is early. We're enabling the console before
+@@ -1161,7 +1151,6 @@ void start_kernel(void)
+ 	 * this. But we do want output early, in case something goes wrong.
+ 	 */
+ 	console_init();
+-	pr_alert("PGCL: console_init done\n");
+ 	if (panic_later)
+ 		panic("Too many boot %s vars at `%s'", panic_later,
+ 		      panic_param);
+@@ -1606,11 +1595,8 @@ static int __ref kernel_init(void *unused)
+ 	ftrace_free_init_mem();
+ 	kgdb_free_init_mem();
+ 	exit_boot_config();
+-	pr_alert("PGCL: kernel_init: free_initmem\n");
+ 	free_initmem();
+-	pr_alert("PGCL: kernel_init: mark_readonly\n");
+ 	mark_readonly();
+-	pr_alert("PGCL: kernel_init: mark_readonly done\n");
+ 
+ 	/*
+ 	 * Kernel mappings are now finalized - update the userspace page-table
+@@ -1625,12 +1611,8 @@ static int __ref kernel_init(void *unused)
+ 
+ 	do_sysctl_args();
+ 
+-	pr_alert("PGCL: kernel_init: about to run init process\n");
+ 	if (ramdisk_execute_command) {
+-		pr_alert("PGCL: kernel_init: ramdisk_execute_command='%s'\n",
+-			 ramdisk_execute_command);
+ 		ret = run_init_process(ramdisk_execute_command);
+-		pr_alert("PGCL: kernel_init: run_init_process returned %d\n", ret);
+ 		if (!ret)
+ 			return 0;
+ 		pr_err("Failed to execute %s (error %d)\n",
+@@ -1697,26 +1679,16 @@ static noinline void __init kernel_init_freeable(void)
+ 
+ 	cad_pid = get_pid(task_pid(current));
+ 
+-	pr_alert("PGCL: smp_prepare_cpus enter\n");
+ 	smp_prepare_cpus(setup_max_cpus);
+-	pr_alert("PGCL: smp_prepare_cpus done\n");
+ 
+-	pr_alert("PGCL: workqueue_init enter\n");
+ 	workqueue_init();
+-	pr_alert("PGCL: workqueue_init done\n");
+ 
+-	pr_alert("PGCL: init_mm_internals enter\n");
+ 	init_mm_internals();
+-	pr_alert("PGCL: init_mm_internals done\n");
+ 
+-	pr_alert("PGCL: do_pre_smp_initcalls enter\n");
+ 	do_pre_smp_initcalls();
+-	pr_alert("PGCL: do_pre_smp_initcalls done\n");
+ 	lockup_detector_init();
+ 
+-	pr_alert("PGCL: smp_init enter\n");
+ 	smp_init();
+-	pr_alert("PGCL: smp_init done\n");
+ 	sched_init_smp();
+ 
+ 	workqueue_init_topology();
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index 48556ee3602c..33b721a9af02 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -8115,10 +8115,8 @@ void __init workqueue_init(void)
+ 	struct worker_pool *pool;
+ 	int cpu, bkt;
+ 
+-	pr_alert("PGCL: workqueue_init: thresh\n");
+ 	wq_cpu_intensive_thresh_init();
+ 
+-	pr_alert("PGCL: workqueue_init: mutex_lock\n");
+ 	mutex_lock(&wq_pool_mutex);
+ 
+ 	/*
+@@ -8132,7 +8130,6 @@ void __init workqueue_init(void)
+ 			pool->node = cpu_to_node(cpu);
+ 	}
+ 
+-	pr_alert("PGCL: workqueue_init: init_rescuers\n");
+ 	list_for_each_entry(wq, &workqueues, list) {
+ 		WARN(init_rescuer(wq),
+ 		     "workqueue: failed to create early rescuer for %s",
+@@ -8141,7 +8138,6 @@ void __init workqueue_init(void)
+ 
+ 	mutex_unlock(&wq_pool_mutex);
+ 
+-	pr_alert("PGCL: workqueue_init: create_bh_workers\n");
+ 	/*
+ 	 * Create the initial workers. A BH pool has one pseudo worker that
+ 	 * represents the shared BH execution context and thus doesn't get
+@@ -8152,7 +8148,6 @@ void __init workqueue_init(void)
+ 		for_each_bh_worker_pool(pool, cpu)
+ 			BUG_ON(!create_worker(pool));
+ 
+-	pr_alert("PGCL: workqueue_init: create_cpu_workers\n");
+ 	for_each_online_cpu(cpu) {
+ 		for_each_cpu_worker_pool(pool, cpu) {
+ 			pool->flags &= ~POOL_DISASSOCIATED;
+@@ -8160,11 +8155,9 @@ void __init workqueue_init(void)
+ 		}
+ 	}
+ 
+-	pr_alert("PGCL: workqueue_init: create_unbound_workers\n");
+ 	hash_for_each(unbound_pool_hash, bkt, pool, hash_node)
+ 		BUG_ON(!create_worker(pool));
+ 
+-	pr_alert("PGCL: workqueue_init: online\n");
+ 	wq_online = true;
+ 	wq_watchdog_init();
+ }
+-- 
+2.54.0
+

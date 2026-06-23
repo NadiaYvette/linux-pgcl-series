@@ -1,0 +1,140 @@
+From 7e2b7c51ebbe93f5fded1654be585a71bdbf5834 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 17:05:36 +0200
+Subject: [PATCH 091/174] mm/rmap: folio_referenced_one consumes correct
+ MMUPAGE units under PGCL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+folio_referenced_one had three unit-mismatch bugs that mostly cancelled
+each other out under non-PGCL but corrupted walker state and rmap
+accounting under PGCL=4:
+
+  1. max_nr = (end_addr - address) >> PAGE_SHIFT;
+
+     PTEs are MMUPAGE-granular, not PAGE-granular.  Under PGCL=4 this
+     under-counted available PTEs by 16x, capping folio_pte_batch's
+     scan to 1/16 of the PMD/VMA tail and missing legitimate
+     batch-eligible PTEs.
+
+  2. pvmw.pte += nr - 1;         (PTE pointer arithmetic — MMUPAGE)
+     pvmw.address += (nr - 1) * PAGE_SIZE;    (PAGE units)
+
+     The "skip the batched PTEs" optimization advanced pvmw.pte by
+     nr-1 PTE slots (nr-1 MMUPAGE worth of address) but advanced
+     pvmw.address by (nr-1) * 64KB (kernel pages).  Under PGCL=4
+     they desynced by 16x.  After the skip the walker's next_pte
+     loop incremented pte and address from these mismatched starting
+     positions, causing the address used for TLB flushes,
+     vma_address_end checks, and PMD-boundary detection to drift far
+     ahead of the PTE the walker was actually inspecting.
+
+  3. pra->mapcount -= nr;
+     if (ptes == pvmw.nr_pages) { ... walk_done; }
+
+     pra->mapcount is in kernel-page-mapping units (one rmap event
+     per kernel page mapped in a VMA), nr from folio_pte_batch is in
+     MMUPAGE units.  Decrementing mapcount by nr over-decremented by
+     PAGE_MMUCOUNT under PGCL, causing folio_referenced to think it
+     had observed all mappings after only ceil(N/PAGE_MMUCOUNT)
+     yields and short-circuit the rmap walk early.  The early-exit
+     check `ptes == pvmw.nr_pages` likewise compared MMUPAGE PTE
+     count against kernel-page count, firing PAGE_MMUCOUNT× too
+     early.
+
+Fix all three:
+
+  - max_nr now uses MMUPAGE_SHIFT.
+  - The skip optimization uses MMUPAGE_SIZE for address.
+  - Mapcount is decremented by ceil(nr / PAGE_MMUCOUNT)
+    ((nr + PAGE_MMUCOUNT - 1) >> PAGE_MMUSHIFT), so a partial
+    kernel-page batch (sub-page gap) still counts as one observed
+    mapping site.
+  - Early-exit compares ptes (MMUPAGE) against
+    pvmw.nr_pages * PAGE_MMUCOUNT.
+
+For non-PGCL builds (PAGE_MMUSHIFT == 0, PAGE_MMUCOUNT == 1):
+- MMUPAGE_SHIFT == PAGE_SHIFT, so max_nr is unchanged.
+- (nr + 0) >> 0 == nr, so the mapcount form collapses to legacy.
+- pvmw.nr_pages * 1 == pvmw.nr_pages, so the early-exit collapses too.
+- MMUPAGE_SIZE == PAGE_SIZE, so the skip stride is unchanged.
+
+Verified on x86_64 PGCL=4 (LTP 71p/0f/28s — exact baseline match)
+and aarch64 PGCL=4 (cow selftest PASS, PGCL basic 19/19, stress
+12/12, all mm selftests PASS, zero kernel BUG/Oops/WARNING/Bad-page-state).
+Test outcomes byte-identical to the post-Bug-2-fix baseline.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/rmap.c | 38 ++++++++++++++++++++++++++++++++------
+ 1 file changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index b4bd84f6fde7..013ca259130e 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -967,7 +967,15 @@ static bool folio_referenced_one(struct folio *folio,
+ 
+ 		if (pvmw.pte && folio_test_large(folio)) {
+ 			const unsigned long end_addr = pmd_addr_end(address, vma->vm_end);
+-			const unsigned int max_nr = (end_addr - address) >> PAGE_SHIFT;
++			/*
++			 * max_nr is the count of PTEs to PMD/VMA end; PTEs are
++			 * MMUPAGE-granular, so shift by MMUPAGE_SHIFT (under
++			 * non-PGCL MMUPAGE_SHIFT == PAGE_SHIFT and this is the
++			 * legacy form).  folio_pte_batch returns nr in MMUPAGE
++			 * units as well, so the subsequent ptes/address arithmetic
++			 * is consistent.
++			 */
++			const unsigned int max_nr = (end_addr - address) >> MMUPAGE_SHIFT;
+ 			pte_t pteval = ptep_get(pvmw.pte);
+ 
+ 			nr = folio_pte_batch(folio, pvmw.pte, pteval, max_nr);
+@@ -993,20 +1001,38 @@ static bool folio_referenced_one(struct folio *folio,
+ 			WARN_ON_ONCE(1);
+ 		}
+ 
++		/*
++		 * ptes accumulates MMUPAGE PTE counts (nr is MMUPAGE-granular
++		 * from folio_pte_batch / from the nr=1 default for the PMD
++		 * and non-large-folio paths).  pra->mapcount is in kernel-
++		 * page-mapping units (each kernel page mapped in a VMA is one
++		 * rmap event); convert nr by ceiling-dividing by PAGE_MMUCOUNT
++		 * so a partial-kernel-page batch (sub-page gap) still counts
++		 * as one observed mapping site.  For non-PGCL builds
++		 * PAGE_MMUCOUNT == 1 and this collapses to `pra->mapcount -= nr`.
++		 */
+ 		ptes += nr;
+-		pra->mapcount -= nr;
++		pra->mapcount -= (nr + PAGE_MMUCOUNT - 1) >> PAGE_MMUSHIFT;
+ 		/*
+ 		 * If we are sure that we batched the entire folio,
+-		 * we can just optimize and stop right here.
++		 * we can just optimize and stop right here.  Both sides in
++		 * MMUPAGE units: ptes is the cumulative MMUPAGE PTE count,
++		 * pvmw.nr_pages * PAGE_MMUCOUNT is the folio's total MMUPAGE
++		 * PTE footprint when fully mapped.
+ 		 */
+-		if (ptes == pvmw.nr_pages) {
++		if (ptes == pvmw.nr_pages * PAGE_MMUCOUNT) {
+ 			page_vma_mapped_walk_done(&pvmw);
+ 			break;
+ 		}
+ 
+-		/* Skip the batched PTEs */
++		/*
++		 * Skip the batched PTEs.  Both arithmetic in MMUPAGE units:
++		 * pvmw.pte advances by (nr-1) PTE slots, pvmw.address advances
++		 * by (nr-1) * MMUPAGE_SIZE.  The previous PAGE_SIZE stride
++		 * desynced address from pte by PAGE_MMUCOUNT under PGCL.
++		 */
+ 		pvmw.pte += nr - 1;
+-		pvmw.address += (nr - 1) * PAGE_SIZE;
++		pvmw.address += (nr - 1) * MMUPAGE_SIZE;
+ 	}
+ 
+ 	if (referenced)
+-- 
+2.54.0
+

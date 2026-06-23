@@ -1,0 +1,1198 @@
+From 460b0dcaea9618c027651b50b25e16ae67843869 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 21 Mar 2026 22:33:40 +0100
+Subject: [PATCH 033/174] =?UTF-8?q?PGCL:=20arm32=20PAGE=5FMMUSHIFT=3D4=20b?=
+ =?UTF-8?q?oot=20=E2=80=94=2015/15=20pgcl-test=20+=208/8=20pgcl-stress=20P?=
+ =?UTF-8?q?ASS?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ARM32 PGCL boot with PAGE_MMUSHIFT=4 (PAGE_SIZE=64KB, MMUPAGE_SIZE=4KB).
+All 23 userspace tests pass with zero kernel warnings.
+
+Key fixes:
+- FIRST_USER_ADDRESS: PAGE_SIZE*2 → MMUPAGE_SIZE*2 (was rejecting ELF at 0x10000)
+- fault.c: handle_mm_fault PAGE_MASK → MMUPAGE_MASK (64KB round-down below VMA)
+- free_initmem: raw L1 table scan (4096 entries) to find PTE tables in init
+  section — Linux PGD abstraction misses second L1 desc per 2MB pair, causing
+  vectors page corruption when PTE table freed
+- fault-armv.c: pgoff shifts PAGE_SHIFT → MMUPAGE_SHIFT (VIVT cache aliasing)
+- pageattr.c: set_memory_* numpages PAGE_SIZE → MMUPAGE_SIZE
+- ioremap.c: ioremap_page and iomem_set_ro PAGE → MMUPAGE granularity
+- mmu.c: early fixmap, devicemaps, PTE table setup for PGCL
+- kfence.h, pgalloc.h, pgd.c, traps.c, entry-header.S, thread_info.h,
+  irq.c, setup.c, smp.c: MMUPAGE/THREAD_SIZE/stack alignment fixes
+- fixmap.h: FIXADDR_TOP uses MMUPAGE_SIZE
+
+Also includes debug prints in init/main.c, binfmt_elf.c, workqueue.c,
+arch_topology.c, fdt.c, initramfs.c, vmalloc.c, page_alloc.c, madvise.c
+for boot tracing (to be cleaned up in a future commit).
+
+Tested: qemu-system-arm -M virt -cpu cortex-a15 -m 768M, nosmp
+Build: arm-linux-gnu-gcc 15.2.1, multi_v7 config + PAGE_MMUSHIFT=4
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm/include/asm/fixmap.h      |   2 +-
+ arch/arm/include/asm/kfence.h      |   9 +-
+ arch/arm/include/asm/pgalloc.h     |   2 +-
+ arch/arm/include/asm/pgtable.h     |  10 +-
+ arch/arm/include/asm/thread_info.h |   2 +-
+ arch/arm/kernel/entry-header.S     |   8 +-
+ arch/arm/kernel/irq.c              |  20 ++--
+ arch/arm/kernel/setup.c            |  16 +++-
+ arch/arm/kernel/smp.c              |   5 +
+ arch/arm/kernel/traps.c            |   4 +-
+ arch/arm/mm/fault-armv.c           |   4 +-
+ arch/arm/mm/fault.c                |   2 +-
+ arch/arm/mm/init.c                 |  78 +++++++++++++--
+ arch/arm/mm/ioremap.c              |   4 +-
+ arch/arm/mm/mmu.c                  | 146 +++++++++++++++++++----------
+ arch/arm/mm/pageattr.c             |   8 +-
+ arch/arm/mm/pgd.c                  |   2 +-
+ drivers/base/arch_topology.c       |   7 ++
+ drivers/of/fdt.c                   |   2 +
+ fs/binfmt_elf.c                    |  21 ++++-
+ init/initramfs.c                   |   9 +-
+ init/main.c                        |  33 ++++++-
+ kernel/workqueue.c                 |   7 ++
+ mm/madvise.c                       |   2 +-
+ mm/vmalloc.c                       |  20 ++++
+ 25 files changed, 326 insertions(+), 97 deletions(-)
+
+diff --git a/arch/arm/include/asm/fixmap.h b/arch/arm/include/asm/fixmap.h
+index 707068f852c2..3f1d9602844d 100644
+--- a/arch/arm/include/asm/fixmap.h
++++ b/arch/arm/include/asm/fixmap.h
+@@ -4,7 +4,7 @@
+ 
+ #define FIXADDR_START		0xffc80000UL
+ #define FIXADDR_END		0xfff00000UL
+-#define FIXADDR_TOP		(FIXADDR_END - PAGE_SIZE)
++#define FIXADDR_TOP		(FIXADDR_END - MMUPAGE_SIZE)
+ 
+ #include <linux/pgtable.h>
+ #include <asm/kmap_size.h>
+diff --git a/arch/arm/include/asm/kfence.h b/arch/arm/include/asm/kfence.h
+index 7980d0f2271f..02c0d8be7018 100644
+--- a/arch/arm/include/asm/kfence.h
++++ b/arch/arm/include/asm/kfence.h
+@@ -17,8 +17,11 @@ static inline int split_pmd_page(pmd_t *pmd, unsigned long addr)
+ 	if (!pte)
+ 		return -ENOMEM;
+ 
+-	for (i = 0; i < PTRS_PER_PTE; i++)
+-		set_pte_ext(pte + i, pfn_pte(pfn + i, PAGE_KERNEL), 0);
++	for (i = 0; i < PTRS_PER_PTE; i++) {
++		phys_addr_t phys = ((phys_addr_t)pfn << PAGE_SHIFT) +
++				   (unsigned long)i * MMUPAGE_SIZE;
++		set_pte_ext(pte + i, __pte(phys | pgprot_val(PAGE_KERNEL)), 0);
++	}
+ 	pmd_populate_kernel(&init_mm, pmd, pte);
+ 
+ 	flush_tlb_kernel_range(addr, addr + PMD_SIZE);
+@@ -31,7 +34,7 @@ static inline bool arch_kfence_init_pool(void)
+ 	pmd_t *pmd;
+ 
+ 	for (addr = (unsigned long)__kfence_pool; is_kfence_address((void *)addr);
+-	     addr += PAGE_SIZE) {
++	     addr += MMUPAGE_SIZE) {
+ 		pmd = pmd_off_k(addr);
+ 
+ 		if (pmd_leaf(*pmd)) {
+diff --git a/arch/arm/include/asm/pgalloc.h b/arch/arm/include/asm/pgalloc.h
+index a17f01235c29..ea11736880bc 100644
+--- a/arch/arm/include/asm/pgalloc.h
++++ b/arch/arm/include/asm/pgalloc.h
+@@ -29,7 +29,7 @@ static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
+ }
+ 
+ #else	/* !CONFIG_ARM_LPAE */
+-#define PGD_SIZE		(PAGE_SIZE << 2)
++#define PGD_SIZE		(PTRS_PER_PGD * sizeof(pgd_t))
+ 
+ /*
+  * Since we have only two-level page tables, these are trivial
+diff --git a/arch/arm/include/asm/pgtable.h b/arch/arm/include/asm/pgtable.h
+index 982795cf4563..1da094e7380a 100644
+--- a/arch/arm/include/asm/pgtable.h
++++ b/arch/arm/include/asm/pgtable.h
+@@ -57,7 +57,7 @@ extern void __pgd_error(const char *file, int line, pgd_t);
+  * mapping to be mapped at.  This is particularly important for
+  * non-high vector CPUs.
+  */
+-#define FIRST_USER_ADDRESS	(PAGE_SIZE * 2)
++#define FIRST_USER_ADDRESS	(MMUPAGE_SIZE * 2)
+ 
+ /*
+  * Use TASK_SIZE as the ceiling argument for free_pgtables() and
+@@ -150,7 +150,13 @@ extern pgd_t swapper_pg_dir[PTRS_PER_PGD];
+ 
+ static inline pte_t *pmd_page_vaddr(pmd_t pmd)
+ {
+-	return __va(pmd_val(pmd) & PHYS_MASK & (s32)PAGE_MASK);
++	/*
++	 * The PTE page base address stored in the PMD is MMUPAGE-aligned
++	 * (after the PTE_HWTABLE_OFF offset). With PGCL, PAGE_MASK would
++	 * truncate the sub-PAGE bits. Use a mask that preserves the full
++	 * PTE table alignment (PTE_HWTABLE_OFF + PTE_HWTABLE_SIZE bytes).
++	 */
++	return __va(pmd_val(pmd) & PHYS_MASK & (s32)MMUPAGE_MASK);
+ }
+ 
+ #define pmd_page(pmd)		pfn_to_page(__phys_to_pfn(pmd_val(pmd) & PHYS_MASK))
+diff --git a/arch/arm/include/asm/thread_info.h b/arch/arm/include/asm/thread_info.h
+index 943ffcf069d2..bdeaf55d237c 100644
+--- a/arch/arm/include/asm/thread_info.h
++++ b/arch/arm/include/asm/thread_info.h
+@@ -22,7 +22,7 @@
+ #else
+ #define THREAD_SIZE_ORDER	1
+ #endif
+-#define THREAD_SIZE		(PAGE_SIZE << THREAD_SIZE_ORDER)
++#define THREAD_SIZE		(MMUPAGE_SIZE << THREAD_SIZE_ORDER)
+ #define THREAD_START_SP		(THREAD_SIZE - 8)
+ 
+ #ifdef CONFIG_VMAP_STACK
+diff --git a/arch/arm/kernel/entry-header.S b/arch/arm/kernel/entry-header.S
+index 99411fa91350..310a4a5db6ec 100644
+--- a/arch/arm/kernel/entry-header.S
++++ b/arch/arm/kernel/entry-header.S
+@@ -433,11 +433,11 @@ tsk	.req	r9		@ current thread_info
+ #ifdef CONFIG_VMAP_STACK
+ 	@
+ 	@ Test whether the SP has overflowed. Task and IRQ stacks are aligned
+-	@ so that SP & BIT(THREAD_SIZE_ORDER + PAGE_SHIFT) should always be
+-	@ zero.
++	@ so that SP & BIT(THREAD_SIZE_ORDER + MMUPAGE_SHIFT) should always be
++	@ zero. Use MMUPAGE_SHIFT since THREAD_SIZE is based on MMUPAGE_SIZE.
+ 	@
+-ARM(	tst	sp, #1 << (THREAD_SIZE_ORDER + PAGE_SHIFT)	)
+-THUMB(	tst	r1, #1 << (THREAD_SIZE_ORDER + PAGE_SHIFT)	)
++ARM(	tst	sp, #1 << (THREAD_SIZE_ORDER + MMUPAGE_SHIFT)	)
++THUMB(	tst	r1, #1 << (THREAD_SIZE_ORDER + MMUPAGE_SHIFT)	)
+ THUMB(	it	ne						)
+ 	bne	.Lstack_overflow_check\@
+ 
+diff --git a/arch/arm/kernel/irq.c b/arch/arm/kernel/irq.c
+index e1993e28a9ec..579177353906 100644
+--- a/arch/arm/kernel/irq.c
++++ b/arch/arm/kernel/irq.c
+@@ -56,15 +56,14 @@ static void __init init_irq_stacks(void)
+ 	u8 *stack;
+ 	int cpu;
+ 
++	pr_alert("PGCL: init_irq_stacks: THREAD_SIZE=%lu THREAD_ALIGN=%lu VMAP=%d\n",
++		 (unsigned long)THREAD_SIZE, (unsigned long)THREAD_ALIGN,
++		 IS_ENABLED(CONFIG_VMAP_STACK));
+ 	for_each_possible_cpu(cpu) {
+-		if (!IS_ENABLED(CONFIG_VMAP_STACK))
+-			stack = (u8 *)__get_free_pages(GFP_KERNEL,
+-						       THREAD_SIZE_ORDER);
+-		else
+-			stack = __vmalloc_node(THREAD_SIZE, THREAD_ALIGN,
+-					       THREADINFO_GFP, NUMA_NO_NODE,
+-					       __builtin_return_address(0));
+-
++		pr_alert("PGCL: irq_stack cpu=%d enter (order=%d sz=%d)\n", cpu, THREAD_SIZE_ORDER, THREAD_SIZE);
++		stack = (u8 *)__get_free_pages(GFP_KERNEL,
++					       THREAD_SIZE_ORDER);
++		pr_alert("PGCL: irq_stack cpu=%d stack=%px\n", cpu, stack);
+ 		if (WARN_ON(!stack))
+ 			break;
+ 		per_cpu(irq_stack_ptr, cpu) = &stack[THREAD_SIZE];
+@@ -126,14 +125,19 @@ void __init init_IRQ(void)
+ {
+ 	int ret;
+ 
++	pr_alert("PGCL: init_IRQ enter\n");
+ #ifdef CONFIG_IRQSTACKS
++	pr_alert("PGCL: init_irq_stacks enter\n");
+ 	init_irq_stacks();
++	pr_alert("PGCL: init_irq_stacks done\n");
+ #endif
+ 
++	pr_alert("PGCL: irqchip_init enter\n");
+ 	if (IS_ENABLED(CONFIG_OF) && !machine_desc->init_irq)
+ 		irqchip_init();
+ 	else
+ 		machine_desc->init_irq();
++	pr_alert("PGCL: irqchip_init done\n");
+ 
+ 	if (IS_ENABLED(CONFIG_OF) && IS_ENABLED(CONFIG_CACHE_L2X0) &&
+ 	    (machine_desc->l2c_aux_mask || machine_desc->l2c_aux_val)) {
+diff --git a/arch/arm/kernel/setup.c b/arch/arm/kernel/setup.c
+index 0bfd66c7ada0..d925bb3fa115 100644
+--- a/arch/arm/kernel/setup.c
++++ b/arch/arm/kernel/setup.c
+@@ -1104,9 +1104,13 @@ void __init setup_arch(char **cmdline_p)
+ 	setup_processor();
+ 	if (atags_vaddr) {
+ 		mdesc = setup_machine_fdt(atags_vaddr);
+-		if (mdesc)
++		if (mdesc) {
++			pr_alert("PGCL: FDT at phys 0x%08x size 0x%x\n",
++				 __atags_pointer,
++				 fdt_totalsize(atags_vaddr));
+ 			memblock_reserve(__atags_pointer,
+ 					 fdt_totalsize(atags_vaddr));
++		}
+ 	}
+ 	if (!mdesc)
+ 		mdesc = setup_machine_tags(atags_vaddr, __machine_arch_type);
+@@ -1149,14 +1153,20 @@ void __init setup_arch(char **cmdline_p)
+ 	 */
+ 	adjust_lowmem_bounds();
+ 	arm_memblock_init(mdesc);
++	pr_alert("PGCL: arm_memblock_init done\n");
+ 	/* Memory may have been removed so recalculate the bounds. */
+ 	adjust_lowmem_bounds();
++	pr_alert("PGCL: adjust_lowmem_bounds done\n");
+ 
+ 	early_ioremap_reset();
++	pr_alert("PGCL: early_ioremap_reset done, calling paging_init\n");
+ 
+ 	paging_init(mdesc);
++	pr_alert("PGCL: paging_init done\n");
+ 	kasan_init();
++	pr_alert("PGCL: kasan_init done\n");
+ 	request_standard_resources(mdesc);
++	pr_alert("PGCL: request_standard_resources done\n");
+ 
+ 	if (mdesc->restart) {
+ 		__arm_pm_restart = mdesc->restart;
+@@ -1164,9 +1174,12 @@ void __init setup_arch(char **cmdline_p)
+ 	}
+ 
+ 	unflatten_device_tree();
++	pr_alert("PGCL: unflatten_device_tree done\n");
+ 
+ 	arm_dt_init_cpu_maps();
++	pr_alert("PGCL: arm_dt_init_cpu_maps done\n");
+ 	psci_dt_init();
++	pr_alert("PGCL: psci_dt_init done\n");
+ #ifdef CONFIG_SMP
+ 	if (is_smp()) {
+ 		if (!mdesc->smp_init || !mdesc->smp_init()) {
+@@ -1183,6 +1196,7 @@ void __init setup_arch(char **cmdline_p)
+ 	if (!is_smp())
+ 		hyp_mode_check();
+ 
++	pr_alert("PGCL: smp init done\n");
+ 	reserve_crashkernel();
+ 
+ #ifdef CONFIG_VT
+diff --git a/arch/arm/kernel/smp.c b/arch/arm/kernel/smp.c
+index 4e8e89a26ca3..338a0c267363 100644
+--- a/arch/arm/kernel/smp.c
++++ b/arch/arm/kernel/smp.c
+@@ -393,8 +393,11 @@ static void smp_store_cpu_info(unsigned int cpuid)
+ 	cpu_info->loops_per_jiffy = loops_per_jiffy;
+ 	cpu_info->cpuid = read_cpuid_id();
+ 
++	pr_alert("PGCL: store_cpu_topology\n");
+ 	store_cpu_topology(cpuid);
++	pr_alert("PGCL: check_icache\n");
+ 	check_cpu_icache_size(cpuid);
++	pr_alert("PGCL: store_cpu_info exit\n");
+ }
+ 
+ static void set_current(struct task_struct *cur)
+@@ -504,7 +507,9 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
+ {
+ 	unsigned int ncores = num_possible_cpus();
+ 
++	pr_alert("PGCL: smp_prepare_cpus ncores=%d max_cpus=%d\n", ncores, max_cpus);
+ 	init_cpu_topology();
++	pr_alert("PGCL: init_cpu_topology done\n");
+ 
+ 	smp_store_cpu_info(smp_processor_id());
+ 
+diff --git a/arch/arm/kernel/traps.c b/arch/arm/kernel/traps.c
+index afbd2ebe5c39..f7fc11deb245 100644
+--- a/arch/arm/kernel/traps.c
++++ b/arch/arm/kernel/traps.c
+@@ -871,7 +871,7 @@ void __init early_trap_init(void *vectors_base)
+ 	 * ISAs.  The Thumb version is an undefined instruction with a
+ 	 * branch back to the undefined instruction.
+ 	 */
+-	for (i = 0; i < PAGE_SIZE / sizeof(u32); i++)
++	for (i = 0; i < MMUPAGE_SIZE / sizeof(u32); i++)
+ 		((u32 *)vectors_base)[i] = 0xe7fddef1;
+ 
+ 	/*
+@@ -884,7 +884,7 @@ void __init early_trap_init(void *vectors_base)
+ 
+ 	kuser_init(vectors_base);
+ 
+-	flush_vectors(vectors_base, 0, PAGE_SIZE * 2);
++	flush_vectors(vectors_base, 0, MMUPAGE_SIZE * 2);
+ }
+ #else /* ifndef CONFIG_CPU_V7M */
+ void __init early_trap_init(void *vectors_base)
+diff --git a/arch/arm/mm/fault-armv.c b/arch/arm/mm/fault-armv.c
+index 91e488767783..1df7962d581b 100644
+--- a/arch/arm/mm/fault-armv.c
++++ b/arch/arm/mm/fault-armv.c
+@@ -132,7 +132,7 @@ make_coherent(struct address_space *mapping, struct vm_area_struct *vma,
+ 	pgoff_t pgoff;
+ 	int aliases = 0;
+ 
+-	pgoff = vma->vm_pgoff + ((addr - vma->vm_start) >> PAGE_SHIFT);
++	pgoff = vma->vm_pgoff + ((addr - vma->vm_start) >> MMUPAGE_SHIFT);
+ 
+ 	/*
+ 	 * If we have any shared mappings that are in the same mm
+@@ -158,7 +158,7 @@ make_coherent(struct address_space *mapping, struct vm_area_struct *vma,
+ 			continue;
+ 		if (!(mpnt->vm_flags & VM_MAYSHARE))
+ 			continue;
+-		offset = (pgoff - mpnt->vm_pgoff) << PAGE_SHIFT;
++		offset = (pgoff - mpnt->vm_pgoff) << MMUPAGE_SHIFT;
+ 		mpnt_addr = mpnt->vm_start + offset;
+ 
+ 		/* Avoid deadlocks by not grabbing the same PTE lock again. */
+diff --git a/arch/arm/mm/fault.c b/arch/arm/mm/fault.c
+index e62cc4be5adf..34a63ce3f68b 100644
+--- a/arch/arm/mm/fault.c
++++ b/arch/arm/mm/fault.c
+@@ -441,7 +441,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 		goto bad_area;
+ 	}
+ 
+-	fault = handle_mm_fault(vma, addr & PAGE_MASK, flags, regs);
++	fault = handle_mm_fault(vma, addr & MMUPAGE_MASK, flags, regs);
+ 
+ 	/* If we need to retry but a fatal signal is pending, handle the
+ 	 * signal first. We do not need to release the mmap_lock because
+diff --git a/arch/arm/mm/init.c b/arch/arm/mm/init.c
+index a0123e76ca4a..b29fa0388499 100644
+--- a/arch/arm/mm/init.c
++++ b/arch/arm/mm/init.c
+@@ -180,6 +180,10 @@ void check_cpu_icache_size(int cpuid)
+ void __init arm_memblock_init(const struct machine_desc *mdesc)
+ {
+ 	/* Register the kernel text, kernel data and initrd with memblock. */
++	pr_alert("PGCL: kernel phys 0x%08lx-0x%08lx size 0x%lx\n",
++		 (unsigned long)__pa(KERNEL_START),
++		 (unsigned long)__pa(KERNEL_END),
++		 (unsigned long)(KERNEL_END - KERNEL_START));
+ 	memblock_reserve(__pa(KERNEL_START), KERNEL_END - KERNEL_START);
+ 
+ 	reserve_initrd_mem();
+@@ -410,24 +414,86 @@ void mark_rodata_ro(void)
+ static inline void fix_kernmem_perms(void) { }
+ #endif /* CONFIG_STRICT_KERNEL_RWX */
+ 
++/*
++ * With PGCL (PAGE_SIZE > MMUPAGE_SIZE), a kernel page can contain both
++ * init-section data and critical page table entries.  Early PTE table
++ * allocations from memblock may land within the init section's physical
++ * range.  Freeing such a page destroys the PTE table, corrupting
++ * kernel mappings (e.g., vectors at 0xffff0000).
++ *
++ * Collect all PTE table physical addresses referenced by kernel PMDs,
++ * then skip any init page that contains one.
++ */
+ void free_initmem(void)
+ {
+ 	fix_kernmem_perms();
+ 
+-	poison_init_mem(__init_begin, __init_end - __init_begin);
+-	if (!machine_is_integrator() && !machine_is_cintegrator())
+-		free_initmem_default(-1);
++	if (!machine_is_integrator() && !machine_is_cintegrator()) {
++		if (!PAGE_MMUSHIFT) {
++			poison_init_mem(__init_begin,
++					__init_end - __init_begin);
++			free_initmem_default(-1);
++		} else {
++			/*
++			 * PGCL: scan ALL 4096 ARM hardware L1 page table
++			 * entries directly (not via Linux PGD abstraction,
++			 * which only exposes the first L1 desc per 2MB pair).
++			 * Skip any init page containing a PTE table.
++			 */
++			unsigned long pos;
++			unsigned long start = PAGE_ALIGN((unsigned long)__init_begin);
++			unsigned long end = (unsigned long)__init_end & PAGE_MASK;
++			unsigned long freed = 0;
++			u32 *l1 = (u32 *)init_mm.pgd;
++			int i;
++
++			for (pos = start; pos < end; pos += PAGE_SIZE) {
++				unsigned long page_phys = __pa(pos);
++				unsigned long page_phys_end = page_phys + PAGE_SIZE;
++				bool has_pgtable = false;
++
++				/*
++				 * Scan all 4096 L1 descriptors.  Each covers 1MB.
++				 * Type bits [1:0]: 01 = coarse page table.
++				 * PTE table phys addr in bits [31:10].
++				 */
++				for (i = 0; i < 4096; i++) {
++					u32 desc = l1[i];
++					unsigned long pte_phys;
++
++					if ((desc & PMD_TYPE_MASK) != PMD_TYPE_TABLE)
++						continue;
++					pte_phys = (unsigned long)(desc & ~0x3FFU) & PAGE_MASK;
++					if (pte_phys >= page_phys && pte_phys < page_phys_end) {
++						has_pgtable = true;
++						break;
++					}
++				}
++
++				if (has_pgtable) {
++					pr_info("PGCL: free_initmem: skip %px (contains pgtable for L1[%d])\n",
++						(void *)pos, i);
++					continue;
++				}
++				free_reserved_page(virt_to_page((void *)pos));
++				freed++;
++			}
++			if (freed)
++				pr_info("Freeing unused kernel image (initmem) memory: %ldK\n",
++					freed * (PAGE_SIZE / 1024));
++		}
++	}
+ }
+ 
+ #ifdef CONFIG_BLK_DEV_INITRD
+ void free_initrd_mem(unsigned long start, unsigned long end)
+ {
+ 	if (start == initrd_start)
+-		start = round_down(start, PAGE_SIZE);
++		start = round_down(start, MMUPAGE_SIZE);
+ 	if (end == initrd_end)
+-		end = round_up(end, PAGE_SIZE);
++		end = round_up(end, MMUPAGE_SIZE);
+ 
+-	poison_init_mem((void *)start, PAGE_ALIGN(end) - start);
++	poison_init_mem((void *)start, MMUPAGE_ALIGN(end) - start);
+ 	free_reserved_area((void *)start, (void *)end, -1, "initrd");
+ }
+ #endif
+diff --git a/arch/arm/mm/ioremap.c b/arch/arm/mm/ioremap.c
+index 27e64f782cb3..4b698b075243 100644
+--- a/arch/arm/mm/ioremap.c
++++ b/arch/arm/mm/ioremap.c
+@@ -111,7 +111,7 @@ void __init add_static_vm_early(struct static_vm *svm)
+ int ioremap_page(unsigned long virt, unsigned long phys,
+ 		 const struct mem_type *mtype)
+ {
+-	return vmap_page_range(virt, virt + PAGE_SIZE, phys,
++	return vmap_page_range(virt, virt + MMUPAGE_SIZE, phys,
+ 			       __pgprot(mtype->prot_pte));
+ }
+ EXPORT_SYMBOL(ioremap_page);
+@@ -433,7 +433,7 @@ __arm_ioremap_exec(phys_addr_t phys_addr, size_t size, bool cached)
+ 
+ void __arm_iomem_set_ro(void __iomem *ptr, size_t size)
+ {
+-	set_memory_ro((unsigned long)ptr, PAGE_ALIGN(size) / PAGE_SIZE);
++	set_memory_ro((unsigned long)ptr, MMUPAGE_ALIGN(size) / MMUPAGE_SIZE);
+ }
+ 
+ void *arch_memremap_wb(phys_addr_t phys_addr, size_t size, unsigned long flags)
+diff --git a/arch/arm/mm/mmu.c b/arch/arm/mm/mmu.c
+index 23b87b5ef7f1..ede84d08f4ad 100644
+--- a/arch/arm/mm/mmu.c
++++ b/arch/arm/mm/mmu.c
+@@ -403,10 +403,10 @@ void __set_fixmap(enum fixed_addresses idx, phys_addr_t phys, pgprot_t prot)
+ 
+ 	if (pgprot_val(prot))
+ 		set_pte_at(NULL, vaddr, pte,
+-			pfn_pte(phys >> PAGE_SHIFT, prot));
++			__pte(phys | pgprot_val(prot)));
+ 	else
+ 		pte_clear(NULL, vaddr, pte);
+-	local_flush_tlb_kernel_range(vaddr, vaddr + PAGE_SIZE);
++	local_flush_tlb_kernel_range(vaddr, vaddr + MMUPAGE_SIZE);
+ }
+ 
+ static pgprot_t protection_map[16] __ro_after_init = {
+@@ -752,17 +752,26 @@ static pte_t * __init early_pte_alloc(pmd_t *pmd, unsigned long addr,
+ }
+ 
+ static void __init alloc_init_pte(pmd_t *pmd, unsigned long addr,
+-				  unsigned long end, unsigned long pfn,
++				  unsigned long end, phys_addr_t phys,
+ 				  const struct mem_type *type,
+ 				  void *(*alloc)(unsigned long sz),
+ 				  bool ng)
+ {
+ 	pte_t *pte = arm_pte_alloc(pmd, addr, type->prot_l1, alloc);
++	if (addr >= 0xffff0000)
++		pr_alert("PGCL: aip pte=%px addr=%08lx phys=%08x pmd=%08x base=%px idx=%lu\n",
++			 pte, addr, (u32)phys, (u32)pmd_val(*pmd),
++			 pmd_page_vaddr(*pmd), pte_index(addr));
+ 	do {
+-		set_pte_ext(pte, pfn_pte(pfn, __pgprot(type->prot_pte)),
++		set_pte_ext(pte, __pte(phys | pgprot_val(__pgprot(type->prot_pte))),
+ 			    ng ? PTE_EXT_NG : 0);
+-		pfn++;
+-	} while (pte++, addr += PAGE_SIZE, addr != end);
++		if (addr >= 0xffff0000) {
++			u32 *hw = (u32 *)pte + PTRS_PER_PTE;
++			pr_alert("PGCL: aip wrote pte@%px=%08x hw@%px=%08x\n",
++				 pte, pte_val(*pte), hw, *hw);
++		}
++		phys += MMUPAGE_SIZE;
++	} while (pte++, addr += MMUPAGE_SIZE, addr != end);
+ }
+ 
+ static void __init __map_init_section(pmd_t *pmd, unsigned long addr,
+@@ -816,7 +825,7 @@ static void __init alloc_init_pmd(pud_t *pud, unsigned long addr,
+ 			__map_init_section(pmd, addr, next, phys, type, ng);
+ 		} else {
+ 			alloc_init_pte(pmd, addr, next,
+-				       __phys_to_pfn(phys), type, alloc, ng);
++				       phys, type, alloc, ng);
+ 		}
+ 
+ 		phys += next - addr;
+@@ -938,9 +947,9 @@ static void __init __create_mapping(struct mm_struct *mm, struct map_desc *md,
+ 	}
+ #endif
+ 
+-	addr = md->virtual & PAGE_MASK;
++	addr = md->virtual & MMUPAGE_MASK;
+ 	phys = __pfn_to_phys(md->pfn);
+-	length = PAGE_ALIGN(md->length + (md->virtual & ~PAGE_MASK));
++	length = MMUPAGE_ALIGN(md->length + (md->virtual & ~MMUPAGE_MASK));
+ 
+ 	if (type->prot_l1 == 0 && ((addr | phys | length) & ~SECTION_MASK)) {
+ 		pr_warn("BUG: map for 0x%08llx at 0x%08lx can not be mapped using pages, ignoring.\n",
+@@ -1136,8 +1145,8 @@ void __init debug_ll_io_init(void)
+ 	if (!map.pfn || !map.virtual)
+ 		return;
+ 	map.pfn = __phys_to_pfn(map.pfn);
+-	map.virtual &= PAGE_MASK;
+-	map.length = PAGE_SIZE;
++	map.virtual &= MMUPAGE_MASK;
++	map.length = MMUPAGE_SIZE;
+ 	map.type = MT_DEVICE;
+ 	iotable_init(&map, 1);
+ }
+@@ -1365,15 +1374,23 @@ static void __init devicemaps_init(const struct machine_desc *mdesc)
+ 	/*
+ 	 * Allocate the vector page early.
+ 	 */
+-	vectors = early_alloc(PAGE_SIZE * 2);
++	/*
++	 * With PGCL, the vector pages must be PAGE-aligned because
++	 * create_mapping uses PAGE-granular pfns. Allocate with
++	 * PAGE_SIZE alignment to avoid sub-page offset loss.
++	 */
++	vectors = memblock_alloc_or_panic(MMUPAGE_SIZE * 2, PAGE_SIZE);
++	pr_alert("PGCL: devmaps vectors=%px\n", vectors);
+ 
+ 	early_trap_init(vectors);
++	pr_alert("PGCL: devmaps early_trap_init done\n");
+ 
+ 	/*
+ 	 * Clear page table except top pmd used by early fixmaps
+ 	 */
+ 	for (addr = VMALLOC_START; addr < (FIXADDR_TOP & PMD_MASK); addr += PMD_SIZE)
+ 		pmd_clear(pmd_off_k(addr));
++	pr_alert("PGCL: devmaps pmd_clear loop done\n");
+ 
+ 	if (__atags_pointer) {
+ 		/* create a read-only mapping of the device tree */
+@@ -1406,34 +1423,41 @@ static void __init devicemaps_init(const struct machine_desc *mdesc)
+ 	 * Create a mapping for the machine vectors at the high-vectors
+ 	 * location (0xffff0000).  If we aren't using high-vectors, also
+ 	 * create a mapping at the low-vectors virtual address.
++	 *
++	 * With PGCL, vectors (4KB) and stubs (4KB) are in separate MMU
++	 * pages but the same kernel page.  Map both in one call so
++	 * alloc_init_pte correctly increments the physical address.
++	 * Using separate calls with PFN would truncate the sub-page
++	 * offset of the stubs physical address.
+ 	 */
+-	map.pfn = __phys_to_pfn(virt_to_phys(vectors));
+-	map.virtual = 0xffff0000;
+-	map.length = PAGE_SIZE;
++	{
++		phys_addr_t vphys = virt_to_phys(vectors);
++		pr_alert("PGCL: devmaps vector mapping virt=%px phys=%pa\n",
++			 vectors, &vphys);
++		map.pfn = __phys_to_pfn(vphys);
++		map.virtual = 0xffff0000;
++		map.length = MMUPAGE_SIZE * 2;
+ #ifdef CONFIG_KUSER_HELPERS
+-	map.type = MT_HIGH_VECTORS;
++		map.type = MT_HIGH_VECTORS;
+ #else
+-	map.type = MT_LOW_VECTORS;
++		map.type = MT_LOW_VECTORS;
+ #endif
+-	create_mapping(&map);
++		create_mapping(&map);
++	}
+ 
+ 	if (!vectors_high()) {
+ 		map.virtual = 0;
+-		map.length = PAGE_SIZE * 2;
++		map.length = MMUPAGE_SIZE * 2;
+ 		map.type = MT_LOW_VECTORS;
+ 		create_mapping(&map);
+ 	}
+ 
+-	/* Now create a kernel read-only mapping */
+-	map.pfn += 1;
+-	map.virtual = 0xffff0000 + PAGE_SIZE;
+-	map.length = PAGE_SIZE;
+-	map.type = MT_LOW_VECTORS;
+-	create_mapping(&map);
++	pr_alert("PGCL: devmaps vector high done\n");
+ 
+ 	/*
+ 	 * Ask the machine support to map in the statically mapped devices.
+ 	 */
++	pr_alert("PGCL: devmaps vector ro done, calling map_io\n");
+ 	if (mdesc->map_io)
+ 		mdesc->map_io();
+ 	else
+@@ -1717,28 +1741,52 @@ static void __init early_fixmap_shutdown(void)
+ 	int i;
+ 	unsigned long va = fix_to_virt(__end_of_permanent_fixed_addresses - 1);
+ 
++	pr_alert("PGCL: fixmap va=0x%08lx, end=%d\n", va,
++		 __end_of_permanent_fixed_addresses);
+ 	pte_offset_fixmap = pte_offset_late_fixmap;
+-	pmd_clear(fixmap_pmd(va));
+-	local_flush_tlb_kernel_page(va);
+-
+-	for (i = 0; i < __end_of_permanent_fixed_addresses; i++) {
+-		pte_t *pte;
+-		struct map_desc map;
+ 
+-		map.virtual = fix_to_virt(i);
+-		pte = pte_offset_early_fixmap(pmd_off_k(map.virtual), map.virtual);
++	/*
++	 * Save PTE values from the early fixmap (bm_pte array, accessed
++	 * directly — not through the page table). Then clear the PMD
++	 * to remove the early fixmap mapping, and re-create permanent
++	 * device mappings via create_mapping.
++	 */
++	{
++		pte_t saved[__end_of_permanent_fixed_addresses];
++		unsigned long saved_va[__end_of_permanent_fixed_addresses];
+ 
+-		/* Only i/o device mappings are supported ATM */
+-		if (pte_none(*pte) ||
+-		    (pte_val(*pte) & L_PTE_MT_MASK) != L_PTE_MT_DEV_SHARED)
+-			continue;
++		for (i = 0; i < __end_of_permanent_fixed_addresses; i++) {
++			saved_va[i] = fix_to_virt(i);
++			saved[i] = bm_pte[pte_index(saved_va[i])];
++		}
+ 
+-		map.pfn = pte_pfn(*pte);
+-		map.type = MT_DEVICE;
+-		map.length = PAGE_SIZE;
++		/*
++		 * DON'T pmd_clear before create_mapping — the earlycon
++		 * is mapped here and clearing it causes a data abort on
++		 * any console output. create_mapping will allocate a new
++		 * PTE page and replace the PMD entry, naturally
++		 * superseding the early bm_pte.
++		 */
++		for (i = 0; i < __end_of_permanent_fixed_addresses; i++) {
++			struct map_desc map;
++
++			if (pte_none(saved[i]) ||
++			    (pte_val(saved[i]) & L_PTE_MT_MASK) !=
++			     L_PTE_MT_DEV_SHARED)
++				continue;
++
++			map.virtual = saved_va[i];
++			map.pfn = pte_pfn(saved[i]);
++			map.type = MT_DEVICE;
++			map.length = MMUPAGE_SIZE;
++			create_mapping(&map);
++		}
+ 
+-		create_mapping(&map);
++		/* Flush TLB to pick up new page table entries */
++		local_flush_tlb_kernel_range(va & PMD_MASK,
++					     (va & PMD_MASK) + PMD_SIZE);
+ 	}
++	pr_alert("PGCL: fixmap remapped\n");
+ }
+ 
+ /*
+@@ -1755,23 +1803,26 @@ void __init paging_init(const struct machine_desc *mdesc)
+ 	pr_debug("physical kernel sections: 0x%08llx-0x%08llx\n",
+ 		 kernel_sec_start, kernel_sec_end);
+ 
++	pr_alert("PGCL: prepare_page_table\n");
+ 	prepare_page_table();
++	pr_alert("PGCL: map_lowmem\n");
+ 	map_lowmem();
+ 	memblock_set_current_limit(arm_lowmem_limit);
+-	pr_debug("lowmem limit is %08llx\n", (long long)arm_lowmem_limit);
+-	/*
+-	 * After this point early_alloc(), i.e. the memblock allocator, can
+-	 * be used
+-	 */
++	pr_alert("PGCL: map_kernel\n");
+ 	map_kernel();
++	pr_alert("PGCL: dma_contiguous_remap\n");
+ 	dma_contiguous_remap();
++	pr_alert("PGCL: early_fixmap_shutdown\n");
+ 	early_fixmap_shutdown();
++	pr_alert("PGCL: devicemaps_init\n");
+ 	devicemaps_init(mdesc);
++	pr_alert("PGCL: kmap_init\n");
+ 	kmap_init();
+ 	tcm_init();
+ 
+ 	top_pmd = pmd_off_k(0xffff0000);
+ 
++	pr_alert("PGCL: bootmem_init\n");
+ 	bootmem_init();
+ }
+ 
+@@ -1797,6 +1848,7 @@ void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		pteval = pte_next_pfn(pteval);
++		pteval = __pte(pte_val(pteval) +
++			       __phys_to_pte_val(MMUPAGE_SIZE));
+ 	}
+ }
+diff --git a/arch/arm/mm/pageattr.c b/arch/arm/mm/pageattr.c
+index 064ad508c149..be77a7a3c2bd 100644
+--- a/arch/arm/mm/pageattr.c
++++ b/arch/arm/mm/pageattr.c
+@@ -54,8 +54,8 @@ static int __change_memory_common(unsigned long start, unsigned long size,
+ static int change_memory_common(unsigned long addr, int numpages,
+ 				pgprot_t set_mask, pgprot_t clear_mask)
+ {
+-	unsigned long start = addr & PAGE_MASK;
+-	unsigned long end = PAGE_ALIGN(addr) + numpages * PAGE_SIZE;
++	unsigned long start = addr & MMUPAGE_MASK;
++	unsigned long end = MMUPAGE_ALIGN(addr) + numpages * MMUPAGE_SIZE;
+ 	unsigned long size = end - start;
+ 
+ 	WARN_ON_ONCE(start != addr);
+@@ -101,11 +101,11 @@ int set_memory_x(unsigned long addr, int numpages)
+ int set_memory_valid(unsigned long addr, int numpages, int enable)
+ {
+ 	if (enable)
+-		return __change_memory_common(addr, PAGE_SIZE * numpages,
++		return __change_memory_common(addr, MMUPAGE_SIZE * numpages,
+ 					      __pgprot(L_PTE_VALID),
+ 					      __pgprot(0));
+ 	else
+-		return __change_memory_common(addr, PAGE_SIZE * numpages,
++		return __change_memory_common(addr, MMUPAGE_SIZE * numpages,
+ 					      __pgprot(0),
+ 					      __pgprot(L_PTE_VALID));
+ }
+diff --git a/arch/arm/mm/pgd.c b/arch/arm/mm/pgd.c
+index 447945836c3f..874a4fe2aad0 100644
+--- a/arch/arm/mm/pgd.c
++++ b/arch/arm/mm/pgd.c
+@@ -20,7 +20,7 @@
+ #define _pgd_alloc(mm)		kmalloc_objs(pgd_t, PTRS_PER_PGD, GFP_KERNEL | __GFP_ZERO)
+ #define _pgd_free(mm, pgd)	kfree(pgd)
+ #else
+-#define _pgd_alloc(mm)		__pgd_alloc(mm, 2)
++#define _pgd_alloc(mm)		__pgd_alloc(mm, get_order(PGD_SIZE))
+ #define _pgd_free(mm, pgd)	__pgd_free(mm, pgd)
+ #endif
+ 
+diff --git a/drivers/base/arch_topology.c b/drivers/base/arch_topology.c
+index 8c5e47c28d9a..a1e70a0b0333 100644
+--- a/drivers/base/arch_topology.c
++++ b/drivers/base/arch_topology.c
+@@ -934,10 +934,14 @@ void __init init_cpu_topology(void)
+ {
+ 	int cpu, ret;
+ 
++	pr_alert("PGCL: init_cpu_topology: reset\n");
+ 	reset_cpu_topology();
++	pr_alert("PGCL: init_cpu_topology: parse_acpi\n");
+ 	ret = parse_acpi_topology();
++	pr_alert("PGCL: init_cpu_topology: parse_dt ret=%d\n", ret);
+ 	if (!ret)
+ 		ret = of_have_populated_dt() && parse_dt_topology();
++	pr_alert("PGCL: init_cpu_topology: dt done ret=%d\n", ret);
+ 
+ 	if (ret) {
+ 		/*
+@@ -949,13 +953,16 @@ void __init init_cpu_topology(void)
+ 	}
+ 
+ 	for_each_possible_cpu(cpu) {
++		pr_alert("PGCL: init_cpu_topology: fetch_cache cpu=%d\n", cpu);
+ 		ret = fetch_cache_info(cpu);
++		pr_alert("PGCL: init_cpu_topology: fetch_cache cpu=%d ret=%d\n", cpu, ret);
+ 		if (!ret)
+ 			continue;
+ 		else if (ret != -ENOENT)
+ 			pr_err("Early cacheinfo failed, ret = %d\n", ret);
+ 		return;
+ 	}
++	pr_alert("PGCL: init_cpu_topology: done\n");
+ }
+ 
+ void store_cpu_topology(unsigned int cpuid)
+diff --git a/drivers/of/fdt.c b/drivers/of/fdt.c
+index 82f7327c59ea..7e92cf413fa8 100644
+--- a/drivers/of/fdt.c
++++ b/drivers/of/fdt.c
+@@ -1336,6 +1336,8 @@ static int __init of_fdt_raw_init(void)
+ 	if (!initial_boot_params)
+ 		return 0;
+ 
++	pr_alert("PGCL: of_fdt_raw_init: initial_boot_params=%px totalsize=0x%x\n",
++		 initial_boot_params, fdt_totalsize(initial_boot_params));
+ 	if (of_fdt_crc32 != crc32_be(~0, initial_boot_params,
+ 				     fdt_totalsize(initial_boot_params))) {
+ 		pr_warn("not creating '/sys/firmware/fdt': CRC check failed\n");
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index f13722301545..ff7c18b07553 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -399,6 +399,9 @@ static unsigned long elf_map(struct file *filep, unsigned long addr,
+ 	} else
+ 		map_addr = vm_mmap(filep, addr, size, prot, type, off);
+ 
++	pr_alert("PGCL: elf_map: addr=0x%lx size=0x%lx off=0x%lx prot=0x%x type=0x%x map_addr=0x%lx\n",
++		 addr, size, off, prot, type, map_addr);
++
+ 	if ((type & MAP_FIXED_NOREPLACE) &&
+ 	    PTR_ERR((void *)map_addr) == -EEXIST)
+ 		pr_info("%d (%s): Uhuuh, elf segment at %px requested but the memory is mapped already\n",
+@@ -421,8 +424,10 @@ static unsigned long elf_load(struct file *filep, unsigned long addr,
+ 
+ 	if (eppnt->p_filesz) {
+ 		map_addr = elf_map(filep, addr, eppnt, prot, type, total_size);
+-		if (BAD_ADDR(map_addr))
++		if (BAD_ADDR(map_addr)) {
++			pr_alert("PGCL: elf_load: elf_map failed addr=0x%lx map_addr=0x%lx\n", addr, map_addr);
+ 			return map_addr;
++		}
+ 		if (eppnt->p_memsz > eppnt->p_filesz) {
+ 			zero_start = map_addr + ELF_PAGEOFFSET(eppnt->p_vaddr) +
+ 				eppnt->p_filesz;
+@@ -433,8 +438,12 @@ static unsigned long elf_load(struct file *filep, unsigned long addr,
+ 			 * Zero the end of the last mapped page but ignore
+ 			 * any errors if the segment isn't writable.
+ 			 */
+-			if (padzero(zero_start) && (prot & PROT_WRITE))
++			if (padzero(zero_start) && (prot & PROT_WRITE)) {
++				pr_alert("PGCL: elf_load: padzero failed at 0x%lx (map_addr=0x%lx pageoff=0x%lx filesz=0x%lx memsz=0x%lx prot=0x%x)\n",
++					 zero_start, map_addr, (unsigned long)ELF_PAGEOFFSET(eppnt->p_vaddr),
++					 (unsigned long)eppnt->p_filesz, (unsigned long)eppnt->p_memsz, prot);
+ 				return -EFAULT;
++			}
+ 		}
+ 	} else {
+ 		map_addr = zero_start = ELF_PAGESTART(addr);
+@@ -1027,8 +1036,10 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	   change some of these later */
+ 	retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),
+ 				 executable_stack);
+-	if (retval < 0)
++	if (retval < 0) {
++		pr_alert("PGCL: setup_arg_pages failed: retval=%d\n", retval);
+ 		goto out_free_dentry;
++	}
+ 
+ 	elf_brk = 0;
+ 
+@@ -1190,6 +1201,8 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		if (BAD_ADDR(error)) {
+ 			retval = IS_ERR_VALUE(error) ?
+ 				PTR_ERR((void*)error) : -EINVAL;
++			pr_alert("PGCL: elf_load failed: addr=0x%lx vaddr=0x%lx bias=0x%lx flags=0x%x error=0x%lx retval=%d\n",
++				 load_bias + vaddr, vaddr, load_bias, elf_flags, error, retval);
+ 			goto out_free_dentry;
+ 		}
+ 
+@@ -1383,6 +1396,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 
+ 	/* error cleanup */
+ out_free_dentry:
++	pr_alert("PGCL: load_elf_binary: out_free_dentry retval=%d\n", retval);
+ 	kfree(interp_elf_ex);
+ 	kfree(interp_elf_phdata);
+ out_free_file:
+@@ -1390,6 +1404,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	if (interpreter)
+ 		fput(interpreter);
+ out_free_ph:
++	pr_alert("PGCL: load_elf_binary: out_free_ph retval=%d\n", retval);
+ 	kfree(elf_phdata);
+ 	goto out;
+ }
+diff --git a/init/initramfs.c b/init/initramfs.c
+index 58db15fb18fd..b31d55a8f8ca 100644
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -620,10 +620,12 @@ void __init reserve_initrd_mem(void)
+ 	 * This allows us to detect whether the pages overlapping the initrd
+ 	 * are in use, but more importantly, reserves the entire set of pages
+ 	 * as we don't want these pages allocated for other purposes.
++	 * Use MMUPAGE_SIZE for alignment — with PGCL, PAGE_SIZE can be much
++	 * larger and cause false overlaps with adjacent reservations (e.g. FDT).
+ 	 */
+-	start = round_down(phys_initrd_start, PAGE_SIZE);
++	start = round_down(phys_initrd_start, MMUPAGE_SIZE);
+ 	size = phys_initrd_size + (phys_initrd_start - start);
+-	size = round_up(size, PAGE_SIZE);
++	size = round_up(size, MMUPAGE_SIZE);
+ 
+ 	if (!memblock_is_region_memory(start, size)) {
+ 		pr_err("INITRD: 0x%08llx+0x%08lx is not a memory region",
+@@ -634,6 +636,9 @@ void __init reserve_initrd_mem(void)
+ 	if (memblock_is_region_reserved(start, size)) {
+ 		pr_err("INITRD: 0x%08llx+0x%08lx overlaps in-use memory region\n",
+ 		       (u64)start, size);
++		pr_err("INITRD: phys_initrd_start=0x%08llx phys_initrd_size=0x%08lx PAGE_SIZE=0x%lx\n",
++		       (u64)phys_initrd_start, (unsigned long)phys_initrd_size, PAGE_SIZE);
++		memblock_dump_all();
+ 		goto disable;
+ 	}
+ 
+diff --git a/init/main.c b/init/main.c
+index 27769865fa97..6eebc43a07b1 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -719,13 +719,11 @@ static noinline void __ref __noreturn rest_init(void)
+ 	struct task_struct *tsk;
+ 	int pid;
+ 
++	pr_alert("PGCL: rest_init enter\n");
+ 	rcu_scheduler_starting();
+-	/*
+-	 * We need to spawn init first so that it obtains pid 1, however
+-	 * the init task will end up wanting to create kthreads, which, if
+-	 * we schedule it before we create kthreadd, will OOPS.
+-	 */
++	pr_alert("PGCL: rest_init: user_mode_thread(kernel_init)\n");
+ 	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
++	pr_alert("PGCL: rest_init: kernel_init pid=%d\n", pid);
+ 	/*
+ 	 * Pin init on the boot CPU. Task migration is not properly working
+ 	 * until sched_init_smp() has been run. It will set the allowed
+@@ -738,6 +736,7 @@ static noinline void __ref __noreturn rest_init(void)
+ 	rcu_read_unlock();
+ 
+ 	numa_default_policy();
++	pr_alert("PGCL: rest_init: kernel_thread(kthreadd)\n");
+ 	pid = kernel_thread(kthreadd, NULL, NULL, CLONE_FS | CLONE_FILES);
+ 	rcu_read_lock();
+ 	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
+@@ -1122,7 +1121,9 @@ void start_kernel(void)
+ 	context_tracking_init();
+ 	/* init some links before init_ISA_irqs() */
+ 	early_irq_init();
++	pr_alert("PGCL: early_irq_init done\n");
+ 	init_IRQ();
++	pr_alert("PGCL: init_IRQ done\n");
+ 	tick_init();
+ 	rcu_init_nohz();
+ 	timers_init();
+@@ -1131,6 +1132,7 @@ void start_kernel(void)
+ 	softirq_init();
+ 	vdso_setup_data_pages();
+ 	timekeeping_init();
++	pr_alert("PGCL: timekeeping_init done\n");
+ 	time_init();
+ 
+ 	/* This must be after timekeeping is initialized */
+@@ -1145,10 +1147,13 @@ void start_kernel(void)
+ 	call_function_init();
+ 	WARN(!irqs_disabled(), "Interrupts were enabled early\n");
+ 
++	pr_alert("PGCL: time_init done, enabling IRQs\n");
+ 	early_boot_irqs_disabled = false;
+ 	local_irq_enable();
++	pr_alert("PGCL: local_irq_enable done\n");
+ 
+ 	kmem_cache_init_late();
++	pr_alert("PGCL: kmem_cache_init_late done\n");
+ 
+ 	/*
+ 	 * HACK ALERT! This is early. We're enabling the console before
+@@ -1156,6 +1161,7 @@ void start_kernel(void)
+ 	 * this. But we do want output early, in case something goes wrong.
+ 	 */
+ 	console_init();
++	pr_alert("PGCL: console_init done\n");
+ 	if (panic_later)
+ 		panic("Too many boot %s vars at `%s'", panic_later,
+ 		      panic_param);
+@@ -1600,8 +1606,11 @@ static int __ref kernel_init(void *unused)
+ 	ftrace_free_init_mem();
+ 	kgdb_free_init_mem();
+ 	exit_boot_config();
++	pr_alert("PGCL: kernel_init: free_initmem\n");
+ 	free_initmem();
++	pr_alert("PGCL: kernel_init: mark_readonly\n");
+ 	mark_readonly();
++	pr_alert("PGCL: kernel_init: mark_readonly done\n");
+ 
+ 	/*
+ 	 * Kernel mappings are now finalized - update the userspace page-table
+@@ -1616,8 +1625,12 @@ static int __ref kernel_init(void *unused)
+ 
+ 	do_sysctl_args();
+ 
++	pr_alert("PGCL: kernel_init: about to run init process\n");
+ 	if (ramdisk_execute_command) {
++		pr_alert("PGCL: kernel_init: ramdisk_execute_command='%s'\n",
++			 ramdisk_execute_command);
+ 		ret = run_init_process(ramdisk_execute_command);
++		pr_alert("PGCL: kernel_init: run_init_process returned %d\n", ret);
+ 		if (!ret)
+ 			return 0;
+ 		pr_err("Failed to execute %s (error %d)\n",
+@@ -1684,16 +1697,26 @@ static noinline void __init kernel_init_freeable(void)
+ 
+ 	cad_pid = get_pid(task_pid(current));
+ 
++	pr_alert("PGCL: smp_prepare_cpus enter\n");
+ 	smp_prepare_cpus(setup_max_cpus);
++	pr_alert("PGCL: smp_prepare_cpus done\n");
+ 
++	pr_alert("PGCL: workqueue_init enter\n");
+ 	workqueue_init();
++	pr_alert("PGCL: workqueue_init done\n");
+ 
++	pr_alert("PGCL: init_mm_internals enter\n");
+ 	init_mm_internals();
++	pr_alert("PGCL: init_mm_internals done\n");
+ 
++	pr_alert("PGCL: do_pre_smp_initcalls enter\n");
+ 	do_pre_smp_initcalls();
++	pr_alert("PGCL: do_pre_smp_initcalls done\n");
+ 	lockup_detector_init();
+ 
++	pr_alert("PGCL: smp_init enter\n");
+ 	smp_init();
++	pr_alert("PGCL: smp_init done\n");
+ 	sched_init_smp();
+ 
+ 	workqueue_init_topology();
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index 33b721a9af02..48556ee3602c 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -8115,8 +8115,10 @@ void __init workqueue_init(void)
+ 	struct worker_pool *pool;
+ 	int cpu, bkt;
+ 
++	pr_alert("PGCL: workqueue_init: thresh\n");
+ 	wq_cpu_intensive_thresh_init();
+ 
++	pr_alert("PGCL: workqueue_init: mutex_lock\n");
+ 	mutex_lock(&wq_pool_mutex);
+ 
+ 	/*
+@@ -8130,6 +8132,7 @@ void __init workqueue_init(void)
+ 			pool->node = cpu_to_node(cpu);
+ 	}
+ 
++	pr_alert("PGCL: workqueue_init: init_rescuers\n");
+ 	list_for_each_entry(wq, &workqueues, list) {
+ 		WARN(init_rescuer(wq),
+ 		     "workqueue: failed to create early rescuer for %s",
+@@ -8138,6 +8141,7 @@ void __init workqueue_init(void)
+ 
+ 	mutex_unlock(&wq_pool_mutex);
+ 
++	pr_alert("PGCL: workqueue_init: create_bh_workers\n");
+ 	/*
+ 	 * Create the initial workers. A BH pool has one pseudo worker that
+ 	 * represents the shared BH execution context and thus doesn't get
+@@ -8148,6 +8152,7 @@ void __init workqueue_init(void)
+ 		for_each_bh_worker_pool(pool, cpu)
+ 			BUG_ON(!create_worker(pool));
+ 
++	pr_alert("PGCL: workqueue_init: create_cpu_workers\n");
+ 	for_each_online_cpu(cpu) {
+ 		for_each_cpu_worker_pool(pool, cpu) {
+ 			pool->flags &= ~POOL_DISASSOCIATED;
+@@ -8155,9 +8160,11 @@ void __init workqueue_init(void)
+ 		}
+ 	}
+ 
++	pr_alert("PGCL: workqueue_init: create_unbound_workers\n");
+ 	hash_for_each(unbound_pool_hash, bkt, pool, hash_node)
+ 		BUG_ON(!create_worker(pool));
+ 
++	pr_alert("PGCL: workqueue_init: online\n");
+ 	wq_online = true;
+ 	wq_watchdog_init();
+ }
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 5cec5dbcb7bf..7c72b4a3e761 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -1182,7 +1182,7 @@ static long madvise_guard_install(struct madvise_behavior *madv_behavior)
+ 
+ 		if (err == 0) {
+ 			unsigned long nr_expected_pages =
+-				PHYS_PFN(range->end - range->start);
++				(range->end - range->start) >> MMUPAGE_SHIFT;
+ 
+ 			VM_WARN_ON(nr_pages != nr_expected_pages);
+ 			return 0;
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 833f2995d6a9..85824af63950 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -3865,6 +3865,9 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 	unsigned int page_order;
+ 	unsigned int flags;
+ 	int ret;
++#ifdef CONFIG_HIGHMEM
++	bool highmem_zero;
++#endif
+ 
+ 	array_size = (unsigned long)nr_small_pages * sizeof(struct page *);
+ 
+@@ -3875,6 +3878,18 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 	if (!(gfp_mask & (GFP_DMA | GFP_DMA32)))
+ 		gfp_mask |= __GFP_HIGHMEM;
+ 
++	/*
++	 * With PGCL, clear_highpage() maps MMUPAGE_SIZE via kmap but
++	 * clear_page() writes PAGE_SIZE bytes, overrunning the mapping.
++	 * Strip __GFP_ZERO from page allocation and zero after vmap.
++	 */
++#ifdef CONFIG_HIGHMEM
++	highmem_zero = (gfp_mask & __GFP_HIGHMEM) &&
++		       (gfp_mask & __GFP_ZERO);
++	if (highmem_zero)
++		gfp_mask &= ~__GFP_ZERO;
++#endif
++
+ 	/* Please note that the recursion is strictly bounded. */
+ 	if (array_size > PAGE_SIZE) {
+ 		area->pages = __vmalloc_node_noprof(array_size, 1, nested_gfp, node,
+@@ -3947,6 +3962,11 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 		goto fail;
+ 	}
+ 
++#ifdef CONFIG_HIGHMEM
++	if (highmem_zero)
++		memset(area->addr, 0, size);
++#endif
++
+ 	return area->addr;
+ 
+ fail:
+-- 
+2.54.0
+

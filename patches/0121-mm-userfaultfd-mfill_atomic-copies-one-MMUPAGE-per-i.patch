@@ -1,0 +1,95 @@
+From 1e47bf77d691d4483d438e27758d4a6989883a6e Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 19 May 2026 17:30:14 +0200
+Subject: [PATCH 121/174] mm/userfaultfd: mfill_atomic copies one MMUPAGE per
+ iteration, not one PAGE
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+mfill_atomic drives UFFDIO_COPY / UFFDIO_ZEROPAGE / UFFDIO_CONTINUE,
+calling mfill_atomic_pte once per inner loop iteration and advancing
+state.dst_addr / state.src_addr / copied by PAGE_SIZE each time.
+mfill_copy_folio_locked / mfill_copy_folio_retry copy PAGE_SIZE bytes
+from the userspace src.
+
+Under PGCL (CONFIG_PAGE_MMUSHIFT > 0):
+  - The userspace page size (sysconf(_SC_PAGESIZE)) is MMUPAGE_SIZE.
+  - validate_range in fs/userfaultfd.c (commit 01acec0521b4) now
+    accepts MMUPAGE-aligned uffd ranges, so userspace can call
+    UFFDIO_COPY with src=malloc(MMUPAGE_SIZE), len=MMUPAGE_SIZE.
+  - mfill_atomic_install_pte then installs one MMUPAGE PTE per call
+    (set_pte_at writes a single PTE on PGCL too).
+  - But mfill_copy_folio_locked still copies PAGE_SIZE bytes from
+    the user-supplied src buffer, reading PAGE_MMUCOUNT MMUPAGES
+    past the end of src and returning -EFAULT.  And the outer loop
+    advances by PAGE_SIZE while only one MMUPAGE has been mapped.
+
+Visible in the LTP mkdirty test's UFFDIO_COPY subtest on
+s390x PGCL=4 (CONFIG_USERFAULTFD=y):
+
+    not ok 3 UFFDIO_COPY failed
+
+Fix: each mfill_atomic iteration handles exactly one MMUPAGE.  Copy
+MMUPAGE_SIZE bytes from src into the folio's first sub-page, install
+one PTE via mfill_atomic_install_pte (which already operates on a
+single PTE = one MMUPAGE), and advance addresses by MMUPAGE_SIZE.
+The folio itself is still PAGE_SIZE-allocated; remaining sub-pages
+stay unmapped (a small over-allocation for the sub-PAGE-aligned uffd
+path, no correctness impact).
+
+At CONFIG_PAGE_MMUSHIFT == 0 MMUPAGE_SIZE == PAGE_SIZE and behaviour
+is byte-for-byte unchanged.
+
+Verified: s390x PGCL=4 LTP mkdirty UFFDIO_COPY subtest:
+
+    not ok 3 UFFDIO_COPY failed
+    ↓
+    ok 3 SIGSEGV generated, page not modified
+
+Remaining mkdirty "not ok 1 write() failed" is a separate PTRACE
+write-access subtest failure (follow-up).
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ mm/userfaultfd.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index 5dcf0743d9d2..19106bb7a5cc 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -434,7 +434,7 @@ static int mfill_copy_folio_locked(struct folio *folio, unsigned long src_addr)
+ 	 */
+ 	pagefault_disable();
+ 	ret = copy_from_user(kaddr, (const void __user *) src_addr,
+-			     PAGE_SIZE);
++			     MMUPAGE_SIZE);
+ 	pagefault_enable();
+ 	kunmap_local(kaddr);
+ 
+@@ -521,7 +521,7 @@ static int mfill_copy_folio_retry(struct mfill_state *mfill_state,
+ 	mfill_put_vma(mfill_state);
+ 
+ 	kaddr = kmap_local_folio(folio, 0);
+-	err = copy_from_user(kaddr, (const void __user *) src_addr, PAGE_SIZE);
++	err = copy_from_user(kaddr, (const void __user *) src_addr, MMUPAGE_SIZE);
+ 	kunmap_local(kaddr);
+ 	if (unlikely(err))
+ 		return -EFAULT;
+@@ -999,9 +999,9 @@ static __always_inline ssize_t mfill_atomic(struct userfaultfd_ctx *ctx,
+ 		cond_resched();
+ 
+ 		if (!err) {
+-			state.dst_addr += PAGE_SIZE;
+-			state.src_addr += PAGE_SIZE;
+-			copied += PAGE_SIZE;
++			state.dst_addr += MMUPAGE_SIZE;
++			state.src_addr += MMUPAGE_SIZE;
++			copied += MMUPAGE_SIZE;
+ 
+ 			if (fatal_signal_pending(current))
+ 				err = -EINTR;
+-- 
+2.54.0
+

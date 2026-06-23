@@ -1,0 +1,179 @@
+From e87f07decddc5b86ca5149ac3147de45f04f21b0 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 10 Mar 2026 22:58:23 +0100
+Subject: [PATCH 009/174] PGCL: add batch PTE optimizations for copy, mremap,
+ mprotect, mlock
+
+Add pgcl_pte_batch() usage to batch PTE operations for PGCL sub-pages
+in the copy (fork), mremap, mprotect, and mlock paths. Since PGCL
+order-0 sub-pages are not compound, folio_pte_batch() cannot help;
+pgcl_pte_batch() counts contiguous present PTEs mapping consecutive
+PFNs within the same kernel page.
+
+copy_present_ptes: batch wrprotect + set_ptes for contiguous anon
+sub-pages with per-sub-page rmap/refcount (each sub-page is its own
+folio). Error path properly undoes rmap and refcount.
+
+mremap_folio_pte_batch, mprotect_folio_pte_batch, folio_mlock_step:
+use pgcl_pte_batch for non-large folios when PAGE_MMUSHIFT > 0.
+
+Fix three PAGE_SIZE bugs in generic PTE iterators in pgtable.h:
+- clear_not_present_full_ptes: addr += PAGE_SIZE -> MMUPAGE_SIZE
+- wrprotect_ptes: addr += PAGE_SIZE -> MMUPAGE_SIZE
+- modify_prot_start_ptes: addr += PAGE_SIZE -> MMUPAGE_SIZE
+
+All changes are no-ops when PAGE_MMUSHIFT=0. Build-tested with full
+Fedora config, boot-tested with PAGE_MMUSHIFT=4 (64KB pages), SMP=4.
+
+Signed-off-by: William Irwin <wli@holomorphy.com>
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ include/linux/pgtable.h |  6 +++---
+ mm/memory.c             | 40 ++++++++++++++++++++++++++++++++++++++++
+ mm/mlock.c              |  7 ++++++-
+ mm/mprotect.c           |  7 ++++++-
+ mm/mremap.c             |  8 +++++++-
+ 5 files changed, 62 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index dc2c72f8fcf5..9c23cf277187 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -1022,7 +1022,7 @@ static inline void clear_not_present_full_ptes(struct mm_struct *mm,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ #endif
+@@ -1127,7 +1127,7 @@ static inline void wrprotect_ptes(struct mm_struct *mm, unsigned long addr,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ #endif
+@@ -1681,7 +1681,7 @@ static inline pte_t modify_prot_start_ptes(struct vm_area_struct *vma,
+ 	pte = ptep_modify_prot_start(vma, addr, ptep);
+ 	while (--nr) {
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 		tmp_pte = ptep_modify_prot_start(vma, addr, ptep);
+ 		if (pte_dirty(tmp_pte))
+ 			pte = pte_mkdirty(pte);
+diff --git a/mm/memory.c b/mm/memory.c
+index 7ac908cc7567..2ac2a0f9ba7e 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1182,6 +1182,46 @@ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
+ 		return nr;
+ 	}
+ 
++
++#if PAGE_MMUSHIFT
++	/*
++	 * PGCL batch: order-0 pages are not compound, so folio_pte_batch
++	 * can't help. Batch PTE operations (wrprotect, set_ptes) for
++	 * contiguous sub-pages within the same kernel page, with
++	 * per-sub-page rmap/refcount since each sub-page is its own folio.
++	 */
++	if (max_nr > 1 && !folio_test_large(folio) && folio_test_anon(folio)
++	    && !*prealloc) {
++		nr = pgcl_pte_batch(pte, src_pte, max_nr);
++		if (nr > 1) {
++			int i;
++
++			for (i = 0; i < nr; i++) {
++				struct page *sp = page + i;
++				struct folio *sf = page_folio(sp);
++
++				folio_get(sf);
++				if (unlikely(folio_try_dup_anon_rmap_pte(
++						sf, sp, dst_vma, src_vma))) {
++					folio_put(sf);
++					/* Undo already-processed sub-pages */
++					while (--i >= 0) {
++						sp = page + i;
++						sf = page_folio(sp);
++						atomic_dec(&sf->_mapcount);
++						folio_put(sf);
++					}
++					return -EAGAIN;
++				}
++			}
++			rss[MM_ANONPAGES] += nr;
++			__copy_present_ptes(dst_vma, src_vma, dst_pte,
++					    src_pte, pte, addr, nr);
++			return nr;
++		}
++	}
++#endif
++
+ 	folio_get(folio);
+ 	if (folio_test_anon(folio)) {
+ 		/*
+diff --git a/mm/mlock.c b/mm/mlock.c
+index d6800bb56767..a1838cab6386 100644
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -310,8 +310,13 @@ static inline unsigned int folio_mlock_step(struct folio *folio,
+ 	unsigned int count = (end - addr) >> MMUPAGE_SHIFT;
+ 	pte_t ptent = ptep_get(pte);
+ 
+-	if (!folio_test_large(folio))
++	if (!folio_test_large(folio)) {
++#if PAGE_MMUSHIFT
++		return pgcl_pte_batch(ptent, pte, count);
++#else
+ 		return 1;
++#endif
++	}
+ 
+ 	return folio_pte_batch(folio, pte, ptent, count);
+ }
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 9626e3322c1b..5899e7a92d2e 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -110,8 +110,13 @@ static int mprotect_folio_pte_batch(struct folio *folio, pte_t *ptep,
+ 	if (!folio)
+ 		return 1;
+ 
+-	if (!folio_test_large(folio))
++	if (!folio_test_large(folio)) {
++#if PAGE_MMUSHIFT
++		return pgcl_pte_batch(pte, ptep, max_nr_ptes);
++#else
+ 		return 1;
++#endif
++	}
+ 
+ 	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr_ptes, flags);
+ }
+diff --git a/mm/mremap.c b/mm/mremap.c
+index 981c86788774..d26b73b8f8ea 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -188,7 +188,13 @@ static int mremap_folio_pte_batch(struct vm_area_struct *vma, unsigned long addr
+ 		return 1;
+ 
+ 	folio = vm_normal_folio(vma, addr, pte);
+-	if (!folio || !folio_test_large(folio))
++	if (!folio)
++		return 1;
++#if PAGE_MMUSHIFT
++	if (!folio_test_large(folio))
++		return pgcl_pte_batch(pte, ptep, max_nr);
++#endif
++	if (!folio_test_large(folio))
+ 		return 1;
+ 
+ 	return folio_pte_batch_flags(folio, NULL, ptep, &pte, max_nr, FPB_RESPECT_WRITE);
+-- 
+2.54.0
+

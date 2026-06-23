@@ -1,0 +1,102 @@
+From 3961f90c593c826f7e5a72f9a1f7326ac3fcc1a0 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 26 Mar 2026 16:18:52 +0100
+Subject: [PATCH 049/174] PGCL: fix parisc TLB flush and PCI DMA stride for
+ MMUPAGE granularity
+
+parisc __flush_tlb_range() in cache.c used PAGE_SIZE as the loop stride
+for pdtlb/pitlb instructions. With PGCL (PAGE_MMUSHIFT=4), PAGE_SIZE=64KB
+but hardware TLB entries are 4KB. The loop skipped 15 of 16 TLB entries.
+
+Similarly, flush_cache_pages() iterated at PAGE_SIZE stride.
+
+pci-dma.c map_pte_uncached() and unmap_uncached_pte() also used PAGE_SIZE
+for both address stepping and physical address advancement through PTE-level
+mappings with explicit TLB purge operations (pdtlb).
+
+fixmap.c set_fixmap() and clear_fixmap() used PAGE_SIZE as the end address
+for flush_tlb_kernel_range(), only invalidating one 64KB range instead of
+the correct one 4KB MMUPAGE mapping.
+
+Fix all instances to use MMUPAGE_SIZE.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/parisc/kernel/cache.c   |  4 ++--
+ arch/parisc/kernel/pci-dma.c | 10 +++++-----
+ arch/parisc/mm/fixmap.c      |  4 ++--
+ 3 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/arch/parisc/kernel/cache.c b/arch/parisc/kernel/cache.c
+index 67ae0a7412d3..8c4ca4aab9a2 100644
+--- a/arch/parisc/kernel/cache.c
++++ b/arch/parisc/kernel/cache.c
+@@ -697,7 +697,7 @@ int __flush_tlb_range(unsigned long sid, unsigned long start,
+ 		pdtlb(SR_TEMP1, start);
+ 		pitlb(SR_TEMP1, start);
+ 		purge_tlb_end(flags);
+-		start += PAGE_SIZE;
++		start += MMUPAGE_SIZE;
+ 	}
+ 	return 0;
+ }
+@@ -706,7 +706,7 @@ static void flush_cache_pages(struct vm_area_struct *vma, unsigned long start, u
+ {
+ 	unsigned long addr;
+ 
+-	for (addr = start; addr < end; addr += PAGE_SIZE)
++	for (addr = start; addr < end; addr += MMUPAGE_SIZE)
+ 		flush_cache_page_if_present(vma, addr);
+ }
+ 
+diff --git a/arch/parisc/kernel/pci-dma.c b/arch/parisc/kernel/pci-dma.c
+index bf9f192c826e..39da70097042 100644
+--- a/arch/parisc/kernel/pci-dma.c
++++ b/arch/parisc/kernel/pci-dma.c
+@@ -93,9 +93,9 @@ static inline int map_pte_uncached(pte_t * pte,
+ 		set_pte(pte, __mk_pte(*paddr_ptr, PAGE_KERNEL_UNC));
+ 		pdtlb(SR_KERNEL, orig_vaddr);
+ 		purge_tlb_end(flags);
+-		vaddr += PAGE_SIZE;
+-		orig_vaddr += PAGE_SIZE;
+-		(*paddr_ptr) += PAGE_SIZE;
++		vaddr += MMUPAGE_SIZE;
++		orig_vaddr += MMUPAGE_SIZE;
++		(*paddr_ptr) += MMUPAGE_SIZE;
+ 		pte++;
+ 	} while (vaddr < end);
+ 	return 0;
+@@ -177,8 +177,8 @@ static inline void unmap_uncached_pte(pmd_t * pmd, unsigned long vaddr,
+ 		purge_tlb_start(flags);
+ 		pdtlb(SR_KERNEL, orig_vaddr);
+ 		purge_tlb_end(flags);
+-		vaddr += PAGE_SIZE;
+-		orig_vaddr += PAGE_SIZE;
++		vaddr += MMUPAGE_SIZE;
++		orig_vaddr += MMUPAGE_SIZE;
+ 		pte++;
+ 		if (pte_none(page) || pte_present(page))
+ 			continue;
+diff --git a/arch/parisc/mm/fixmap.c b/arch/parisc/mm/fixmap.c
+index ae3493dae9dc..1c660bfcc3f3 100644
+--- a/arch/parisc/mm/fixmap.c
++++ b/arch/parisc/mm/fixmap.c
+@@ -21,7 +21,7 @@ void notrace set_fixmap(enum fixed_addresses idx, phys_addr_t phys)
+ 
+ 	pte = pte_offset_kernel(pmd, vaddr);
+ 	set_pte_at(&init_mm, vaddr, pte, __mk_pte(phys, PAGE_KERNEL_RWX));
+-	flush_tlb_kernel_range(vaddr, vaddr + PAGE_SIZE);
++	flush_tlb_kernel_range(vaddr, vaddr + MMUPAGE_SIZE);
+ }
+ 
+ void notrace clear_fixmap(enum fixed_addresses idx)
+@@ -34,5 +34,5 @@ void notrace clear_fixmap(enum fixed_addresses idx)
+ 
+ 	pte_clear(&init_mm, vaddr, pte);
+ 
+-	flush_tlb_kernel_range(vaddr, vaddr + PAGE_SIZE);
++	flush_tlb_kernel_range(vaddr, vaddr + MMUPAGE_SIZE);
+ }
+-- 
+2.54.0
+

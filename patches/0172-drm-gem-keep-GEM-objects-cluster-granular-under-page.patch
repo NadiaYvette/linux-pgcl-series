@@ -1,0 +1,84 @@
+From f052720d1bca31b569dc20ebfefcf898d12c1274 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 19 Jun 2026 16:37:10 +0200
+Subject: [PATCH 172/174] drm/gem: keep GEM objects cluster-granular under
+ page-clustering
+
+On a page-clustering (PGCL) kernel PAGE_SIZE is the cluster size
+(MMUPAGE_SIZE << CONFIG_PAGE_MMUSHIFT) -- e.g. 64KiB over a 4KiB MMU page
+at PAGE_MMUSHIFT=4 -- and there is exactly one struct page per cluster.
+GEM objects are backed and accounted in those PAGE_SIZE units: the
+backing page array, the LRU and the shrinker all derive their page count
+from obj->size >> PAGE_SHIFT, and drm_gem_get_pages()/drm_gem_put_pages()
+walk that many struct pages.
+
+Callers, however, size objects in MMUPAGE (hardware-page) units, which
+need not be cluster-aligned.  i915's internal-object allocator
+(__i915_gem_object_create_internal) does exactly this for scratch and
+firmware objects, so on a real PAGE_MMUSHIFT=4 boot
+drm_gem_private_object_init() tripped:
+
+  kernel BUG at drivers/gpu/drm/drm_gem.c:222!
+  BUG_ON((size & (PAGE_SIZE - 1)) != 0)
+  drm_gem_private_object_init+0xdc
+  __i915_gem_object_create_internal+0x3a [i915]
+
+during i915 module load (the worker is killed, i915 then fails to bind
+and the display falls back to simpledrm).
+
+Rather than relax the assertion -- which would let a sub-cluster object
+reach drm_gem_get_pages() with obj->size >> PAGE_SHIFT == 0 -- round the
+requested size up to the cluster in drm_gem_private_object_init(), and in
+drm_gem_object_init() before sizing the shmem backing so the two agree.
+This keeps every PAGE_SIZE-granular accounting site correct and matches
+the one-struct-page-per-cluster model.  The userspace-facing mmap offset
+space is unaffected: drm_gem_create_mmap_offset_size() already spans the
+object in MMUPAGE units.
+
+No functional change when CONFIG_PAGE_MMUSHIFT == 0 (MMUPAGE_SIZE ==
+PAGE_SIZE), where callers already pass PAGE-aligned sizes.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ drivers/gpu/drm/drm_gem.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index 34b76e1a7d05..ed3cfbe7732d 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -188,6 +188,12 @@ int drm_gem_object_init(struct drm_device *dev, struct drm_gem_object *obj,
+ 	struct file *filp;
+ 	const vma_flags_t flags = mk_vma_flags(VMA_NORESERVE_BIT);
+ 
++	/*
++	 * PGCL: round up to the cluster up-front so the shmem backing below is
++	 * sized to agree with obj->size (see drm_gem_private_object_init).
++	 */
++	size = PAGE_ALIGN(size);
++
+ 	drm_gem_private_object_init(dev, obj, size);
+ 
+ 	huge_mnt = drm_gem_get_huge_mnt(dev);
+@@ -219,7 +225,16 @@ EXPORT_SYMBOL(drm_gem_object_init);
+ void drm_gem_private_object_init(struct drm_device *dev,
+ 				 struct drm_gem_object *obj, size_t size)
+ {
+-	BUG_ON((size & (PAGE_SIZE - 1)) != 0);
++	/*
++	 * PGCL: GEM objects are backed and accounted in PAGE_SIZE (cluster)
++	 * units -- there is one struct page per cluster, and the backing page
++	 * array, the LRU and the shrinker all use obj->size >> PAGE_SHIFT.
++	 * Callers size objects in MMUPAGE (hardware-page) units, which need not
++	 * be cluster-aligned (e.g. i915 internal scratch objects), so round up
++	 * to the cluster to keep those invariants consistent rather than BUG.
++	 * Identity when PAGE_MMUSHIFT == 0 (size is already PAGE-aligned).
++	 */
++	size = PAGE_ALIGN(size);
+ 
+ 	obj->dev = dev;
+ 	obj->filp = NULL;
+-- 
+2.54.0
+

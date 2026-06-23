@@ -1,0 +1,60 @@
+From 52ab1f812f0a829aeac3aaee5eb3e0467158956e Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 28 May 2026 22:31:35 +0200
+Subject: [PATCH 127/174] =?UTF-8?q?parisc:=20NUM=5FPDC=5FRESULT=2032=20?=
+ =?UTF-8?q?=E2=86=92=2064=20to=20absorb=20wide-firmware=20result=20overrun?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On QEMU's HP C3700 emulation (and similar 64-bit PDC firmware platforms)
+running a 32-bit hppa kernel, certain PDC calls write 64-bit-wide result
+slots into pdc_result.  The kernel sizes pdc_result as
+`unsigned long pdc_result[NUM_PDC_RESULT]`, giving 32 × 4 = 128 bytes on
+a 32-bit kernel — exactly half what the wide firmware writes for the
+same number of slots.  The overrun corrupts whatever .bss sits
+immediately after pdc_result.
+
+For years this overrun was invisible because the unfortunate neighbour
+in the layout was harmless (e.g. `no_alternatives`).  Upstream commit
+b8425ceefee5 ("parisc: drivers: switch to dynamic root device") converted
+the static `struct device root` (large, lived in .data) to a small
+`struct device *root` pointer in .bss.  In our linker layout `root`
+landed exactly 128 bytes after `pdc_result` — i.e. the first word the
+overrun zeroes.  The result is a NULL `root`, parent=NULL passed all
+the way through alloc_pa_dev → create_tree_node → setup_bus_id →
+get_node_path, and a "Kernel Fault: Code=26 ... at addr 00000034"
+during early device inventory on hppa PGCL=6.
+
+Bumping NUM_PDC_RESULT to 64 gives pdc_result 256 bytes, matching the
+worst-case wide-firmware footprint, so the overrun lands inside the
+buffer instead of clobbering the next .bss variable.  Verified clean
+on hppa PGCL=6: pgcl-stress 12/0, LTP 72p/2f/27s, 0 BUGs, 0 panics
+(matches pre-rebase baseline).
+
+This is a workaround, not a root-cause fix — the proper fix is to
+add a narrow-from-wide conversion (the inverse of convert_to_wide())
+or to declare pdc_result with a worst-case element size — but neither
+is appropriate for the PGCL branch as-is.
+
+Signed-off-by: Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
+---
+ arch/parisc/include/uapi/asm/pdc.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/parisc/include/uapi/asm/pdc.h b/arch/parisc/include/uapi/asm/pdc.h
+index 65031ddf8372..b31b84efae54 100644
+--- a/arch/parisc/include/uapi/asm/pdc.h
++++ b/arch/parisc/include/uapi/asm/pdc.h
+@@ -359,7 +359,7 @@
+ #define BOOT_CONSOLE_PATH_OFFSET 0x3a8
+ 
+ /* size of the pdc_result buffer for firmware.c */
+-#define NUM_PDC_RESULT	32
++#define NUM_PDC_RESULT	64
+ 
+ #if !defined(__ASSEMBLER__)
+ 
+-- 
+2.54.0
+

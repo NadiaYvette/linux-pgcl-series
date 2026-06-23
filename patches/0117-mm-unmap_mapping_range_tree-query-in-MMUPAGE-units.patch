@@ -1,0 +1,90 @@
+From 47d4e3e3b8bc802f6905a8da2746a0c1867527d9 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 14 May 2026 05:54:01 +0200
+Subject: [PATCH 117/174] mm: unmap_mapping_range_tree query in MMUPAGE units
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The i_mmap interval tree is keyed on vma->vm_pgoff and vma_last_pgoff,
+both of which are in MMUPAGE-sized units under PGCL.  But callers of
+unmap_mapping_pages (e.g. shmem_setattr → unmap_mapping_range during
+ftruncate) compute first_index/last_index from a byte offset shifted
+by PAGE_SHIFT — i.e. PAGE-cache units — and pass them straight to
+unmap_mapping_range_tree.
+
+At PAGE_MMUSHIFT == 0 the units coincide and there is no problem.
+At PAGE_MMUSHIFT > 0 the tree query and the subsequent max(...) /
+min(...) intersection mix PAGE-pgoff with MMUPAGE-pgoff.  When
+first_index > vma->vm_pgoff (raw comparison across mismatched units),
+start_idx ends up as first_index, and `vma->vm_start + ((start_idx -
+vma->vm_pgoff) << PAGE_SHIFT)` lands far past vma->vm_end.  The
+resulting __zap_vma_range fires its `start >= end ||
+!range_in_vma(vma, start, end)` VM_WARN.  Visible in matrix logs as
+ppc64 PGCL=4/6 pgcl-stress ftruncate path:
+
+  WARNING: mm/memory.c:2180 at __zap_vma_range+0x90/0x1f80
+  CPU: 3 UID: 0 PID: 179 Comm: pgcl-stress
+  Call Trace:
+    zap_vma_range_batched+0x108/0x250
+    unmap_mapping_range_tree+0xf8/0x170
+    unmap_mapping_pages+0xe4/0xf0
+    shmem_setattr+0x41c/0x570
+    notify_change+0x384/0x6a0
+    do_truncate+0x134/0x160
+    do_ftruncate+0x180/0x2b0
+    sys_ftruncate+0x58/0xd0
+
+Convert first_index/last_index to MMUPAGE units up front and use
+MMUPAGE_SHIFT for the byte-offset arithmetic.  Use the existing
+pgoff_page_to_mmu helper; ULONG_MAX (the "to end of file" sentinel)
+is preserved verbatim.  At PAGE_MMUSHIFT == 0 the helper is identity
+and behaviour is byte-for-byte unchanged.
+
+Verified ppc64 PGCL=6 SMP=4 boot + pgcl-test + pgcl-stress + early
+LTP run cleanly with no zap_vma_range WARN where the previous run
+fired during pgcl-stress.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ mm/memory.c | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index 4453552387bb..f9b436b7c339 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -4603,13 +4603,25 @@ static inline void unmap_mapping_range_tree(struct rb_root_cached *root,
+ 	struct vm_area_struct *vma;
+ 	unsigned long start, size;
+ 	struct mmu_gather tlb;
++	/*
++	 * Callers pass first/last_index in PAGE-cache units.  Under PGCL
++	 * the i_mmap interval tree is keyed on vma->vm_pgoff which is in
++	 * MMUPAGE units.  Convert before querying the tree and use
++	 * MMUPAGE_SHIFT for the byte-offset arithmetic so the resulting
++	 * (start, size) lies within [vma->vm_start, vma->vm_end).
++	 * At PAGE_MMUSHIFT==0 these helpers are identity.
++	 */
++	pgoff_t mmu_first = pgoff_page_to_mmu(first_index);
++	pgoff_t mmu_last = (last_index == ULONG_MAX) ?
++		ULONG_MAX : (pgoff_page_to_mmu(last_index + 1) - 1);
+ 
+-	vma_interval_tree_foreach(vma, root, first_index, last_index) {
+-		const pgoff_t start_idx = max(first_index, vma->vm_pgoff);
+-		const pgoff_t end_idx = min(last_index, vma_last_pgoff(vma)) + 1;
++	vma_interval_tree_foreach(vma, root, mmu_first, mmu_last) {
++		const pgoff_t start_idx = max(mmu_first, vma->vm_pgoff);
++		const pgoff_t end_idx = min(mmu_last, vma_last_pgoff(vma)) + 1;
+ 
+-		start = vma->vm_start + ((start_idx - vma->vm_pgoff) << PAGE_SHIFT);
+-		size = (end_idx - start_idx) << PAGE_SHIFT;
++		start = vma->vm_start +
++			((start_idx - vma->vm_pgoff) << MMUPAGE_SHIFT);
++		size = (end_idx - start_idx) << MMUPAGE_SHIFT;
+ 
+ 		tlb_gather_mmu(&tlb, vma->vm_mm);
+ 		zap_vma_range_batched(&tlb, vma, start, size, details);
+-- 
+2.54.0
+

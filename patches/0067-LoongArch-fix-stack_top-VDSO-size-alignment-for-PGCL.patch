@@ -1,0 +1,35 @@
+From 9dc08868d8a4c4c65586388b3e3c57b90690f1ba Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 2 Apr 2026 13:52:49 +0200
+Subject: [PATCH 067/174] LoongArch: fix stack_top() VDSO size alignment for
+ PGCL
+
+stack_top() used PAGE_ALIGN() for the VDSO size, but the VDSO
+is mapped at MMUPAGE granularity.  With PGCL (PAGE_MMUSHIFT=4),
+PAGE_ALIGN rounds a 16KB VDSO up to 256KB, wasting 240KB of
+virtual address space below the stack.
+
+Use MMUPAGE_ALIGN() to match the actual VDSO mapping granularity.
+
+Signed-off-by: William Irwin <wli@holomorphy.com>
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/loongarch/kernel/process.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/loongarch/kernel/process.c b/arch/loongarch/kernel/process.c
+index 375220dfeca9..7a7a7cc57f71 100644
+--- a/arch/loongarch/kernel/process.c
++++ b/arch/loongarch/kernel/process.c
+@@ -324,7 +324,7 @@ unsigned long stack_top(void)
+ 
+ 	if (current->thread.vdso) {
+ 		/* Space for the VDSO & data page */
+-		top -= PAGE_ALIGN(current->thread.vdso->size);
++		top -= MMUPAGE_ALIGN(current->thread.vdso->size);
+ 		top -= VVAR_SIZE;
+ 
+ 		/* Space to randomize the VDSO base */
+-- 
+2.54.0
+

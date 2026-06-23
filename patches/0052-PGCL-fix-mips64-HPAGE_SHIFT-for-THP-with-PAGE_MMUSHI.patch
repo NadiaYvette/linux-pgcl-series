@@ -1,0 +1,44 @@
+From 9b0cd83ac665dbc1bc9e580d936337f797d886be Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 27 Mar 2026 04:31:53 +0100
+Subject: [PATCH 052/174] PGCL: fix mips64 HPAGE_SHIFT for THP with
+ PAGE_MMUSHIFT>0
+
+The HPAGE_SHIFT formula was (PAGE_SHIFT + MMUPAGE_SHIFT - 3) which gives
+the wrong result when PAGE_SHIFT != MMUPAGE_SHIFT under PGCL. With
+PAGE_MMUSHIFT=4 (MMUPAGE_SHIFT=14, PAGE_SHIFT=18), this produced
+HPAGE_SHIFT=29 (512MB) instead of the correct 25 (32MB).
+
+The hardware TLB (PM_HUGE_MASK = PM_16M) maps paired 16MB entries, so
+HPAGE_SIZE must be 32MB = 2^25. The correct formula is (2 * MMUPAGE_SHIFT - 3),
+matching the original upstream (2 * PAGE_SHIFT - 3) where PAGE_SHIFT was the
+hardware page shift.
+
+With the wrong HPAGE_SHIFT, the EntryLo1 offset (HPAGE_SIZE >> 7) was 4MB
+instead of 256KB, making EntryLo1 point 256MB past EntryLo0 and causing
+"Data bus error" on any THP access requiring the second TLB entry half.
+
+Tested: mips64 cow selftest fully passes with THP enabled; PMD THP size
+correctly shows 32768 kB.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/mips/include/asm/page.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/mips/include/asm/page.h b/arch/mips/include/asm/page.h
+index de1a79120248..d8ac3640a00e 100644
+--- a/arch/mips/include/asm/page.h
++++ b/arch/mips/include/asm/page.h
+@@ -40,7 +40,7 @@ static inline unsigned int page_size_ftlb(unsigned int mmuextdef)
+ }
+ 
+ #ifdef CONFIG_MIPS_HUGE_TLB_SUPPORT
+-#define HPAGE_SHIFT	(PAGE_SHIFT + MMUPAGE_SHIFT - 3)
++#define HPAGE_SHIFT	(2 * MMUPAGE_SHIFT - 3)
+ #define HPAGE_SIZE	(_AC(1,UL) << HPAGE_SHIFT)
+ #define HPAGE_MASK	(~(HPAGE_SIZE - 1))
+ #define HUGETLB_PAGE_ORDER	(HPAGE_SHIFT - PAGE_SHIFT)
+-- 
+2.54.0
+

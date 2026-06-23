@@ -1,0 +1,124 @@
+From 90f99944fcdd60bb8d26559ceabc0734691e6b13 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 17:16:31 +0200
+Subject: [PATCH 092/174] mm/rmap: page_vma_mkclean_one batches via
+ pvmw->nr_mmupages
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mirror the Phase-2b conversion of try_to_unmap_one (commit ff154fa36c21)
+and try_to_migrate_one (commit 0452d1cbc36c): batch page_vma_mkclean's
+PTE-level work over the kernel page worth of consecutive same-PFN PTEs
+the walker yields per yield, instead of operating one PTE at a time.
+
+Before this change the function ran the per-PTE sequence
+(flush_cache_page → ptep_clear_flush → wrprotect+mkclean → set_pte_at)
+once per yield.  Under PGCL the walker yields PAGE_MMUCOUNT PTEs at a
+time, and only the first was processed per yield; the loop then
+iterated PAGE_MMUCOUNT times to clean a single kernel page mapping.
+Correct results but PAGE_MMUCOUNT× the cache+TLB flushes.
+
+The early-skip (no work needed if no PTE in the batch is dirty or
+writable) must scan ALL sub-PTEs.  Sub-page mprotect can leave a
+kernel-page mapping with mixed write bits, so checking only the first
+PTE could falsely skip a writable sub-PTE and leave it modifiable
+during writeback (data corruption).  The peek loop is O(nr_pages) but
+typically hits cache.
+
+For the actual cleaning, use:
+  flush_cache_range(vma, address, end_addr);
+  entry = get_and_clear_ptes(mm, address, pte, nr_pages);
+  flush_tlb_range(vma, address, end_addr);
+  entry = pte_wrprotect(pte_mkclean(entry));
+  set_ptes(mm, address, pte, entry, nr_pages);
+
+get_and_clear_ptes returns the OR'd dirty/accessed bits with the
+FIRST PTE's PFN; set_ptes(..., nr_pages) reconstructs the consecutive
+sub-page PFNs via pte_advance_pfn, so the per-sub-page PFN topology
+is preserved across the round-trip.
+
+For non-PGCL builds nr_mmupages is always 1, the peek loop runs once,
+get_and_clear_ptes(..., 1) == ptep_get_and_clear, set_ptes(..., 1) ==
+set_pte_at, and behavior is byte-identical to the legacy form.
+
+Verified on x86_64 PGCL=4 (LTP 71p/0f/28s — exact baseline match) and
+aarch64 PGCL=4 (cow PASS, PGCL basic 19/19, stress 12/12, all mm
+selftests PASS, zero kernel BUG/Oops/WARNING).  Test outcomes byte-
+identical to the post-Bug-4-fix baseline.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/rmap.c | 45 +++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 013ca259130e..cae5532a3383 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1148,6 +1148,18 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
+ 		if (pvmw->pte) {
+ 			pte_t *pte = pvmw->pte;
+ 			pte_t entry = ptep_get(pte);
++			/*
++			 * Under PGCL the walker yields one kernel page worth
++			 * of consecutive same-PFN PTEs at a time
++			 * (pvmw->nr_mmupages, typically PAGE_MMUCOUNT).  Batch
++			 * the cache+TLB flush, clear, and writeback over the
++			 * whole yielded range; one rmap event per yield.  For
++			 * non-PGCL builds nr_mmupages is always 1 and this
++			 * collapses to the per-PTE legacy form.
++			 */
++			unsigned int nr_pages = pvmw->nr_mmupages, i;
++			unsigned long end_addr;
++			bool any_dirty_or_write = false;
+ 
+ 			/*
+ 			 * PFN swap PTEs, such as device-exclusive ones, that
+@@ -1157,14 +1169,39 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
+ 			 */
+ 			if (!pte_present(entry))
+ 				continue;
+-			if (!pte_dirty(entry) && !pte_write(entry))
++
++			/*
++			 * The early-skip (no work needed if no PTE in the
++			 * batch is dirty or writable) must scan ALL sub-PTEs:
++			 * sub-page mprotect can leave a kernel-page mapping
++			 * with mixed write bits, so checking only the first
++			 * PTE could falsely skip a writable sub-PTE and leave
++			 * it modifiable during writeback (data corruption).
++			 * Loop is O(nr_pages) but typically hits cache.
++			 */
++			for (i = 0; i < nr_pages; i++) {
++				pte_t pe = ptep_get(pte + i);
++
++				if (pte_dirty(pe) || pte_write(pe)) {
++					any_dirty_or_write = true;
++					break;
++				}
++			}
++			if (!any_dirty_or_write)
+ 				continue;
+ 
+-			flush_cache_page(vma, address, pte_pfn(entry));
+-			entry = ptep_clear_flush(vma, address, pte);
++			end_addr = address + nr_pages * MMUPAGE_SIZE;
++			flush_cache_range(vma, address, end_addr);
++			entry = get_and_clear_ptes(vma->vm_mm, address, pte, nr_pages);
++			flush_tlb_range(vma, address, end_addr);
+ 			entry = pte_wrprotect(entry);
+ 			entry = pte_mkclean(entry);
+-			set_pte_at(vma->vm_mm, address, pte, entry);
++			/*
++			 * set_ptes restores N PTEs with PFN-stride: the OR'd
++			 * pteval keeps the FIRST PTE's PFN; consecutive sub-
++			 * page PFNs are reconstructed by pte_advance_pfn.
++			 */
++			set_ptes(vma->vm_mm, address, pte, entry, nr_pages);
+ 			ret = 1;
+ 		} else {
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-- 
+2.54.0
+

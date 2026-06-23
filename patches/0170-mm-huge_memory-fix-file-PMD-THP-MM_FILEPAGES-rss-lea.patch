@@ -1,0 +1,51 @@
+From b414074ee6ad911ca0f79ac31b6e5e70a6edc371 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 19 Jun 2026 14:46:34 +0200
+Subject: [PATCH 170/174] mm/huge_memory: fix file-PMD-THP MM_FILEPAGES rss
+ leak under PGCL
+
+__split_huge_pmd_locked()'s present-folio PMD teardown subtracted
+HPAGE_PMD_NR from MM_FILEPAGES, but under page clustering MM_FILEPAGES rss
+is MMUPAGE-granular and the file-PMD-THP fault adds +HPAGE_PMD_MMUNR
+(== HPAGE_PMD_NR << PAGE_MMUSHIFT).  Tearing down a 2MB file THP thus
+returned only the cluster count (HPAGE_PMD_NR) of the sub-PTE count
+(HPAGE_PMD_MMUNR) it had added, leaking (PAGE_MMUCOUNT-1)/PAGE_MMUCOUNT of
+each PMD's MM_FILEPAGES.  With transparent_hugepage=always (Fedora default)
+every process that mmaps files leaks file rss -> "BUG: Bad rss-counter
+state ... type:MM_FILEPAGES val:~970000" at exit (reproduced for the test
+workload AND systemd-journald).  The sibling migration-entry path and
+zap_huge_pmd() already use HPAGE_PMD_MMUNR.
+
+QEMU A/B (pgcl4 DEBUG_VM, THP=always, MADV_COLLAPSE file reproducer):
+unfixed 9 Bad-rss-counter records / fixed 0.  Identity at PAGE_MMUSHIFT==0.
+Reproducer: pgcl userspace/file_collapse_repro.c.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ mm/huge_memory.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index f937b7e11aa9..c109551ee8d3 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3133,7 +3133,14 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 			if (!folio_test_referenced(folio) && pmd_young(old_pmd))
+ 				folio_set_referenced(folio);
+ 			folio_remove_rmap_pmd(folio, page, vma);
+-			add_mm_counter(mm, mm_counter_file(folio), -HPAGE_PMD_NR);
++			/*
++			 * PGCL: MM_FILEPAGES rss is MMUPAGE-granular and the
++			 * file-PMD-THP fault adds +HPAGE_PMD_MMUNR, so tear-down
++			 * must subtract HPAGE_PMD_MMUNR, not the cluster-count
++			 * HPAGE_PMD_NR (which leaks the rest of the PMD per split).
++			 * Matches the migration path below + zap_huge_pmd().
++			 */
++			add_mm_counter(mm, mm_counter_file(folio), -HPAGE_PMD_MMUNR);
+ 			folio_put(folio);
+ 			return;
+ 		}
+-- 
+2.54.0
+

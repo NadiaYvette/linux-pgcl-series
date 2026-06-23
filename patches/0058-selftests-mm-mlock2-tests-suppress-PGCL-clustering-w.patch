@@ -1,0 +1,51 @@
+From 8692696e2e2a6f1edad94dc27c01834f80d2a2a7 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 31 Mar 2026 23:55:19 +0200
+Subject: [PATCH 058/174] selftests/mm: mlock2-tests: suppress PGCL clustering
+ with MADV_RANDOM
+
+On PGCL kernels, anonymous page clustering prefaults all sub-pages within
+a kernel page allocation unit. This causes mlock2 MLOCK_ONFAULT tests to
+see more resident pages than expected (RSS == Size instead of just the
+one faulted page).
+
+Add MADV_RANDOM to suppress clustering so the tests correctly verify
+that only the explicitly touched page is resident.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ tools/testing/selftests/mm/mlock2-tests.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/tools/testing/selftests/mm/mlock2-tests.c b/tools/testing/selftests/mm/mlock2-tests.c
+index b474f2b20def..fe270b67ca80 100644
+--- a/tools/testing/selftests/mm/mlock2-tests.c
++++ b/tools/testing/selftests/mm/mlock2-tests.c
+@@ -202,6 +202,15 @@ static void test_mlock_lock(void)
+ 
+ static int onfault_check(char *map)
+ {
++	unsigned long page_size = getpagesize();
++
++	/*
++	 * Suppress sub-page clustering so that faulting one page
++	 * doesn't prefault the adjacent page within the same kernel
++	 * allocation unit.  Without this, RSS == Size and the
++	 * "only one page faulted" assertion fails on PGCL kernels.
++	 */
++	madvise(map, 2 * page_size, MADV_RANDOM);
+ 	*map = 'a';
+ 	if (!is_vma_lock_on_fault((unsigned long)map)) {
+ 		ksft_print_msg("VMA is not marked for lock on fault\n");
+@@ -261,6 +270,8 @@ static void test_lock_onfault_of_present(void)
+ 	if (map == MAP_FAILED)
+ 		ksft_exit_fail_msg("mmap error: %s", strerror(errno));
+ 
++	/* Suppress clustering so only the touched page is resident */
++	madvise(map, 2 * page_size, MADV_RANDOM);
+ 	*map = 'a';
+ 
+ 	if (mlock2_(map, 2 * page_size, MLOCK_ONFAULT)) {
+-- 
+2.54.0
+

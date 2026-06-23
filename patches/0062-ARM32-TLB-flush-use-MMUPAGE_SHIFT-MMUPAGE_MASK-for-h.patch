@@ -1,0 +1,326 @@
+From 55f3c580c7259f5c6a02619d2038eb6ae7b154f8 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 1 Apr 2026 19:03:05 +0200
+Subject: [PATCH 062/174] ARM32 TLB flush: use MMUPAGE_SHIFT/MMUPAGE_MASK for
+ hardware page granularity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With PGCL (PAGE_MMUSHIFT=4), PAGE_SIZE=64KB but hardware MMU pages are
+4KB (MMUPAGE_SIZE). All ARM32 TLB flush operations were using PAGE_MASK
+and PAGE_SHIFT, causing TLBI instructions to target 64KB-aligned addresses
+and step by 64KB — flushing only 1 in 16 TLB entries.
+
+This caused stale TLB entries after COW faults during fork(), leading to
+SIGSEGV in child processes. The bug manifested as 41 LTP test failures
+on ARM32 with MMUSHIFT=4, all tests that fork after creating files/dirs
+on tmpfs.
+
+Fix all ARM32 TLB flush code:
+- tlbflush.h: flush_tlb_page variants use MMUPAGE_MASK (5 instances)
+- tlb-v7.S: MMUPAGE_SHIFT for alignment, MMUPAGE_SZ for stride
+- tlb-v6.S: same pattern as v7
+- tlb-v4.S, tlb-v4wb.S, tlb-v4wbi.S, tlb-fa.S: MMUPAGE_SZ stride
+- asm-offsets.c: add MMUPAGE_SZ constant for assembly
+- pgtable.h: clear_young_dirty_ptes and clear_flush_young_ptes
+  iterate PTEs at MMUPAGE_SIZE stride (not PAGE_SIZE)
+
+Same class of bug as x86_64 flush_tlb_range fix (S53).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm/include/asm/tlbflush.h | 12 ++++++------
+ arch/arm/kernel/asm-offsets.c   |  1 +
+ arch/arm/mm/tlb-fa.S            |  4 ++--
+ arch/arm/mm/tlb-v4.S            |  2 +-
+ arch/arm/mm/tlb-v4wb.S          |  4 ++--
+ arch/arm/mm/tlb-v4wbi.S         |  4 ++--
+ arch/arm/mm/tlb-v6.S            | 20 ++++++++++----------
+ arch/arm/mm/tlb-v7.S            | 20 ++++++++++----------
+ include/linux/pgtable.h         |  4 ++--
+ 9 files changed, 36 insertions(+), 35 deletions(-)
+
+diff --git a/arch/arm/include/asm/tlbflush.h b/arch/arm/include/asm/tlbflush.h
+index 38c6e4a2a0b6..40257e3c2055 100644
+--- a/arch/arm/include/asm/tlbflush.h
++++ b/arch/arm/include/asm/tlbflush.h
+@@ -415,7 +415,7 @@ __local_flush_tlb_page(struct vm_area_struct *vma, unsigned long uaddr)
+ 	const int zero = 0;
+ 	const unsigned int __tlb_flag = __cpu_tlb_flags;
+ 
+-	uaddr = (uaddr & PAGE_MASK) | ASID(vma->vm_mm);
++	uaddr = (uaddr & MMUPAGE_MASK) | ASID(vma->vm_mm);
+ 
+ 	if (possible_tlb_flags & (TLB_V4_U_PAGE|TLB_V4_D_PAGE|TLB_V4_I_PAGE|TLB_V4_I_FULL) &&
+ 	    cpumask_test_cpu(smp_processor_id(), mm_cpumask(vma->vm_mm))) {
+@@ -436,7 +436,7 @@ local_flush_tlb_page(struct vm_area_struct *vma, unsigned long uaddr)
+ {
+ 	const unsigned int __tlb_flag = __cpu_tlb_flags;
+ 
+-	uaddr = (uaddr & PAGE_MASK) | ASID(vma->vm_mm);
++	uaddr = (uaddr & MMUPAGE_MASK) | ASID(vma->vm_mm);
+ 
+ 	if (tlb_flag(TLB_WB))
+ 		dsb(nshst);
+@@ -453,14 +453,14 @@ __flush_tlb_page(struct vm_area_struct *vma, unsigned long uaddr)
+ {
+ 	const unsigned int __tlb_flag = __cpu_tlb_flags;
+ 
+-	uaddr = (uaddr & PAGE_MASK) | ASID(vma->vm_mm);
++	uaddr = (uaddr & MMUPAGE_MASK) | ASID(vma->vm_mm);
+ 
+ 	if (tlb_flag(TLB_WB))
+ 		dsb(ishst);
+ 
+ 	__local_flush_tlb_page(vma, uaddr);
+ #ifdef CONFIG_ARM_ERRATA_720789
+-	tlb_op(TLB_V7_UIS_PAGE, "c8, c3, 3", uaddr & PAGE_MASK);
++	tlb_op(TLB_V7_UIS_PAGE, "c8, c3, 3", uaddr & MMUPAGE_MASK);
+ #else
+ 	tlb_op(TLB_V7_UIS_PAGE, "c8, c3, 1", uaddr);
+ #endif
+@@ -489,7 +489,7 @@ static inline void local_flush_tlb_kernel_page(unsigned long kaddr)
+ {
+ 	const unsigned int __tlb_flag = __cpu_tlb_flags;
+ 
+-	kaddr &= PAGE_MASK;
++	kaddr &= MMUPAGE_MASK;
+ 
+ 	if (tlb_flag(TLB_WB))
+ 		dsb(nshst);
+@@ -507,7 +507,7 @@ static inline void __flush_tlb_kernel_page(unsigned long kaddr)
+ {
+ 	const unsigned int __tlb_flag = __cpu_tlb_flags;
+ 
+-	kaddr &= PAGE_MASK;
++	kaddr &= MMUPAGE_MASK;
+ 
+ 	if (tlb_flag(TLB_WB))
+ 		dsb(ishst);
+diff --git a/arch/arm/kernel/asm-offsets.c b/arch/arm/kernel/asm-offsets.c
+index 2101938d27fc..4cf2beb12689 100644
+--- a/arch/arm/kernel/asm-offsets.c
++++ b/arch/arm/kernel/asm-offsets.c
+@@ -114,6 +114,7 @@ int main(void)
+   DEFINE(VM_EXEC,	       	VM_EXEC);
+   BLANK();
+   DEFINE(PAGE_SZ,	       	PAGE_SIZE);
++  DEFINE(MMUPAGE_SZ,		MMUPAGE_SIZE);
+   BLANK();
+   DEFINE(SYS_ERROR0,		0x9f0000);
+   BLANK();
+diff --git a/arch/arm/mm/tlb-fa.S b/arch/arm/mm/tlb-fa.S
+index 85a6fe766b21..65a42f95e929 100644
+--- a/arch/arm/mm/tlb-fa.S
++++ b/arch/arm/mm/tlb-fa.S
+@@ -42,7 +42,7 @@ SYM_TYPED_FUNC_START(fa_flush_user_tlb_range)
+ 	bic	r0, r0, #0x0ff
+ 	bic	r0, r0, #0xf00
+ 1:	mcr	p15, 0, r0, c8, c7, 1		@ invalidate UTLB entry
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	mcr	p15, 0, r3, c7, c10, 4		@ data write barrier
+@@ -56,7 +56,7 @@ SYM_TYPED_FUNC_START(fa_flush_kern_tlb_range)
+ 	bic	r0, r0, #0x0ff
+ 	bic	r0, r0, #0xf00
+ 1:	mcr	p15, 0, r0, c8, c7, 1		@ invalidate UTLB entry
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	mcr	p15, 0, r3, c7, c10, 4		@ data write barrier
+diff --git a/arch/arm/mm/tlb-v4.S b/arch/arm/mm/tlb-v4.S
+index 079774a02be6..a43df85bca25 100644
+--- a/arch/arm/mm/tlb-v4.S
++++ b/arch/arm/mm/tlb-v4.S
+@@ -37,7 +37,7 @@ SYM_TYPED_FUNC_START(v4_flush_user_tlb_range)
+ 	bic	r0, r0, #0x0ff
+ 	bic	r0, r0, #0xf00
+ 1:	mcr	p15, 0, r0, c8, c7, 1		@ invalidate TLB entry
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	ret	lr
+diff --git a/arch/arm/mm/tlb-v4wb.S b/arch/arm/mm/tlb-v4wb.S
+index 04e46c359e75..edc2ab2b1d37 100644
+--- a/arch/arm/mm/tlb-v4wb.S
++++ b/arch/arm/mm/tlb-v4wb.S
+@@ -40,7 +40,7 @@ SYM_TYPED_FUNC_START(v4wb_flush_user_tlb_range)
+ 	bic	r0, r0, #0x0ff
+ 	bic	r0, r0, #0xf00
+ 1:	mcr	p15, 0, r0, c8, c6, 1		@ invalidate D TLB entry
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	ret	lr
+@@ -62,7 +62,7 @@ SYM_TYPED_FUNC_START(v4wb_flush_kern_tlb_range)
+ 	bic	r0, r0, #0xf00
+ 	mcr	p15, 0, r3, c8, c5, 0		@ invalidate I TLB
+ 1:	mcr	p15, 0, r0, c8, c6, 1		@ invalidate D TLB entry
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	ret	lr
+diff --git a/arch/arm/mm/tlb-v4wbi.S b/arch/arm/mm/tlb-v4wbi.S
+index 502dfe5628a3..aae9cf7b5f11 100644
+--- a/arch/arm/mm/tlb-v4wbi.S
++++ b/arch/arm/mm/tlb-v4wbi.S
+@@ -40,7 +40,7 @@ SYM_TYPED_FUNC_START(v4wbi_flush_user_tlb_range)
+ 1:	tst	r2, #VM_EXEC
+ 	mcrne	p15, 0, r0, c8, c5, 1		@ invalidate I TLB entry
+ 	mcr	p15, 0, r0, c8, c6, 1		@ invalidate D TLB entry
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	ret	lr
+@@ -53,7 +53,7 @@ SYM_TYPED_FUNC_START(v4wbi_flush_kern_tlb_range)
+ 	bic	r0, r0, #0xf00
+ 1:	mcr	p15, 0, r0, c8, c5, 1		@ invalidate I TLB entry
+ 	mcr	p15, 0, r0, c8, c6, 1		@ invalidate D TLB entry
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	ret	lr
+diff --git a/arch/arm/mm/tlb-v6.S b/arch/arm/mm/tlb-v6.S
+index 8256a67ac654..6fc4e2a93336 100644
+--- a/arch/arm/mm/tlb-v6.S
++++ b/arch/arm/mm/tlb-v6.S
+@@ -38,11 +38,11 @@ SYM_TYPED_FUNC_START(v6wbi_flush_user_tlb_range)
+ 	mov	ip, #0
+ 	mmid	r3, r3				@ get vm_mm->context.id
+ 	mcr	p15, 0, ip, c7, c10, 4		@ drain write buffer
+-	mov	r0, r0, lsr #PAGE_SHIFT		@ align address
+-	mov	r1, r1, lsr #PAGE_SHIFT
++	mov	r0, r0, lsr #MMUPAGE_SHIFT		@ align address
++	mov	r1, r1, lsr #MMUPAGE_SHIFT
+ 	asid	r3, r3				@ mask ASID
+-	orr	r0, r3, r0, lsl #PAGE_SHIFT	@ Create initial MVA
+-	mov	r1, r1, lsl #PAGE_SHIFT
++	orr	r0, r3, r0, lsl #MMUPAGE_SHIFT	@ Create initial MVA
++	mov	r1, r1, lsl #MMUPAGE_SHIFT
+ 	vma_vm_flags r2, r2			@ get vma->vm_flags
+ 1:
+ #ifdef HARVARD_TLB
+@@ -52,7 +52,7 @@ SYM_TYPED_FUNC_START(v6wbi_flush_user_tlb_range)
+ #else
+ 	mcr	p15, 0, r0, c8, c7, 1		@ TLB invalidate MVA (was 1)
+ #endif
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	mcr	p15, 0, ip, c7, c10, 4		@ data synchronization barrier
+@@ -70,10 +70,10 @@ SYM_FUNC_END(v6wbi_flush_user_tlb_range)
+ SYM_TYPED_FUNC_START(v6wbi_flush_kern_tlb_range)
+ 	mov	r2, #0
+ 	mcr	p15, 0, r2, c7, c10, 4		@ drain write buffer
+-	mov	r0, r0, lsr #PAGE_SHIFT		@ align address
+-	mov	r1, r1, lsr #PAGE_SHIFT
+-	mov	r0, r0, lsl #PAGE_SHIFT
+-	mov	r1, r1, lsl #PAGE_SHIFT
++	mov	r0, r0, lsr #MMUPAGE_SHIFT		@ align address
++	mov	r1, r1, lsr #MMUPAGE_SHIFT
++	mov	r0, r0, lsl #MMUPAGE_SHIFT
++	mov	r1, r1, lsl #MMUPAGE_SHIFT
+ 1:
+ #ifdef HARVARD_TLB
+ 	mcr	p15, 0, r0, c8, c6, 1		@ TLB invalidate D MVA
+@@ -81,7 +81,7 @@ SYM_TYPED_FUNC_START(v6wbi_flush_kern_tlb_range)
+ #else
+ 	mcr	p15, 0, r0, c8, c7, 1		@ TLB invalidate MVA
+ #endif
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	mcr	p15, 0, r2, c7, c10, 4		@ data synchronization barrier
+diff --git a/arch/arm/mm/tlb-v7.S b/arch/arm/mm/tlb-v7.S
+index f1aa0764a2cc..bf8f03d04f49 100644
+--- a/arch/arm/mm/tlb-v7.S
++++ b/arch/arm/mm/tlb-v7.S
+@@ -36,15 +36,15 @@ SYM_TYPED_FUNC_START(v7wbi_flush_user_tlb_range)
+ 	vma_vm_mm r3, r2			@ get vma->vm_mm
+ 	mmid	r3, r3				@ get vm_mm->context.id
+ 	dsb	ish
+-	mov	r0, r0, lsr #PAGE_SHIFT		@ align address
+-	mov	r1, r1, lsr #PAGE_SHIFT
++	mov	r0, r0, lsr #MMUPAGE_SHIFT	@ align address
++	mov	r1, r1, lsr #MMUPAGE_SHIFT
+ 	asid	r3, r3				@ mask ASID
+ #ifdef CONFIG_ARM_ERRATA_720789
+ 	ALT_SMP(W(mov)	r3, #0	)
+ 	ALT_UP(W(nop)		)
+ #endif
+-	orr	r0, r3, r0, lsl #PAGE_SHIFT	@ Create initial MVA
+-	mov	r1, r1, lsl #PAGE_SHIFT
++	orr	r0, r3, r0, lsl #MMUPAGE_SHIFT	@ Create initial MVA
++	mov	r1, r1, lsl #MMUPAGE_SHIFT
+ 1:
+ #ifdef CONFIG_ARM_ERRATA_720789
+ 	ALT_SMP(mcr	p15, 0, r0, c8, c3, 3)	@ TLB invalidate U MVA all ASID (shareable)
+@@ -53,7 +53,7 @@ SYM_TYPED_FUNC_START(v7wbi_flush_user_tlb_range)
+ #endif
+ 	ALT_UP(mcr	p15, 0, r0, c8, c7, 1)	@ TLB invalidate U MVA
+ 
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	dsb	ish
+@@ -70,10 +70,10 @@ SYM_FUNC_END(v7wbi_flush_user_tlb_range)
+  */
+ SYM_TYPED_FUNC_START(v7wbi_flush_kern_tlb_range)
+ 	dsb	ish
+-	mov	r0, r0, lsr #PAGE_SHIFT		@ align address
+-	mov	r1, r1, lsr #PAGE_SHIFT
+-	mov	r0, r0, lsl #PAGE_SHIFT
+-	mov	r1, r1, lsl #PAGE_SHIFT
++	mov	r0, r0, lsr #MMUPAGE_SHIFT	@ align address
++	mov	r1, r1, lsr #MMUPAGE_SHIFT
++	mov	r0, r0, lsl #MMUPAGE_SHIFT
++	mov	r1, r1, lsl #MMUPAGE_SHIFT
+ 1:
+ #ifdef CONFIG_ARM_ERRATA_720789
+ 	ALT_SMP(mcr	p15, 0, r0, c8, c3, 3)	@ TLB invalidate U MVA all ASID (shareable)
+@@ -81,7 +81,7 @@ SYM_TYPED_FUNC_START(v7wbi_flush_kern_tlb_range)
+ 	ALT_SMP(mcr	p15, 0, r0, c8, c3, 1)	@ TLB invalidate U MVA (shareable)
+ #endif
+ 	ALT_UP(mcr	p15, 0, r0, c8, c7, 1)	@ TLB invalidate U MVA
+-	add	r0, r0, #PAGE_SZ
++	add	r0, r0, #MMUPAGE_SZ
+ 	cmp	r0, r1
+ 	blo	1b
+ 	dsb	ish
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index 41f8c6be553c..ed73b2611fde 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -692,7 +692,7 @@ static inline void clear_young_dirty_ptes(struct vm_area_struct *vma,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ #endif
+@@ -1169,7 +1169,7 @@ static inline bool clear_flush_young_ptes(struct vm_area_struct *vma,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ 
+ 	return young;
+-- 
+2.54.0
+

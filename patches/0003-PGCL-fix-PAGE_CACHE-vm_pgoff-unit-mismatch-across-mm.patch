@@ -1,0 +1,327 @@
+From 67f22306caf69c75cd4b019a389e58fe17034678 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 5 Mar 2026 05:52:40 +0100
+Subject: [PATCH 003/174] PGCL: fix PAGE_CACHE/vm_pgoff unit mismatch across
+ mm/ subsystems
+
+Fix pervasive unit confusion between MMUPAGE-unit (vm_pgoff, linear_page_index)
+and PAGE-unit (page cache folio->index, xarray index) in 11 files.
+
+Key fixes:
+- Anon folio->index now stored in PAGE-unit via pgoff_mmu_to_page() conversion
+  in rmap.c __folio_add_new_anon_rmap, matching file-backed folio convention.
+  All comparisons against folio->index updated (ksm.c, rmap.c assertion).
+
+- Page cache lookups (xarray, filemap_lock_folio, shmem_get_folio) now receive
+  PAGE-unit indices via pgoff_mmu_to_page() conversion (madvise.c, khugepaged.c,
+  userfaultfd.c, shmem.c, mincore.c, migrate.c).
+
+- PTE walker address-to-pgoff conversions use MMUPAGE_SHIFT instead of PAGE_SHIFT
+  (mapping_dirty_helpers.c, nommu.c). TLB flush ranges use MMUPAGE_SIZE.
+
+- mmap pgoff-to-bytes conversions use MMUPAGE_SHIFT (huge_memory.c thp_get_unmapped_area,
+  shmem.c shmem_get_unmapped_area, nommu.c region sharing and remap_vmalloc_range).
+
+- File size comparisons use MMUPAGE_SIZE denominator to match MMUPAGE-unit pgoff
+  (userfaultfd.c mcopy_atomic_pte bounds check).
+
+Tested: PAGE_MMUSHIFT=0 and PAGE_MMUSHIFT=2 both boot with 8/8 comprehensive
+tests passing. No kernel BUGs, no bad page maps, no RSS counter errors.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ mm/huge_memory.c           |  4 ++--
+ mm/khugepaged.c            |  4 ++--
+ mm/ksm.c                   |  2 +-
+ mm/madvise.c               |  7 +++----
+ mm/mapping_dirty_helpers.c |  9 +++++----
+ mm/migrate.c               |  2 +-
+ mm/mincore.c               |  5 +++--
+ mm/nommu.c                 |  4 ++--
+ mm/rmap.c                  |  4 ++--
+ mm/shmem.c                 |  6 +++---
+ mm/userfaultfd.c           | 11 ++++++-----
+ 11 files changed, 30 insertions(+), 28 deletions(-)
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index b118bcd392cb..3222cdd22768 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -1313,7 +1313,7 @@ unsigned long thp_get_unmapped_area_vmflags(struct file *filp, unsigned long add
+ 		vm_flags_t vm_flags)
+ {
+ 	unsigned long ret;
+-	loff_t off = (loff_t)pgoff << PAGE_SHIFT;
++	loff_t off = (loff_t)pgoff << MMUPAGE_SHIFT;
+ 
+ 	ret = __thp_get_unmapped_area(filp, addr, len, off, flags, PMD_SIZE, vm_flags);
+ 	if (ret)
+@@ -2892,7 +2892,7 @@ int move_pages_huge_pmd(struct mm_struct *mm, pmd_t *dst_pmd, pmd_t *src_pmd, pm
+ 		}
+ 
+ 		folio_move_anon_rmap(src_folio, dst_vma);
+-		src_folio->index = linear_page_index(dst_vma, dst_addr);
++		src_folio->index = pgoff_mmu_to_page(linear_page_index(dst_vma, dst_addr));
+ 
+ 		_dst_pmd = folio_mk_pmd(src_folio, dst_vma->vm_page_prot);
+ 		/* Follow mremap() behavior and treat the entry dirty after the move */
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index b8452dbdb043..216a2c48cd59 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1537,7 +1537,7 @@ static enum scan_result try_collapse_pte_mapped_thp(struct mm_struct *mm, unsign
+ 		return SCAN_PTE_UFFD_WP;
+ 
+ 	folio = filemap_lock_folio(vma->vm_file->f_mapping,
+-			       linear_page_index(vma, haddr));
++			       pgoff_mmu_to_page(linear_page_index(vma, haddr)));
+ 	if (IS_ERR(folio))
+ 		return SCAN_PAGE_NULL;
+ 
+@@ -1785,7 +1785,7 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
+ 		spinlock_t *ptl;
+ 		bool success = false;
+ 
+-		addr = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
++		addr = pgoff_to_vma_addr(vma, pgoff);
+ 		if (addr & ~HPAGE_PMD_MASK ||
+ 		    vma->vm_end < addr + HPAGE_PMD_SIZE)
+ 			continue;
+diff --git a/mm/ksm.c b/mm/ksm.c
+index f8a4b2459d05..8fc1ba3cb707 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -3120,7 +3120,7 @@ struct folio *ksm_might_need_to_copy(struct folio *folio,
+ 			return folio;	/* no need to copy it */
+ 	} else if (!anon_vma) {
+ 		return folio;		/* no need to copy it */
+-	} else if (folio->index == linear_page_index(vma, addr) &&
++	} else if (folio->index == pgoff_mmu_to_page(linear_page_index(vma, addr)) &&
+ 			anon_vma->root == vma->anon_vma->root) {
+ 		return folio;		/* still no need to copy it */
+ 	}
+diff --git a/mm/madvise.c b/mm/madvise.c
+index fd6066007bd0..11f678f0dd35 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -235,8 +235,8 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
+ 		unsigned long start, unsigned long end,
+ 		struct address_space *mapping)
+ {
+-	XA_STATE(xas, &mapping->i_pages, linear_page_index(vma, start));
+-	pgoff_t end_index = linear_page_index(vma, end) - 1;
++	XA_STATE(xas, &mapping->i_pages, pgoff_mmu_to_page(linear_page_index(vma, start)));
++	pgoff_t end_index = pgoff_mmu_to_page(linear_page_index(vma, end)) - 1;
+ 	struct folio *folio;
+ 	struct swap_iocb *splug = NULL;
+ 
+@@ -252,8 +252,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
+ 		if (!softleaf_is_swap(entry))
+ 			continue;
+ 
+-		addr = vma->vm_start +
+-			((xas.xa_index - vma->vm_pgoff) << PAGE_SHIFT);
++		addr = pgoff_to_vma_addr(vma, xas.xa_index);
+ 		xas_pause(&xas);
+ 		rcu_read_unlock();
+ 
+diff --git a/mm/mapping_dirty_helpers.c b/mm/mapping_dirty_helpers.c
+index 737c407f4081..6c03260764e5 100644
+--- a/mm/mapping_dirty_helpers.c
++++ b/mm/mapping_dirty_helpers.c
+@@ -45,7 +45,7 @@ static int wp_pte(pte_t *pte, unsigned long addr, unsigned long end,
+ 		wpwalk->total++;
+ 		wpwalk->tlbflush_start = min(wpwalk->tlbflush_start, addr);
+ 		wpwalk->tlbflush_end = max(wpwalk->tlbflush_end,
+-					   addr + PAGE_SIZE);
++					   addr + MMUPAGE_SIZE);
+ 	}
+ 
+ 	return 0;
+@@ -94,8 +94,9 @@ static int clean_record_pte(pte_t *pte, unsigned long addr,
+ 	pte_t ptent = ptep_get(pte);
+ 
+ 	if (pte_dirty(ptent)) {
+-		pgoff_t pgoff = ((addr - walk->vma->vm_start) >> PAGE_SHIFT) +
+-			walk->vma->vm_pgoff - cwalk->bitmap_pgoff;
++		pgoff_t pgoff = pgoff_mmu_to_page(
++			((addr - walk->vma->vm_start) >> MMUPAGE_SHIFT) +
++			walk->vma->vm_pgoff) - cwalk->bitmap_pgoff;
+ 		pte_t old_pte = ptep_modify_prot_start(walk->vma, addr, pte);
+ 
+ 		ptent = pte_mkclean(old_pte);
+@@ -104,7 +105,7 @@ static int clean_record_pte(pte_t *pte, unsigned long addr,
+ 		wpwalk->total++;
+ 		wpwalk->tlbflush_start = min(wpwalk->tlbflush_start, addr);
+ 		wpwalk->tlbflush_end = max(wpwalk->tlbflush_end,
+-					   addr + PAGE_SIZE);
++					   addr + MMUPAGE_SIZE);
+ 
+ 		__set_bit(pgoff, cwalk->bitmap);
+ 		cwalk->start = min(cwalk->start, pgoff);
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 8a64291ab5b4..6e88993f95d7 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -359,7 +359,7 @@ static bool remove_migration_pte(struct folio *folio,
+ 
+ 		/* pgoff is invalid for ksm pages, but they are never large */
+ 		if (folio_test_large(folio) && !folio_test_hugetlb(folio))
+-			idx = linear_page_index(vma, pvmw.address) - pvmw.pgoff;
++			idx = pgoff_mmu_to_page(linear_page_index(vma, pvmw.address)) - pvmw.pgoff;
+ 		new = folio_page(folio, idx);
+ 
+ #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+diff --git a/mm/mincore.c b/mm/mincore.c
+index f86508f25965..c2463ded6791 100644
+--- a/mm/mincore.c
++++ b/mm/mincore.c
+@@ -135,7 +135,7 @@ static unsigned char mincore_page(struct address_space *mapping, pgoff_t index)
+ static int __mincore_unmapped_range(unsigned long addr, unsigned long end,
+ 				struct vm_area_struct *vma, unsigned char *vec)
+ {
+-	unsigned long nr = (end - addr) >> PAGE_SHIFT;
++	unsigned long nr = (end - addr) >> MMUPAGE_SHIFT;
+ 	int i;
+ 
+ 	if (vma->vm_file) {
+@@ -143,7 +143,8 @@ static int __mincore_unmapped_range(unsigned long addr, unsigned long end,
+ 
+ 		pgoff = linear_page_index(vma, addr);
+ 		for (i = 0; i < nr; i++, pgoff++)
+-			vec[i] = mincore_page(vma->vm_file->f_mapping, pgoff);
++			vec[i] = mincore_page(vma->vm_file->f_mapping,
++					      pgoff_mmu_to_page(pgoff));
+ 	} else {
+ 		for (i = 0; i < nr; i++)
+ 			vec[i] = 0;
+diff --git a/mm/nommu.c b/mm/nommu.c
+index ed3934bc2de4..57640bf6f3a7 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -1116,7 +1116,7 @@ unsigned long do_mmap(struct file *file,
+ 			pregion->vm_usage++;
+ 			vma->vm_region = pregion;
+ 			start = pregion->vm_start;
+-			start += (pgoff - pregion->vm_pgoff) << PAGE_SHIFT;
++			start += (pgoff - pregion->vm_pgoff) << MMUPAGE_SHIFT;
+ 			vma->vm_start = start;
+ 			vma->vm_end = start + len;
+ 
+@@ -1616,7 +1616,7 @@ int remap_vmalloc_range(struct vm_area_struct *vma, void *addr,
+ 	if (!(vma->vm_flags & VM_USERMAP))
+ 		return -EINVAL;
+ 
+-	vma->vm_start = (unsigned long)(addr + (pgoff << PAGE_SHIFT));
++	vma->vm_start = (unsigned long)(addr + (pgoff << MMUPAGE_SHIFT));
+ 	vma->vm_end = vma->vm_start + size;
+ 
+ 	return 0;
+diff --git a/mm/rmap.c b/mm/rmap.c
+index ab2996a5d99f..e2e09eebd3c6 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1482,7 +1482,7 @@ static void __folio_set_anon(struct folio *folio, struct vm_area_struct *vma,
+ 	 */
+ 	anon_vma = (void *) anon_vma + FOLIO_MAPPING_ANON;
+ 	WRITE_ONCE(folio->mapping, (struct address_space *) anon_vma);
+-	folio->index = linear_page_index(vma, address);
++	folio->index = pgoff_mmu_to_page(linear_page_index(vma, address));
+ }
+ 
+ /**
+@@ -1509,7 +1509,7 @@ static void __page_check_anon_rmap(const struct folio *folio,
+ 	 */
+ 	VM_BUG_ON_FOLIO(folio_anon_vma(folio)->root != vma->anon_vma->root,
+ 			folio);
+-	VM_BUG_ON_PAGE(page_pgoff(folio, page) != linear_page_index(vma, address),
++	VM_BUG_ON_PAGE(page_pgoff(folio, page) != pgoff_mmu_to_page(linear_page_index(vma, address)),
+ 		       page);
+ }
+ 
+diff --git a/mm/shmem.c b/mm/shmem.c
+index cebd81920e2a..e46cb118483e 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2858,13 +2858,13 @@ unsigned long shmem_get_unmapped_area(struct file *file,
+ 	if (len < hpage_size)
+ 		return addr;
+ 
+-	offset = (pgoff << PAGE_SHIFT) & (hpage_size - 1);
++	offset = (pgoff << MMUPAGE_SHIFT) & (hpage_size - 1);
+ 	if (offset && offset + len < 2 * hpage_size)
+ 		return addr;
+ 	if ((addr & (hpage_size - 1)) == offset)
+ 		return addr;
+ 
+-	inflated_len = len + hpage_size - PAGE_SIZE;
++	inflated_len = len + hpage_size - MMUPAGE_SIZE;
+ 	if (inflated_len > TASK_SIZE)
+ 		return addr;
+ 	if (inflated_len < len)
+@@ -3188,7 +3188,7 @@ static struct folio *shmem_mfill_folio_alloc(struct vm_area_struct *vma,
+ 	struct inode *inode = file_inode(vma->vm_file);
+ 	struct address_space *mapping = inode->i_mapping;
+ 	struct shmem_inode_info *info = SHMEM_I(inode);
+-	pgoff_t pgoff = linear_page_index(vma, addr);
++	pgoff_t pgoff = pgoff_mmu_to_page(linear_page_index(vma, addr));
+ 	gfp_t gfp = mapping_gfp_mask(mapping);
+ 	struct folio *folio;
+ 
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index cf2b16a65a91..5dcf0743d9d2 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -328,7 +328,7 @@ static bool mfill_file_over_size(struct vm_area_struct *dst_vma,
+ 
+ 	inode = dst_vma->vm_file->f_inode;
+ 	offset = linear_page_index(dst_vma, dst_addr);
+-	max_off = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
++	max_off = DIV_ROUND_UP(i_size_read(inode), MMUPAGE_SIZE);
+ 	return offset >= max_off;
+ }
+ 
+@@ -678,6 +678,7 @@ static int mfill_atomic_pte_continue(struct mfill_state *state)
+ 	const struct vm_uffd_ops *ops = vma_uffd_ops(dst_vma);
+ 	unsigned long dst_addr = state->dst_addr;
+ 	pgoff_t pgoff = linear_page_index(dst_vma, dst_addr);
++	pgoff_t cache_pgoff = pgoff_mmu_to_page(pgoff);
+ 	struct inode *inode = file_inode(dst_vma->vm_file);
+ 	uffd_flags_t flags = state->flags;
+ 	pmd_t *dst_pmd = state->pmd;
+@@ -690,12 +691,12 @@ static int mfill_atomic_pte_continue(struct mfill_state *state)
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	folio = ops->get_folio_noalloc(inode, pgoff);
++	folio = ops->get_folio_noalloc(inode, cache_pgoff);
+ 	/* Our caller expects us to return -EFAULT if we failed to find folio */
+ 	if (IS_ERR_OR_NULL(folio))
+ 		return -EFAULT;
+ 
+-	page = folio_file_page(folio, pgoff);
++	page = folio_file_page(folio, cache_pgoff);
+ 	if (PageHWPoison(page)) {
+ 		ret = -EIO;
+ 		goto out_release;
+@@ -1267,7 +1268,7 @@ static long move_present_ptes(struct mm_struct *mm,
+ 		}
+ 
+ 		folio_move_anon_rmap(src_folio, dst_vma);
+-		src_folio->index = linear_page_index(dst_vma, dst_addr);
++		src_folio->index = pgoff_mmu_to_page(linear_page_index(dst_vma, dst_addr));
+ 
+ 		orig_dst_pte = folio_mk_pte(src_folio, dst_vma->vm_page_prot);
+ 		/* Set soft dirty bit so userspace can notice the pte was moved */
+@@ -1336,7 +1337,7 @@ static int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,
+ 	 */
+ 	if (src_folio) {
+ 		folio_move_anon_rmap(src_folio, dst_vma);
+-		src_folio->index = linear_page_index(dst_vma, dst_addr);
++		src_folio->index = pgoff_mmu_to_page(linear_page_index(dst_vma, dst_addr));
+ 	} else {
+ 		/*
+ 		 * Check if the swap entry is cached after acquiring the src_pte
+-- 
+2.54.0
+

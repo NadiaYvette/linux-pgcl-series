@@ -1,0 +1,77 @@
+From 111ee44a26e8415cd535cccc1727193bbef7f68c Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 12 Jun 2026 14:11:54 +0200
+Subject: [PATCH 142/174] mm: PGCL: gate __split_folio_to_order _mapcount reset
+ on PAGE_MMUSHIFT
+
+__split_folio_to_order() force-resets the post-split sub-folio and (on
+split-to-order-0) head _mapcount to -1, guarded only by
+IS_ENABLED(CONFIG_PAGE_MAPCOUNT).  That reset is needed under page
+clustering because folio_add_new_anon_rmap() bulk-initializes PAGE_MMUCOUNT
+per-page _mapcounts while the fault path installs a single PTE, leaving
+"phantom" mapcounts the (DEBUG_VM-only) VM_BUG_ON_PAGE can't catch.
+
+But the guard was missing the PGCL condition, so it also ran at
+PAGE_MMUSHIFT == 0, where the phantom cannot exist (one page == one PTE)
+and mainline never writes _mapcount here.  Forcing a still-mapped head to
+_mapcount == -1 makes folio_mapped() report it unmapped; the caller's
+folio_put() (e.g. madvise_cold_or_pageout_pte_range, shrink_folio_list)
+then frees a still-mapped page onto the buddy free list.  A later
+allocation of that page faults in kernel_init_pages (reserved-bit
+violation on a stale/garbage pfn) -- the non-deterministic early-userspace
+crash seen booting the PAGE_MMUSHIFT=0 kernel on real x86_64 hardware,
+which a clean mainline build of the same base+config does NOT hit.  (QEMU
+dodged it: the THP-split-then-reclaim timing didn't reallocate the freed
+page into a fault.)
+
+Gate both resets on PAGE_MMUSHIFT > 0 so PAGE_MMUSHIFT == 0 is byte-for-byte
+mainline again (Newton limit); the validated PGCL>0 behavior is unchanged.
+Found by Newton-limit source audit after a mainline-base+same-config kernel
+booted clean on the same laptop. Compile-verified at PGCL=0 and PGCL=4.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ mm/huge_memory.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 42029036fa4c..eb13a33e2e0a 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3651,8 +3651,16 @@ static void __split_folio_to_order(struct folio *folio, int old_order,
+ 		 * Force-reset to -1 so the post-split sub-folio is genuinely
+ 		 * unmapped; remap_page() will inc it back to 0 if there's a
+ 		 * migration entry restored to point to this sub-folio.
++		 *
++		 * The phantom-mapcount premise only exists under PGCL
++		 * (PAGE_MMUSHIFT > 0): folio_add_new_anon_rmap() bulk-inits
++		 * PAGE_MMUCOUNT per-page _mapcounts while a fault installs one
++		 * PTE.  At PAGE_MMUSHIFT == 0 one page == one PTE, no phantom
++		 * exists, and mainline never writes _mapcount here — so gate
++		 * the reset on PGCL to preserve the Newton limit (forcing -1 on
++		 * a still-mapped head at shift 0 would free a mapped page).
+ 		 */
+-		if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
++		if (PAGE_MMUSHIFT > 0 && IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
+ 			atomic_set(&new_folio->_mapcount, -1);
+ 
+ 		/*
+@@ -3747,8 +3755,14 @@ static void __split_folio_to_order(struct folio *folio, int old_order,
+ 	 * VM_BUG_ON_PAGE check at the top of this function).  This fix
+ 	 * extends the same invariant to the head, which remap_page() will
+ 	 * inc back to 0 if and only if there's a migration entry for it.
++	 *
++	 * Gate on PAGE_MMUSHIFT > 0: the phantom only arises from PGCL's
++	 * bulk _mapcount init.  At shift 0 mainline leaves the head
++	 * _mapcount alone; forcing -1 on a still-mapped head would free a
++	 * mapped page onto the buddy list (the laptop pgcl0 reserved-bit
++	 * crash).  Newton limit: byte-identical to mainline at shift 0.
+ 	 */
+-	if (!new_order && IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
++	if (PAGE_MMUSHIFT > 0 && !new_order && IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
+ 		atomic_set(&folio->page._mapcount, -1);
+ }
+ 
+-- 
+2.54.0
+

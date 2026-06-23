@@ -1,0 +1,232 @@
+From 4470121c54399bd9742649744ccbfcfff1a5e948 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 22 Mar 2026 03:02:58 +0100
+Subject: [PATCH 035/174] PGCL: fix slub overflow, btrfs assertion, sparc64
+ TLB, swap readahead for large PAGE_SIZE
+
+mm/slub.c:
+- Fix oo_make() object count overflow when PAGE_SIZE is large (e.g., 1MB
+  with PPC_64K_PAGES + MMUSHIFT=4). order_objects() can return values
+  exceeding OO_MASK (65535), causing truncation to 0 objects. Cap at
+  OO_MASK.
+- Fix calculate_order() underflow when get_order(size * MAX_OBJS_PER_PAGE)
+  returns 0 (object fits within one large page). The subtraction 0-1
+  produces an invalid negative order. Clamp to 0.
+
+fs/btrfs/defrag.c:
+- Fix CLUSTER_SIZE alignment assertion: use MMUPAGE_ALIGNED instead of
+  PAGE_ALIGNED. CLUSTER_SIZE (256KB) is not PAGE_ALIGNED when PAGE_SIZE
+  exceeds 256KB.
+- Fix nr_pages assertion: use DIV_ROUND_UP to handle PAGE_SIZE > CLUSTER_SIZE.
+
+arch/powerpc/platforms/cell/spufs/spufs.h:
+- Fix SPUFS_SIGNAL_MAP_SIZE: use MMUPAGE_SIZE. The SPU signal area maps
+  hardware pages, not kernel pages.
+
+arch/sparc/include/asm/pgtable_64.h:
+- Fix __set_pte_at TLB batch: use MMUPAGE_SHIFT instead of PAGE_SHIFT for
+  TLB invalidation stride.
+
+arch/sparc/mm/hugetlbpage.c:
+- Fix sun4u/sun4v hugetlb default TTE shift: use MMUPAGE_SHIFT.
+
+include/linux/pte_cluster.h:
+- Fix private_cluster_page: use softleaf_from_pte() instead of
+  __pte_to_swp_entry() for swap entry comparison.
+
+mm/swap_state.c:
+- Fix swap VMA readahead to use MMUPAGE_SHIFT/MMUPAGE_SIZE throughout.
+  Readahead windows and addresses are in MMUPAGE granularity.
+
+All 7 architectures boot and pass 23/23 tests with PAGE_MMUSHIFT=4.
+ppc64 (4K base pages) fully tested: 15/15 pgcl-test + 8/8 pgcl-stress +
+16/16 mm-selftests = ALL PASS.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/powerpc/platforms/cell/spufs/spufs.h |  2 +-
+ arch/sparc/include/asm/pgtable_64.h       |  2 +-
+ arch/sparc/mm/hugetlbpage.c               |  4 ++--
+ fs/btrfs/defrag.c                         |  4 ++--
+ include/linux/pte_cluster.h               |  2 +-
+ mm/slub.c                                 | 10 +++++++---
+ mm/swap_state.c                           | 23 ++++++++++++-----------
+ 7 files changed, 26 insertions(+), 21 deletions(-)
+
+diff --git a/arch/powerpc/platforms/cell/spufs/spufs.h b/arch/powerpc/platforms/cell/spufs/spufs.h
+index d33787c57c39..ab299cb62e40 100644
+--- a/arch/powerpc/platforms/cell/spufs/spufs.h
++++ b/arch/powerpc/platforms/cell/spufs/spufs.h
+@@ -23,7 +23,7 @@
+ #define SPUFS_PS_MAP_SIZE	0x20000
+ #define SPUFS_MFC_MAP_SIZE	0x1000
+ #define SPUFS_CNTL_MAP_SIZE	0x1000
+-#define SPUFS_SIGNAL_MAP_SIZE	PAGE_SIZE
++#define SPUFS_SIGNAL_MAP_SIZE	MMUPAGE_SIZE
+ #define SPUFS_MSS_MAP_SIZE	0x1000
+ 
+ /* The magic number for our file system */
+diff --git a/arch/sparc/include/asm/pgtable_64.h b/arch/sparc/include/asm/pgtable_64.h
+index c4a01144cc0d..aa50381acea5 100644
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@ -926,7 +926,7 @@ static inline void __set_pte_at(struct mm_struct *mm, unsigned long addr,
+ 	pte_t orig = *ptep;
+ 
+ 	*ptep = pte;
+-	maybe_tlb_batch_add(mm, addr, ptep, orig, fullmm, PAGE_SHIFT);
++	maybe_tlb_batch_add(mm, addr, ptep, orig, fullmm, MMUPAGE_SHIFT);
+ }
+ 
+ #define PFN_PTE_SHIFT		PAGE_SHIFT
+diff --git a/arch/sparc/mm/hugetlbpage.c b/arch/sparc/mm/hugetlbpage.c
+index 4652e868663b..0d5c1ecde6f2 100644
+--- a/arch/sparc/mm/hugetlbpage.c
++++ b/arch/sparc/mm/hugetlbpage.c
+@@ -127,7 +127,7 @@ static unsigned int sun4v_huge_tte_to_shift(pte_t entry)
+ 		shift = HPAGE_64K_SHIFT;
+ 		break;
+ 	default:
+-		shift = PAGE_SHIFT;
++		shift = MMUPAGE_SHIFT;
+ 		break;
+ 	}
+ 	return shift;
+@@ -149,7 +149,7 @@ static unsigned int sun4u_huge_tte_to_shift(pte_t entry)
+ 		shift = HPAGE_64K_SHIFT;
+ 		break;
+ 	default:
+-		shift = PAGE_SHIFT;
++		shift = MMUPAGE_SHIFT;
+ 		break;
+ 	}
+ 	return shift;
+diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+index 7e2db5d3a4d4..fc303bbc35ca 100644
+--- a/fs/btrfs/defrag.c
++++ b/fs/btrfs/defrag.c
+@@ -1129,7 +1129,7 @@ static int defrag_collect_targets(struct btrfs_inode *inode,
+ }
+ 
+ #define CLUSTER_SIZE	(SZ_256K)
+-static_assert(PAGE_ALIGNED(CLUSTER_SIZE));
++static_assert(MMUPAGE_ALIGNED(CLUSTER_SIZE));
+ 
+ /*
+  * Defrag one contiguous target range.
+@@ -1203,7 +1203,7 @@ static int defrag_one_range(struct btrfs_inode *inode, u64 start, u32 len,
+ 				      (start >> PAGE_SHIFT) + 1;
+ 	int ret = 0;
+ 
+-	ASSERT(nr_pages <= CLUSTER_SIZE / PAGE_SIZE);
++	ASSERT(nr_pages <= DIV_ROUND_UP(CLUSTER_SIZE, PAGE_SIZE));
+ 	ASSERT(IS_ALIGNED(start, sectorsize) && IS_ALIGNED(len, sectorsize));
+ 
+ 	folios = kzalloc_objs(struct folio *, nr_pages, GFP_NOFS);
+diff --git a/include/linux/pte_cluster.h b/include/linux/pte_cluster.h
+index 0c73ce3b5ffd..3838444edb27 100644
+--- a/include/linux/pte_cluster.h
++++ b/include/linux/pte_cluster.h
+@@ -329,7 +329,7 @@ static __maybe_unused struct page *private_cluster_page(pte_t *cluster[],
+ 		for (i = 0; scount && i < fcount; i++) {
+ 			if (!cluster[i] || pte_present(*cluster[i]))
+ 				continue;
+-			if (__pte_to_swp_entry(*cluster[i]).val == entry.val)
++			if (softleaf_from_pte(*cluster[i]).val == entry.val)
+ 				scount--;
+ 		}
+ 		if (scount)
+diff --git a/mm/slub.c b/mm/slub.c
+index a2bf3756ca7d..86a251dbae68 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -584,8 +584,10 @@ static inline unsigned int order_objects(unsigned int order, unsigned int size)
+ static inline struct kmem_cache_order_objects oo_make(unsigned int order,
+ 		unsigned int size)
+ {
++	unsigned int nr = order_objects(order, size);
++
+ 	struct kmem_cache_order_objects x = {
+-		(order << OO_SHIFT) + order_objects(order, size)
++		(order << OO_SHIFT) + min_t(unsigned int, nr, OO_MASK)
+ 	};
+ 
+ 	return x;
+@@ -7489,8 +7491,10 @@ static inline int calculate_order(unsigned int size)
+ 
+ 	min_order = max_t(unsigned int, slub_min_order,
+ 			  get_order(min_objects * size));
+-	if (order_objects(min_order, size) > MAX_OBJS_PER_PAGE)
+-		return get_order(size * MAX_OBJS_PER_PAGE) - 1;
++	if (order_objects(min_order, size) > MAX_OBJS_PER_PAGE) {
++		unsigned int order = get_order(size * MAX_OBJS_PER_PAGE);
++		return order > 0 ? order - 1 : 0;
++	}
+ 
+ 	/*
+ 	 * Attempt to find best configuration for a slab. This works by first
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 380321b1857a..9c52e0954b78 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -45,17 +45,17 @@ static bool enable_vma_readahead __read_mostly = true;
+ 
+ #define SWAP_RA_ORDER_CEILING	5
+ 
+-#define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT / 2)
++#define SWAP_RA_WIN_SHIFT	(MMUPAGE_SHIFT / 2)
+ #define SWAP_RA_HITS_MASK	((1UL << SWAP_RA_WIN_SHIFT) - 1)
+ #define SWAP_RA_HITS_MAX	SWAP_RA_HITS_MASK
+-#define SWAP_RA_WIN_MASK	(~PAGE_MASK & ~SWAP_RA_HITS_MASK)
++#define SWAP_RA_WIN_MASK	(~MMUPAGE_MASK & ~SWAP_RA_HITS_MASK)
+ 
+ #define SWAP_RA_HITS(v)		((v) & SWAP_RA_HITS_MASK)
+ #define SWAP_RA_WIN(v)		(((v) & SWAP_RA_WIN_MASK) >> SWAP_RA_WIN_SHIFT)
+-#define SWAP_RA_ADDR(v)		((v) & PAGE_MASK)
++#define SWAP_RA_ADDR(v)		((v) & MMUPAGE_MASK)
+ 
+ #define SWAP_RA_VAL(addr, win, hits)				\
+-	(((addr) & PAGE_MASK) |					\
++	(((addr) & MMUPAGE_MASK) |				\
+ 	 (((win) << SWAP_RA_WIN_SHIFT) & SWAP_RA_WIN_MASK) |	\
+ 	 ((hits) & SWAP_RA_HITS_MASK))
+ 
+@@ -766,19 +766,20 @@ static int swap_vma_ra_win(struct vm_fault *vmf, unsigned long *start,
+ 	prev_faddr = SWAP_RA_ADDR(ra_val);
+ 	prev_win = SWAP_RA_WIN(ra_val);
+ 	hits = SWAP_RA_HITS(ra_val);
+-	win = __swapin_nr_pages(PFN_DOWN(prev_faddr), PFN_DOWN(faddr), hits,
++	win = __swapin_nr_pages(prev_faddr >> MMUPAGE_SHIFT,
++				faddr >> MMUPAGE_SHIFT, hits,
+ 				max_win, prev_win);
+ 	atomic_long_set(&vma->swap_readahead_info, SWAP_RA_VAL(faddr, win, 0));
+ 	if (win == 1)
+ 		return 1;
+ 
+-	if (faddr == prev_faddr + PAGE_SIZE)
++	if (faddr == prev_faddr + MMUPAGE_SIZE)
+ 		left = faddr;
+-	else if (prev_faddr == faddr + PAGE_SIZE)
+-		left = faddr - (win << PAGE_SHIFT) + PAGE_SIZE;
++	else if (prev_faddr == faddr + MMUPAGE_SIZE)
++		left = faddr - (win << MMUPAGE_SHIFT) + MMUPAGE_SIZE;
+ 	else
+-		left = faddr - (((win - 1) / 2) << PAGE_SHIFT);
+-	right = left + (win << PAGE_SHIFT);
++		left = faddr - (((win - 1) / 2) << MMUPAGE_SHIFT);
++	right = left + (win << MMUPAGE_SHIFT);
+ 	if ((long)left < 0)
+ 		left = 0;
+ 	*start = max3(left, vma->vm_start, faddr & PMD_MASK);
+@@ -819,7 +820,7 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
+ 	if (win == 1)
+ 		goto skip;
+ 
+-	ilx = targ_ilx - PFN_DOWN(vmf->address - start);
++	ilx = targ_ilx - ((vmf->address - start) >> MMUPAGE_SHIFT);
+ 
+ 	blk_start_plug(&plug);
+ 	for (addr = start; addr < end; ilx++, addr += MMUPAGE_SIZE) {
+-- 
+2.54.0
+

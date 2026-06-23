@@ -1,0 +1,84 @@
+From fa8fffa729247f6bf156e410dbd2f7c206128892 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 19 May 2026 16:45:06 +0200
+Subject: [PATCH 120/174] fs/userfaultfd: validate uffd ranges in MMUPAGE
+ units, not PAGE units
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+userfaultfd is a userspace-visible interface; the granularity of all
+range arguments (UFFDIO_REGISTER, UFFDIO_UNREGISTER, UFFDIO_COPY,
+UFFDIO_ZEROPAGE, UFFDIO_WAKE, UFFDIO_WRITEPROTECT) is the userspace
+page size, which equals sysconf(_SC_PAGESIZE).
+
+Under PGCL (CONFIG_PAGE_MMUSHIFT > 0), the userspace page size is
+MMUPAGE_SIZE (the hardware MMU page size), while the kernel PAGE_SIZE
+is MMUPAGE_SIZE << CONFIG_PAGE_MMUSHIFT.  The PAGE_MASK / MMUPAGE_MASK
+divergence breaks validate_unaligned_range / validate_range:
+
+  - Userspace mmaps 10 * sysconf(_SC_PAGESIZE) = 10 * MMUPAGE_SIZE.
+  - Userspace calls UFFDIO_REGISTER with len = 10 * MMUPAGE_SIZE.
+  - Kernel checks `len & ~PAGE_MASK` and the low MMUPAGE-sized bits
+    of len are non-zero (10 * MMUPAGE_SIZE is not a multiple of
+    PAGE_SIZE when PAGE_MMUCOUNT > 1).
+  - UFFDIO_REGISTER returns -EINVAL.
+
+Visible in tools/testing/selftests/mm/guard-regions.c uffd subtest:
+
+  not ok 13 guard_regions.anon.uffd
+  not ok 43 guard_regions.shmem.uffd
+
+on s390x PGCL=4 (CONFIG_USERFAULTFD=y).  s390x mainline and PGCL=0
+pass — those have PAGE_MASK == MMUPAGE_MASK so the bug is invisible.
+Arches whose defconfig sets CONFIG_USERFAULTFD=n (aarch64, ppc64,
+many others) SKIP the uffd subtest and don't observe this directly.
+loongarch64 PGCL=2/4/6 hits the same failure (USERFAULTFD=y).
+
+Fix: validate uffd ranges with MMUPAGE_MASK.  At CONFIG_PAGE_MMUSHIFT
+== 0 the two masks are identical and behaviour is byte-for-byte
+unchanged.
+
+Verified: s390x PGCL=4 guard-regions: FAIL (2 uffd subtests) → PASS.
+Test Summary 86 passed / 1 failed (mkdirty still fails on UFFDIO_COPY
+— separate issue, follow-up).
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ fs/userfaultfd.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/fs/userfaultfd.c b/fs/userfaultfd.c
+index 4b53dc4a3266..bd2059a511e9 100644
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@ -1234,7 +1234,16 @@ static __always_inline int validate_unaligned_range(
+ {
+ 	__u64 task_size = mm->task_size;
+ 
+-	if (len & ~PAGE_MASK)
++	/*
++	 * Userfaultfd is a userspace-visible interface; ranges are measured
++	 * in the userspace page size, which is MMUPAGE_SIZE under PGCL
++	 * (PAGE_MMUSHIFT > 0).  Without this, mmap'd 10 * sysconf(PAGESIZE)
++	 * = 10 * MMUPAGE_SIZE is rejected as not PAGE_MASK-aligned, breaking
++	 * any uffd consumer that uses sub-PAGE-aligned ranges (e.g. the
++	 * tools/testing/selftests/mm/guard-regions.c uffd subtest).
++	 * At PAGE_MMUSHIFT == 0 the two masks coincide; no change.
++	 */
++	if (len & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 	if (!len)
+ 		return -EINVAL;
+@@ -1250,7 +1259,7 @@ static __always_inline int validate_unaligned_range(
+ static __always_inline int validate_range(struct mm_struct *mm,
+ 					  __u64 start, __u64 len)
+ {
+-	if (start & ~PAGE_MASK)
++	if (start & ~MMUPAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	return validate_unaligned_range(mm, start, len);
+-- 
+2.54.0
+

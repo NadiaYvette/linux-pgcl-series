@@ -1,0 +1,95 @@
+From 2c0892c515b401d3c31d789fb90858a877b2d8d8 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 19 Jun 2026 03:09:16 +0200
+Subject: [PATCH 169/174] mm/rmap: query the i_mmap/anon_vma interval trees in
+ MMUPAGE units
+
+Page clustering keys the i_mmap and anon_vma interval trees in MMUPAGE
+units: vma_start_pgoff()/vma_last_pgoff() derive from vma->vm_pgoff and
+vma_pages(), both MMUPAGE-granular under PGCL.  A folio's index and
+folio_nr_pages(), however, count PAGE-sized clusters -- filemap stores
+file folios at "vmf->pgoff >> PAGE_MMUSHIFT", and __folio_set_anon()
+stores "pgoff_mmu_to_page(linear_page_index())".
+
+rmap_walk_anon() and __rmap_walk_file() passed those cluster-unit pgoffs
+straight into {anon_vma_,}vma_interval_tree_foreach().  The interval
+overlap test then compares a cluster index against MMUPAGE keys, so a low
+cluster index can spuriously fall inside the MMUPAGE range of a VMA that
+does not actually map the folio.  vma_address() (which does convert the
+cluster pgoff to MMUPAGE) then computes an address past that VMA and
+returns -EFAULT, tripping:
+
+    kernel BUG at mm/rmap.c:3307!   VM_BUG_ON_VMA(address == -EFAULT, vma)
+
+Reproduced on a PAGE_MMUSHIFT=4 (64KB PAGE) x86_64 laptop during early
+boot: journald's offline thread ran fallocate(PUNCH_HOLE) on a btrfs
+journal file whose inode had several shared 8 MiB windows in i_mmap;
+writeback of a dirty folio at cluster index 0xbd (file offset ~12 MiB)
+walked the vm_pgoff=0 window, whose MMUPAGE key range [0, 0x7ff] wrongly
+contained 0xbd, and vma_address() converted that to MMUPAGE 0xbd0, beyond
+the window's 0x800 MMUPAGE extent.
+
+Convert both tree queries to the folio's MMUPAGE span,
+[pgoff_page_to_mmu(start), pgoff_page_to_mmu(end + 1) - 1], so the overlap
+test selects exactly the VMAs vma_address() can resolve.  The anon walk
+has the identical structure and the same latent bug; fix both.
+pgoff_page_to_mmu() is the identity at PAGE_MMUSHIFT==0, so mainline
+(PGCL=0) behaviour is byte-for-byte unchanged.
+
+Other interval-tree query sites (khugepaged retract_page_tables /
+collapse_file, hugetlb unmap_ref_private / huge_pmd_share) have the same
+shape and are tracked separately; mm/memory.c's unmap path already queries
+in MMUPAGE units.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ mm/rmap.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index e213e998613d..7f797beeca91 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -3235,8 +3235,16 @@ static void rmap_walk_anon(struct folio *folio,
+ 
+ 	pgoff_start = folio_pgoff(folio);
+ 	pgoff_end = pgoff_start + folio_nr_pages(folio) - 1;
++	/*
++	 * Like the file case: the anon_vma interval tree is keyed in MMUPAGE
++	 * units (avc_*_pgoff -> vma_*_pgoff), but folio_pgoff()/folio_nr_pages()
++	 * count PAGE-sized clusters.  Query the folio's MMUPAGE span so the tree
++	 * returns exactly the VMAs vma_address() can resolve.  Identity at
++	 * PAGE_MMUSHIFT==0.
++	 */
+ 	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root,
+-			pgoff_start, pgoff_end) {
++			pgoff_page_to_mmu(pgoff_start),
++			pgoff_page_to_mmu(pgoff_end + 1) - 1) {
+ 		struct vm_area_struct *vma = avc->vma;
+ 		unsigned long address = vma_address(vma, pgoff_start,
+ 				folio_nr_pages(folio));
+@@ -3300,8 +3308,19 @@ static void __rmap_walk_file(struct folio *folio, struct address_space *mapping,
+ 		i_mmap_lock_read(mapping);
+ 	}
+ lookup:
++	/*
++	 * The i_mmap interval tree is keyed in MMUPAGE units (vma_start_pgoff /
++	 * vma_last_pgoff derive from vm_pgoff and vma_pages(), both
++	 * MMUPAGE-granular), whereas pgoff_start/pgoff_end count PAGE-sized
++	 * clusters.  Convert the query to the folio's MMUPAGE span so the
++	 * interval-overlap test selects exactly the VMAs that vma_address() can
++	 * resolve; a cluster-unit key may otherwise spuriously match a VMA that
++	 * does not map the folio, making vma_address() return -EFAULT (BUG).
++	 * pgoff_page_to_mmu() is the identity at PAGE_MMUSHIFT==0.
++	 */
+ 	vma_interval_tree_foreach(vma, &mapping->i_mmap,
+-			pgoff_start, pgoff_end) {
++			pgoff_page_to_mmu(pgoff_start),
++			pgoff_page_to_mmu(pgoff_end + 1) - 1) {
+ 		unsigned long address = vma_address(vma, pgoff_start, nr_pages);
+ 
+ 		VM_BUG_ON_VMA(address == -EFAULT, vma);
+-- 
+2.54.0
+

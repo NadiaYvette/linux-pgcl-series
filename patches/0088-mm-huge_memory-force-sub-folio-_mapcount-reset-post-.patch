@@ -1,0 +1,69 @@
+From 6109d77d0f1c5c4979d3b93e05e2fea341b3e289 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 13:39:10 +0200
+Subject: [PATCH 088/174] mm/huge_memory: force sub-folio _mapcount reset
+ post-split
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends commit 426fdaf08ecc ("mm/huge_memory: fix phantom head
+_mapcount post-split for partial mTHP") to non-head sub-folios.
+
+The existing `VM_BUG_ON_PAGE(_mapcount != -1)` at the top of
+`__split_folio_to_order`'s sub-folio loop is a no-op without
+CONFIG_DEBUG_VM, allowing phantom `_mapcount = 0` values to slip
+through.  These phantoms come from `folio_add_new_anon_rmap()`'s
+bulk init at fault time, which sets all sub-pages' `_mapcount = 0`
+even when not all sub-pages will receive PTEs (e.g., for
+partial-fault scenarios on non-PMD-mappable mTHP).
+
+Force-reset every post-split sub-folio's `_mapcount = -1` so the
+sub-folio is genuinely "unmapped" until `remap_page()` finds a
+migration entry to restore.  Matches the same invariant the head
+fix in 426fdaf08ecc enforces for new_order == 0.
+
+With CONFIG_DEBUG_VM enabled, the existing `VM_BUG_ON_PAGE` still
+fires before this reset, preserving the original integrity check.
+With CONFIG_DEBUG_VM disabled, the reset masks pre-existing
+phantom state — which is the production-build behavior we need on
+PGCL=0/2 + THP=on aarch64 to prevent post-split sub-folios from
+being prematurely freed via `__folio_put` while still
+"folio_mapped()" by phantom.
+
+PGCL=4 + THP=on regression-tested clean post-fix (cow.c PASS,
+zero BUG/Oops events).  PGCL=0 + THP=on still produces some
+rss-counter BUGs from other phantom sources (likely
+`shrink_folio_list` reclaim paths or other unmap routes that
+never reach `__split_folio_to_order`), which require separate
+fixes building on this same understanding.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/huge_memory.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 9e61fd9ac127..42029036fa4c 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3644,6 +3644,16 @@ static void __split_folio_to_order(struct folio *folio, int old_order,
+ 		struct folio *new_folio = (struct folio *)new_head;
+ 
+ 		VM_BUG_ON_PAGE(atomic_read(&new_folio->_mapcount) != -1, new_head);
++		/*
++		 * PGCL fix: VM_BUG_ON_PAGE above is a no-op without
++		 * CONFIG_DEBUG_VM, allowing phantom _mapcount values from
++		 * folio_add_new_anon_rmap()'s bulk init to slip through.
++		 * Force-reset to -1 so the post-split sub-folio is genuinely
++		 * unmapped; remap_page() will inc it back to 0 if there's a
++		 * migration entry restored to point to this sub-folio.
++		 */
++		if (IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
++			atomic_set(&new_folio->_mapcount, -1);
+ 
+ 		/*
+ 		 * Clone page flags before unfreezing refcount.
+-- 
+2.54.0
+

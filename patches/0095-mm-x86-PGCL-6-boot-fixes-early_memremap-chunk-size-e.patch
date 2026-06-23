@@ -1,0 +1,206 @@
+From bf379f4cd38a110419472846dedeae3d9399697b Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 7 May 2026 20:35:53 +0200
+Subject: [PATCH 095/174] =?UTF-8?q?mm,=20x86:=20PGCL=3D6=20boot=20fixes=20?=
+ =?UTF-8?q?=E2=80=94=20early=5Fmemremap=20chunk=20size,=20early=5Fpgt=5Fbu?=
+ =?UTF-8?q?f?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three fixes that together let x86_64 PGCL=6 (256KB kernel pages) boot
+through to a clean LTP run.  Pre-fix the kernel triple-faulted in early
+setup_arch with three distinct symptoms surfaced sequentially.
+
+1) mm/early_ioremap.c (generic):
+
+   __early_ioremap caps mappings at NR_FIX_BTMAPS hardware-page slots.
+   copy_from_early_mem and its MAX_MAP_CHUNK macro were sized in
+   PAGE_SHIFT units, but the fixmap pool itself maps MMUPAGE-sized
+   hardware pages.  Under page-clustering MMUPAGE_SHIFT < PAGE_SHIFT, so
+   PAGE-shift sizing overstates the chunk capacity by PAGE_MMUCOUNT and
+   the WARN_ON(nrpages > NR_FIX_BTMAPS) inside __early_ioremap fires,
+   the function returns NULL, the initramfs copy panics with "Copy
+   RAMDISK failed".  Switch MAX_MAP_CHUNK and the alignment masks in
+   copy_from_early_mem to MMUPAGE_SHIFT/MMUPAGE_MASK so the chunk size
+   reflects the actual fixmap MMUPAGE capacity.
+
+2) arch/x86/kernel/mpparse.c get_mpc_size:
+
+   Only reads mpc->length (offset 4) but used early_memremap with
+   PAGE_SIZE.  Under PGCL=6 PAGE_SIZE=256KB, that's 65 MMUPAGEs which
+   exceeds NR_FIX_BTMAPS=64 — same WARN as #1, returns NULL, NULL
+   deref panic in get_mpc_size+0x17 (CR2=0x4 = mpc + offsetof(length)).
+   Map a single MMUPAGE instead — the field fits comfortably.
+
+3) arch/x86/mm/init.c early_alloc_pgt_buf and alloc_low_pages:
+
+   The early page-table allocator pool was sized
+   `INIT_PGD_PAGE_COUNT * PAGE_SIZE` and stride/PFN-shift used PAGE_SIZE.
+   But x86 page tables are MMUPAGE-sized (4KB hardware pages); under
+   PGCL each table consumed a 256KB kernel page worth of brk.  With
+   dmi_alloc's 64KB pre-claim, the 4MB request from extend_brk
+   overflowed __brk_limit (also 4MB ish), tripping the BUG at
+   setup.c:266.  Size the pool by MMUPAGE_SIZE (= 64KB total regardless
+   of PGCL) and have alloc_low_pages allocate MMUPAGE-granular tables
+   with MMUPAGE_SHIFT PFN units.  Also switches the memblock alloc range
+   request and the per-page memset/__va translations to MMUPAGE units.
+
+Verified: x86_64 PGCL=6 standalone boot now matches PGCL=4 baseline
+exactly: LTP 71p/0f/28s, zero kernel BUG/Oops/WARNING/panic.
+
+aarch64 PGCL=6 remains silent-boot — fix #1 is generic but aarch64
+hangs before earlycon prints, suggesting an earlier issue (head.S /
+decompressor / TTBR setup).  Separate follow-up.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/x86/kernel/mpparse.c | 10 ++++++++--
+ arch/x86/mm/init.c        | 35 +++++++++++++++++++++++++----------
+ mm/early_ioremap.c        | 13 ++++++++++---
+ 3 files changed, 43 insertions(+), 15 deletions(-)
+
+diff --git a/arch/x86/kernel/mpparse.c b/arch/x86/kernel/mpparse.c
+index 4a1b1b28abf9..b6547d3f6255 100644
+--- a/arch/x86/kernel/mpparse.c
++++ b/arch/x86/kernel/mpparse.c
+@@ -414,9 +414,15 @@ static unsigned long __init get_mpc_size(unsigned long physptr)
+ 	struct mpc_table *mpc;
+ 	unsigned long size;
+ 
+-	mpc = early_memremap(physptr, PAGE_SIZE);
++	/*
++	 * Map only one MMUPAGE: we read mpc->length (offset 4) which fits
++	 * in a single hardware page.  Using PAGE_SIZE under page-clustering
++	 * (PAGE_SIZE up to 1MB on PGCL=6) overflows NR_FIX_BTMAPS in the
++	 * early_ioremap fixmap pool.
++	 */
++	mpc = early_memremap(physptr, MMUPAGE_SIZE);
+ 	size = mpc->length;
+-	early_memunmap(mpc, PAGE_SIZE);
++	early_memunmap(mpc, MMUPAGE_SIZE);
+ 	apic_pr_verbose("  mpc: %lx-%lx\n", physptr, physptr + size);
+ 
+ 	return size;
+diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
+index 456d6e3e1fe9..304be16e1f56 100644
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@ -135,22 +135,29 @@ __ref void *alloc_low_pages(unsigned int num)
+ 		return (void *)__get_free_pages(GFP_ATOMIC | __GFP_ZERO, order);
+ 	}
+ 
++	/*
++	 * num is the number of hardware (MMUPAGE-sized) page-table pages to
++	 * allocate.  Under page-clustering, kernel-page granularity (PAGE_SIZE)
++	 * is PAGE_MMUCOUNT× larger and would waste pool space; use MMUPAGE_SIZE
++	 * consistently with the brk pool sized by INIT_PGD_PAGE_COUNT *
++	 * MMUPAGE_SIZE.  pgt_buf_end/top are in MMUPAGE PFN units.
++	 */
+ 	if ((pgt_buf_end + num) > pgt_buf_top || !can_use_brk_pgt) {
+ 		unsigned long ret = 0;
+ 
+ 		if (min_pfn_mapped < max_pfn_mapped) {
+ 			ret = memblock_phys_alloc_range(
+-					PAGE_SIZE * num, PAGE_SIZE,
++					MMUPAGE_SIZE * num, MMUPAGE_SIZE,
+ 					min_pfn_mapped << PAGE_SHIFT,
+ 					max_pfn_mapped << PAGE_SHIFT);
+ 		}
+ 		if (!ret && can_use_brk_pgt)
+-			ret = __pa(extend_brk(PAGE_SIZE * num, PAGE_SIZE));
++			ret = __pa(extend_brk(MMUPAGE_SIZE * num, MMUPAGE_SIZE));
+ 
+ 		if (!ret)
+ 			panic("alloc_low_pages: can not alloc memory");
+ 
+-		pfn = ret >> PAGE_SHIFT;
++		pfn = ret >> MMUPAGE_SHIFT;
+ 	} else {
+ 		pfn = pgt_buf_end;
+ 		pgt_buf_end += num;
+@@ -159,11 +166,11 @@ __ref void *alloc_low_pages(unsigned int num)
+ 	for (i = 0; i < num; i++) {
+ 		void *adr;
+ 
+-		adr = __va((pfn + i) << PAGE_SHIFT);
+-		clear_page(adr);
++		adr = __va((unsigned long)(pfn + i) << MMUPAGE_SHIFT);
++		memset(adr, 0, MMUPAGE_SIZE);
+ 	}
+ 
+-	return __va(pfn << PAGE_SHIFT);
++	return __va((unsigned long)pfn << MMUPAGE_SHIFT);
+ }
+ 
+ /*
+@@ -182,18 +189,26 @@ __ref void *alloc_low_pages(unsigned int num)
+ #define INIT_PGD_PAGE_COUNT      (4 * INIT_PGD_PAGE_TABLES)
+ #endif
+ 
+-#define INIT_PGT_BUF_SIZE	(INIT_PGD_PAGE_COUNT * PAGE_SIZE)
++/*
++ * Page tables are MMUPAGE-sized (hardware page size); under page-clustering
++ * PAGE_SIZE may exceed MMUPAGE_SIZE by PAGE_MMUCOUNT.  Sizing the early
++ * page-table pool by PAGE_SIZE wastes brk space (each 4KB page table would
++ * consume a 256KB kernel page at PGCL=6) and overflows the linker-reserved
++ * .bss..brk allocation once dmi_alloc has pre-claimed its 64KB.  Use
++ * MMUPAGE_SIZE consistently — alloc_low_pages also speaks MMUPAGE PFNs.
++ */
++#define INIT_PGT_BUF_SIZE	(INIT_PGD_PAGE_COUNT * MMUPAGE_SIZE)
+ RESERVE_BRK(early_pgt_alloc, INIT_PGT_BUF_SIZE);
+ void  __init early_alloc_pgt_buf(void)
+ {
+ 	unsigned long tables = INIT_PGT_BUF_SIZE;
+ 	phys_addr_t base;
+ 
+-	base = __pa(extend_brk(tables, PAGE_SIZE));
++	base = __pa(extend_brk(tables, MMUPAGE_SIZE));
+ 
+-	pgt_buf_start = base >> PAGE_SHIFT;
++	pgt_buf_start = base >> MMUPAGE_SHIFT;
+ 	pgt_buf_end = pgt_buf_start;
+-	pgt_buf_top = pgt_buf_start + (tables >> PAGE_SHIFT);
++	pgt_buf_top = pgt_buf_start + (tables >> MMUPAGE_SHIFT);
+ }
+ 
+ int after_bootmem;
+diff --git a/mm/early_ioremap.c b/mm/early_ioremap.c
+index fa8ee634cb47..966e3f70178a 100644
+--- a/mm/early_ioremap.c
++++ b/mm/early_ioremap.c
+@@ -251,7 +251,14 @@ early_memremap_prot(resource_size_t phys_addr, unsigned long size,
+ }
+ #endif
+ 
+-#define MAX_MAP_CHUNK	(NR_FIX_BTMAPS << PAGE_SHIFT)
++/*
++ * The fixmap pool maps MMUPAGE-sized hardware pages; each NR_FIX_BTMAPS slot
++ * is one MMUPAGE.  Under page-clustering, MMUPAGE_SHIFT < PAGE_SHIFT, so
++ * computing the chunk size with PAGE_SHIFT (and aligning with PAGE_MASK)
++ * overstates capacity by PAGE_MMUCOUNT and overflows __early_ioremap's
++ * NR_FIX_BTMAPS check, returning NULL and panicing initramfs copy.
++ */
++#define MAX_MAP_CHUNK	(NR_FIX_BTMAPS << MMUPAGE_SHIFT)
+ 
+ /*
+  * If no empty slot, handle that and return -ENOMEM.
+@@ -262,11 +269,11 @@ int __init copy_from_early_mem(void *dest, phys_addr_t src, unsigned long size)
+ 	char *p;
+ 
+ 	while (size) {
+-		slop = offset_in_page(src);
++		slop = src & ~MMUPAGE_MASK;
+ 		clen = size;
+ 		if (clen > MAX_MAP_CHUNK - slop)
+ 			clen = MAX_MAP_CHUNK - slop;
+-		p = early_memremap(src & PAGE_MASK, clen + slop);
++		p = early_memremap(src & MMUPAGE_MASK, clen + slop);
+ 		if (!p)
+ 			return -ENOMEM;
+ 		memcpy(dest, p + slop, clen);
+-- 
+2.54.0
+

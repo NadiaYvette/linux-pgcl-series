@@ -1,0 +1,61 @@
+From 53981c1a81a30d3d2fcf77f696cf644b2ca3cf21 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 9 May 2026 21:43:58 +0200
+Subject: [PATCH 102/174] parisc: entry.S protect-isolation aligns at
+ MMUPAGE_SIZE, not PAGE_SIZE
+
+Two .align PAGE_SIZE directives in entry.S (after fault_vector_11 and
+before syscall_exit_rfi) were placed to give the trap vector / syscall
+return path their own protection page so the kernel can apply different
+permissions there.  Hardware protection is enforced at the MMU page
+granularity (MMUPAGE_SIZE), so MMU-page alignment is sufficient.
+
+At PGCL=6 these two alignments together inserted ~512 KiB of slack
+between fault_vector_20 and intr_extint, pushing the trap-dispatch `b
+intr_extint` past the 19-bit (+/- 256 KiB) PA-RISC branch immediate
+field and triggering the assembler:
+  Field out of range [-262144..262143] (524784).
+
+PGCL=5 also overflowed (offset 262640, ~500 bytes over the limit);
+PGCL=4 fit because the slack was only ~128 KiB.  Switching to
+MMUPAGE_SIZE (= hw MMU page = 4 KiB on parisc) collapses the slack
+back to a few KiB so the build succeeds at any PGCL setting.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/parisc/kernel/entry.S | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/arch/parisc/kernel/entry.S b/arch/parisc/kernel/entry.S
+index 4aa5926c9188..b973e622a700 100644
+--- a/arch/parisc/kernel/entry.S
++++ b/arch/parisc/kernel/entry.S
+@@ -728,8 +728,12 @@ ENTRY(fault_vector_11)
+ END(fault_vector_11)
+ 
+ #endif
+-	/* Fault vector is separately protected and *must* be on its own page */
+-	.align		PAGE_SIZE
++	/* Fault vector is separately protected and *must* be on its own page.
++	 * Protection isolation works at the hardware MMU page (MMUPAGE_SIZE);
++	 * with PGCL, PAGE_SIZE may be many MMU-pages large and aligning here
++	 * pushes the rest of .text.hot beyond the trap branch immediate range.
++	 */
++	.align		MMUPAGE_SIZE
+ 
+ 	.import		handle_interruption,code
+ 	.import		do_cpu_irq_mask,code
+@@ -803,7 +807,9 @@ ENDPROC_CFI(_switch_to)
+ 	 *
+ 	 */
+ 
+-	.align	PAGE_SIZE
++	/* MMU-page alignment is sufficient for protection isolation; using
++	 * PAGE_SIZE wastes up to PAGE_SIZE-1 bytes under PGCL. */
++	.align	MMUPAGE_SIZE
+ 
+ ENTRY_CFI(syscall_exit_rfi)
+ 	mfctl	%cr30,%r16		/* task_struct */
+-- 
+2.54.0
+

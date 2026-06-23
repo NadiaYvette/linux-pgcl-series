@@ -1,0 +1,276 @@
+From 43f2f174d05294b6c5dcc3d4924d926d200a9281 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 21 Mar 2026 23:21:37 +0100
+Subject: [PATCH 034/174] PGCL: fix swap entry encoding on sparc64/ppc64,
+ page_table_check MMUPAGE fixes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Swap entry encoding:
+- sparc64 pgtable_64.h: __swp_type/__swp_offset/__swp_entry used PAGE_SHIFT
+  to position type/offset fields within the PTE. With PGCL, PAGE_SHIFT=17
+  (8KB MMUPAGE + MMUSHIFT=4) but the swap format must use MMUPAGE_SHIFT=13
+  since swap PTEs encode hardware-page-granular addresses. Fix all 4 macros.
+- ppc64 book3s/64/pgtable.h: __swp_offset/__swp_entry used PAGE_SHIFT to
+  position the offset within PTE_RPN_MASK. Same issue — fix to MMUPAGE_SHIFT.
+
+page_table_check.c:
+- __page_table_check_ptes_set: addr stride was PAGE_SIZE (wrong with PGCL),
+  fix to MMUPAGE_SIZE. Also fix page_table_check_set to handle PGCL sub-page
+  PFNs correctly — increment once per PTE using PAGE-granular PFN.
+- __page_table_check_pte_clear_range: addr stride PAGE_SIZE → MMUPAGE_SIZE.
+
+Also includes pending ppc64 pgtable.c and mm/memory.c PGCL fixes from
+prior investigation.
+
+Test results:
+- s390x: 15/15 pgcl-test + 8/8 pgcl-stress + 14/14 mm-selftests PASS, zero warnings
+- sparc64: 15/15 pgcl-test + 8/8 pgcl-stress PASS (guard-regions selftest
+  has remaining PTE marker issue under investigation)
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/powerpc/include/asm/book3s/64/pgtable.h |  4 +-
+ arch/powerpc/mm/pgtable.c                    | 28 +++++++++++
+ arch/sparc/include/asm/pgtable_64.h          |  8 +--
+ mm/memory.c                                  | 53 ++++++++++++++++----
+ mm/mremap.c                                  |  2 +-
+ mm/page_table_check.c                        | 16 ++++--
+ 6 files changed, 89 insertions(+), 22 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/book3s/64/pgtable.h b/arch/powerpc/include/asm/book3s/64/pgtable.h
+index bd876d379ddb..2bdf93af0d69 100644
+--- a/arch/powerpc/include/asm/book3s/64/pgtable.h
++++ b/arch/powerpc/include/asm/book3s/64/pgtable.h
+@@ -645,9 +645,9 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
+ #define SWP_TYPE_BITS 5
+ #define SWP_TYPE_MASK		((1UL << SWP_TYPE_BITS) - 1)
+ #define __swp_type(x)		((x).val & SWP_TYPE_MASK)
+-#define __swp_offset(x)		(((x).val & PTE_RPN_MASK) >> PAGE_SHIFT)
++#define __swp_offset(x)		(((x).val & PTE_RPN_MASK) >> MMUPAGE_SHIFT)
+ #define __swp_entry(type, offset)	((swp_entry_t) { \
+-				(type) | (((offset) << PAGE_SHIFT) & PTE_RPN_MASK)})
++				(type) | (((offset) << MMUPAGE_SHIFT) & PTE_RPN_MASK)})
+ /*
+  * swp_entry_t must be independent of pte bits. We build a swp_entry_t from
+  * swap type and offset we get from swap and convert that to pte to find a
+diff --git a/arch/powerpc/mm/pgtable.c b/arch/powerpc/mm/pgtable.c
+index 30833da8b0b5..a343574c1d06 100644
+--- a/arch/powerpc/mm/pgtable.c
++++ b/arch/powerpc/mm/pgtable.c
+@@ -208,6 +208,33 @@ void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
+ 	 * involved that need to be batched.
+ 	 */
+ 
++	/*
++	 * With PGCL (PAGE_MMUSHIFT > 0), set_ptes semantics are:
++	 *   nr == 1: set a single PTE (caller already adjusted sub-page)
++	 *   nr >  1: nr is in kernel pages; write nr * PAGE_MMUCOUNT PTEs,
++	 *            filling sub-pages within each kernel page.
++	 * This matches the generic set_ptes in include/linux/pgtable.h.
++	 */
++#if PAGE_MMUSHIFT > 0
++	if (nr == 1) {
++		page_table_check_ptes_set(mm, addr, ptep, pte, 1);
++		VM_WARN_ON(pte_hw_valid(*ptep) && !pte_protnone(*ptep));
++		__set_pte_at(mm, addr, ptep, pte, 0);
++	} else {
++		unsigned int total = nr * PAGE_MMUCOUNT;
++		unsigned int i;
++
++		page_table_check_ptes_set(mm, addr, ptep, pte, total);
++		for (i = 0; i < total; i++) {
++			VM_WARN_ON(pte_hw_valid(*ptep) && !pte_protnone(*ptep));
++			__set_pte_at(mm, addr, ptep, pte, 0);
++			ptep++;
++			addr += MMUPAGE_SIZE;
++			pte = __pte(pte_val(pte) +
++				    __phys_to_pte_val(MMUPAGE_SIZE));
++		}
++	}
++#else
+ 	page_table_check_ptes_set(mm, addr, ptep, pte, nr);
+ 
+ 	for (;;) {
+@@ -226,6 +253,7 @@ void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
+ 		addr += MMUPAGE_SIZE;
+ 		pte = __pte(pte_val(pte) + __phys_to_pte_val(MMUPAGE_SIZE));
+ 	}
++#endif
+ }
+ 
+ void set_pte_at_unchecked(struct mm_struct *mm, unsigned long addr,
+diff --git a/arch/sparc/include/asm/pgtable_64.h b/arch/sparc/include/asm/pgtable_64.h
+index 84242b22dadf..c4a01144cc0d 100644
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@ -1041,13 +1041,13 @@ pgtable_t pgtable_trans_huge_withdraw(struct mm_struct *mm, pmd_t *pmdp);
+  *   1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+  *   --------------------> E <-- type ---> <------- zeroes -------->
+  */
+-#define __swp_type(entry)	(((entry).val >> PAGE_SHIFT) & 0x7fUL)
+-#define __swp_offset(entry)	((entry).val >> (PAGE_SHIFT + 8UL))
++#define __swp_type(entry)	(((entry).val >> MMUPAGE_SHIFT) & 0x7fUL)
++#define __swp_offset(entry)	((entry).val >> (MMUPAGE_SHIFT + 8UL))
+ #define __swp_entry(type, offset)	\
+ 	( (swp_entry_t) \
+ 	  { \
+-		((((long)(type) & 0x7fUL) << PAGE_SHIFT) | \
+-                 ((long)(offset) << (PAGE_SHIFT + 8UL))) \
++		((((long)(type) & 0x7fUL) << MMUPAGE_SHIFT) | \
++                 ((long)(offset) << (MMUPAGE_SHIFT + 8UL))) \
+ 	  } )
+ #define __pte_to_swp_entry(pte)		((swp_entry_t) { pte_val(pte) })
+ #define __swp_entry_to_pte(x)		((pte_t) { (x).val })
+diff --git a/mm/memory.c b/mm/memory.c
+index 78c25f4f43ba..8f1182c465d7 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5365,8 +5365,12 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	 */
+ 	arch_swap_restore(folio_swap(entry, folio), folio);
+ 
+-	add_mm_counter(vma->vm_mm, MM_ANONPAGES, nr_pages);
+-	add_mm_counter(vma->vm_mm, MM_SWAPENTS, -nr_pages);
++	{
++		long nr_rss = (PAGE_MMUSHIFT && nr_pages > 1) ?
++			(long)nr_pages * PAGE_MMUCOUNT : nr_pages;
++		add_mm_counter(vma->vm_mm, MM_ANONPAGES, nr_rss);
++		add_mm_counter(vma->vm_mm, MM_SWAPENTS, -nr_rss);
++	}
+ 	pte = mk_pte(page, vma->vm_page_prot);
+ 	if (pte_swp_soft_dirty(vmf->orig_pte))
+ 		pte = pte_mksoft_dirty(pte);
+@@ -5391,7 +5395,15 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 		}
+ 		rmap_flags |= RMAP_EXCLUSIVE;
+ 	}
+-	folio_ref_add(folio, nr_pages - 1);
++	{
++	/*
++	 * PGCL: set_ptes(nr>1) maps nr*PAGE_MMUCOUNT PTEs.
++	 * Refs and rmap must account for all hardware PTEs.
++	 */
++	unsigned long nr_ptes = (PAGE_MMUSHIFT && nr_pages > 1) ?
++		(unsigned long)nr_pages * PAGE_MMUCOUNT : nr_pages;
++
++	folio_ref_add(folio, nr_ptes - 1);
+ 	flush_icache_pages(vma, page, nr_pages);
+ 	vmf->orig_pte = pte_advance_pfn(pte, page_idx);
+ 
+@@ -5415,6 +5427,20 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 					 rmap_flags);
+ 		folio_put_swap(folio, nr_pages == 1 ? page : NULL);
+ 	}
++	/*
++	 * PGCL large folio rmap fixup: folio_add_new_anon_rmap and
++	 * folio_add_anon_rmap_ptes only account for nr_pages (kernel
++	 * pages), but we need nr_ptes (MMUPAGE count) mappings.
++	 */
++	if (PAGE_MMUSHIFT && nr_pages > 1 && folio_test_large(folio)) {
++		int i;
++		for (i = 0; i < nr_pages; i++)
++			atomic_add(PAGE_MMUCOUNT - 1,
++				   &folio_page(folio, i)->_mapcount);
++		folio_add_large_mapcount(folio,
++					nr_ptes - nr_pages, vma);
++	}
++	}
+ 
+ 	VM_BUG_ON(!folio_test_anon(folio) ||
+ 			(pte_write(pte) && !PageAnonExclusive(page)));
+@@ -5804,7 +5830,6 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		for (j = 0; j < PAGE_MMUCOUNT; j++) {
+ 			unsigned long a = base_addr + (unsigned long)j * MMUPAGE_SIZE;
+ 			pte_t *ptep = base_pte + j;
+-			struct page *sub_page;
+ 
+ 			/* Skip if outside VMA bounds */
+ 			if (a < vma->vm_start || a >= vma->vm_end)
+@@ -5812,7 +5837,6 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 			/* Skip if PTE already occupied */
+ 			if (!pte_none(ptep_get(ptep)))
+ 				continue;
+-			sub_page = folio_page(folio, 0) + j;
+ 			set_ptes(vma->vm_mm, a, ptep, pte_mksub(entry, (unsigned long)j * MMUPAGE_SIZE), 1);
+ 			rss++;
+ 		}
+@@ -6057,14 +6081,21 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 		folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
+ 		folio_add_lru_vma(folio, vma);
+ 	} else {
++		folio_add_file_rmap_ptes(folio, page, nr, vma);
+ 		/*
+-		 * With PGCL, set_ptes(nr=1) maps a single PTE (special case),
+-		 * but set_ptes(nr>1) maps nr * PAGE_MMUCOUNT PTEs.
+-		 * Match rmap count to actual PTEs set.
++		 * PGCL: set_ptes(nr>1) maps nr*PAGE_MMUCOUNT PTEs,
++		 * but rmap functions only accept kernel page counts.
++		 * Bump per-page mapcount and large_mapcount for the
++		 * extra PGCL sub-page PTEs.
+ 		 */
+-		unsigned int rmap_nr = (nr > 1) ?
+-			nr * PAGE_MMUCOUNT : nr;
+-		folio_add_file_rmap_ptes(folio, page, rmap_nr, vma);
++		if (PAGE_MMUSHIFT && nr > 1 && folio_test_large(page_folio(page))) {
++			int i;
++			for (i = 0; i < nr; i++)
++				atomic_add(PAGE_MMUCOUNT - 1,
++					   &(page + i)->_mapcount);
++			folio_add_large_mapcount(page_folio(page),
++				(unsigned long)nr * (PAGE_MMUCOUNT - 1), vma);
++		}
+ 	}
+ 	set_ptes(vma->vm_mm, addr, vmf->pte, entry, nr);
+ 
+diff --git a/mm/mremap.c b/mm/mremap.c
+index 2fcab0018041..02c6dd7a2e42 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -320,7 +320,7 @@ static int move_ptes(struct pagetable_move_control *pmc,
+ 				for (j = 0; j < nr_ptes; j++) {
+ 					set_ptes(mm, new_addr + (unsigned long)j * MMUPAGE_SIZE, new_ptep + j, pte, 1);
+ 					pte = __pte(pte_val(pte) +
+-						    MMUPAGE_SIZE);
++						    __phys_to_pte_val(MMUPAGE_SIZE));
+ 				}
+ 			} else
+ #endif
+diff --git a/mm/page_table_check.c b/mm/page_table_check.c
+index 53a8997ec043..cbb0310908ac 100644
+--- a/mm/page_table_check.c
++++ b/mm/page_table_check.c
+@@ -207,9 +207,17 @@ void __page_table_check_ptes_set(struct mm_struct *mm, unsigned long addr,
+ 	page_table_check_pte_flags(pte);
+ 
+ 	for (i = 0; i < nr; i++)
+-		__page_table_check_pte_clear(mm, addr + PAGE_SIZE * i, ptep_get(ptep + i));
+-	if (pte_user_accessible_page(mm, addr, pte))
+-		page_table_check_set(pte_pfn(pte), nr, pte_write(pte));
++		__page_table_check_pte_clear(mm, addr + i * MMUPAGE_SIZE, ptep_get(ptep + i));
++	if (pte_user_accessible_page(mm, addr, pte)) {
++		/*
++		 * With PGCL, consecutive PTEs may map sub-pages within the
++		 * same kernel page.  Increment the page_table_check counter
++		 * once per PTE, using the correct PAGE-granular PFN for each.
++		 */
++		for (i = 0; i < nr; i++)
++			page_table_check_set(pte_pfn(pte) + (i >> PAGE_MMUSHIFT),
++					     1, pte_write(pte));
++	}
+ }
+ EXPORT_SYMBOL(__page_table_check_ptes_set);
+ 
+@@ -274,7 +282,7 @@ void __page_table_check_pte_clear_range(struct mm_struct *mm,
+ 			return;
+ 		for (i = 0; i < PTRS_PER_PTE; i++) {
+ 			__page_table_check_pte_clear(mm, addr, ptep_get(ptep));
+-			addr += PAGE_SIZE;
++			addr += MMUPAGE_SIZE;
+ 			ptep++;
+ 		}
+ 		pte_unmap(ptep - PTRS_PER_PTE);
+-- 
+2.54.0
+

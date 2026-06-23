@@ -1,0 +1,567 @@
+From 01765b8d675d1b50b741272f94adfb91755d92ed Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 25 Mar 2026 06:57:17 +0100
+Subject: [PATCH 042/174] =?UTF-8?q?PGCL:=20unify=20set=5Fptes=20nr=20conve?=
+ =?UTF-8?q?ntion=20=E2=80=94=20nr=20always=20means=20PTE/MMUPAGE=20count?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fix arm64 use-after-free crash (POISON_FREE in __rmqueue_pcplist) caused
+by ambiguous set_ptes nr semantics. Previously, THP split passed kernel
+page count (HPAGE_PMD_NR) while folio_pte_batch returned MMUPAGE count,
+and arch set_ptes multiplied nr by PAGE_MMUCOUNT internally. On arm64,
+where folio_pte_batch can return >1 for PGCL sub-pages, this caused
+double-expansion: 32 PTEs became 512, exhausting folio refcount and
+corrupting the PCP free list.
+
+New convention: set_ptes nr is ALWAYS the PTE/MMUPAGE count. No arch
+multiplies internally. THP split passes HPAGE_PMD_MMUNR (512 on x86_64/
+arm64 with MMUSHIFT=4). All arch set_ptes implementations use flat
+MMUPAGE-stepping loops instead of nested kernel-page/sub-page loops.
+
+Changes:
+- include/linux/pgtable.h: generic PGCL set_ptes flat loop
+- include/linux/huge_mm.h: add HPAGE_PMD_MMUNR macro
+- mm/huge_memory.c: THP split uses HPAGE_PMD_MMUNR, PGCL rmap fixup
+  for per-page _mapcount and folio_large_mapcount
+- mm/memory.c: remove stale PGCL rmap fixup in set_pte_range
+- mm/migrate_device.c: RSS counter uses HPAGE_PMD_MMUNR
+- arch/{sparc,parisc,mips,powerpc}: flat MMUPAGE-stepping set_ptes
+- fs/splice.c: iter_to_pipe MMUPAGE-granular GUP page tracking
+
+Verified: 9 arches boot and pass all tests (19/19 pgcl-test + 11-13/13
+pgcl-stress + 16/16 mm-selftests) with zero Oops/WARN.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/mips/include/asm/pgtable.h     | 19 +++----
+ arch/parisc/include/asm/pgtable.h   | 13 ++---
+ arch/powerpc/mm/pgtable.c           |  9 ++--
+ arch/sparc/include/asm/pgtable_64.h | 22 +++-----
+ fs/splice.c                         | 34 ++++++++++--
+ include/linux/huge_mm.h             |  3 ++
+ include/linux/pgtable.h             | 22 +++-----
+ mm/huge_memory.c                    | 80 ++++++++++++++++++++---------
+ mm/memory.c                         | 16 +-----
+ mm/migrate_device.c                 |  2 +-
+ 10 files changed, 119 insertions(+), 101 deletions(-)
+
+diff --git a/arch/mips/include/asm/pgtable.h b/arch/mips/include/asm/pgtable.h
+index f7154013d4e2..444b3a6247e4 100644
+--- a/arch/mips/include/asm/pgtable.h
++++ b/arch/mips/include/asm/pgtable.h
+@@ -236,21 +236,14 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		set_pte(ptep, pte);
+ 	} else {
+ 		/*
+-		 * With PGCL, nr is in kernel pages.  Each kernel page spans
+-		 * PAGE_MMUCOUNT hardware pages (MMUPAGEs).  Write
+-		 * nr * PAGE_MMUCOUNT PTEs with correct sub-page offsets.
++		 * With PGCL, nr is the number of PTEs (MMUPAGE-granular)
++		 * to write.  Advance by one MMUPAGE per PTE.
+ 		 */
+ 		for (i = 0; i < nr; i++) {
+-			unsigned int j;
+-
+-			for (j = 0; j < PAGE_MMUCOUNT; j++) {
+-				set_pte(ptep, __pte(pte_val(pte) +
+-					__phys_to_pte_val((phys_addr_t)j *
+-							  MMUPAGE_SIZE)));
+-				ptep++;
+-			}
+-			if (i + 1 < nr)
+-				pte = pte_advance_pfn(pte, 1);
++			set_pte(ptep, pte);
++			ptep++;
++			pte = __pte(pte_val(pte) +
++				    __phys_to_pte_val(MMUPAGE_SIZE));
+ 		}
+ 	}
+ #else
+diff --git a/arch/parisc/include/asm/pgtable.h b/arch/parisc/include/asm/pgtable.h
+index f0841f82f360..10e532b7233c 100644
+--- a/arch/parisc/include/asm/pgtable.h
++++ b/arch/parisc/include/asm/pgtable.h
+@@ -386,14 +386,11 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 	} else {
+ 		unsigned int i;
+ 		for (i = 0; i < nr; i++) {
+-			unsigned int j;
+-			for (j = 0; j < PAGE_MMUCOUNT; j++) {
+-				*ptep = __pte(pte_val(pte) + j * MMUPAGE_SIZE);
+-				purge_tlb_entries(mm, addr);
+-				ptep++;
+-				addr += MMUPAGE_SIZE;
+-			}
+-			pte_val(pte) += PAGE_SIZE;
++			*ptep = pte;
++			purge_tlb_entries(mm, addr);
++			ptep++;
++			addr += MMUPAGE_SIZE;
++			pte_val(pte) += MMUPAGE_SIZE;
+ 		}
+ 	}
+ }
+diff --git a/arch/powerpc/mm/pgtable.c b/arch/powerpc/mm/pgtable.c
+index a343574c1d06..579030e7626a 100644
+--- a/arch/powerpc/mm/pgtable.c
++++ b/arch/powerpc/mm/pgtable.c
+@@ -211,9 +211,7 @@ void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
+ 	/*
+ 	 * With PGCL (PAGE_MMUSHIFT > 0), set_ptes semantics are:
+ 	 *   nr == 1: set a single PTE (caller already adjusted sub-page)
+-	 *   nr >  1: nr is in kernel pages; write nr * PAGE_MMUCOUNT PTEs,
+-	 *            filling sub-pages within each kernel page.
+-	 * This matches the generic set_ptes in include/linux/pgtable.h.
++	 *   nr >  1: nr is the number of PTEs (MMUPAGE-granular) to write.
+ 	 */
+ #if PAGE_MMUSHIFT > 0
+ 	if (nr == 1) {
+@@ -221,11 +219,10 @@ void set_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
+ 		VM_WARN_ON(pte_hw_valid(*ptep) && !pte_protnone(*ptep));
+ 		__set_pte_at(mm, addr, ptep, pte, 0);
+ 	} else {
+-		unsigned int total = nr * PAGE_MMUCOUNT;
+ 		unsigned int i;
+ 
+-		page_table_check_ptes_set(mm, addr, ptep, pte, total);
+-		for (i = 0; i < total; i++) {
++		page_table_check_ptes_set(mm, addr, ptep, pte, nr);
++		for (i = 0; i < nr; i++) {
+ 			VM_WARN_ON(pte_hw_valid(*ptep) && !pte_protnone(*ptep));
+ 			__set_pte_at(mm, addr, ptep, pte, 0);
+ 			ptep++;
+diff --git a/arch/sparc/include/asm/pgtable_64.h b/arch/sparc/include/asm/pgtable_64.h
+index aa50381acea5..35f899c2af94 100644
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@ -942,23 +942,15 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		unsigned int i;
+ 
+ 		/*
+-		 * With page clustering, nr is in kernel pages but each
+-		 * kernel page spans PAGE_MMUCOUNT MMUPAGEs.  Fill
+-		 * nr * PAGE_MMUCOUNT PTEs, using sub-page offsets
+-		 * within each kernel page.
++		 * With page clustering, nr is the number of PTEs
++		 * (MMUPAGE-granular) to write.  Advance by MMUPAGE_SIZE
++		 * per PTE.
+ 		 */
+ 		for (i = 0; i < nr; i++) {
+-			unsigned int j;
+-
+-			for (j = 0; j < PAGE_MMUCOUNT; j++) {
+-				pte_t sub = __pte(pte_val(pte) +
+-						  j * MMUPAGE_SIZE);
+-				__set_pte_at(mm, addr, ptep, sub, 0);
+-				ptep++;
+-				addr += MMUPAGE_SIZE;
+-			}
+-			if (i + 1 < nr)
+-				pte_val(pte) += PAGE_SIZE;
++			__set_pte_at(mm, addr, ptep, pte, 0);
++			ptep++;
++			addr += MMUPAGE_SIZE;
++			pte_val(pte) += MMUPAGE_SIZE;
+ 		}
+ 	}
+ #else
+diff --git a/fs/splice.c b/fs/splice.c
+index 9d8f63e2fd1a..fa97450224ee 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -1455,7 +1455,8 @@ static ssize_t iter_to_pipe(struct iov_iter *from,
+ 		struct page *pages[16];
+ 		ssize_t left;
+ 		size_t start;
+-		int i, n;
++		int i, n, pidx, npages;
++		bool user_pages = user_backed_iter(from);
+ 
+ 		left = iov_iter_get_pages2(from, pages, ~0UL, 16, &start);
+ 		if (left <= 0) {
+@@ -1463,21 +1464,44 @@ static ssize_t iter_to_pipe(struct iov_iter *from,
+ 			break;
+ 		}
+ 
++		/*
++		 * For user-backed iterators, pages[] is MMUPAGE-granular
++		 * (one entry per hardware page from GUP).  For bvec/folioq,
++		 * pages[] is PAGE-granular.  We create kernel-page-granular
++		 * pipe buffers in both cases, but must track and release
++		 * the extra sub-page references from GUP.
++		 */
+ 		n = DIV_ROUND_UP(left + start, PAGE_SIZE);
++		if (user_pages)
++			npages = DIV_ROUND_UP(left + (start & ~MMUPAGE_MASK),
++					      MMUPAGE_SIZE);
++		else
++			npages = n;
++		pidx = 0;
+ 		for (i = 0; i < n; i++) {
+ 			int size = umin(left, PAGE_SIZE - start);
++			int skip = user_pages ?
++				   DIV_ROUND_UP(size + (start & ~MMUPAGE_MASK),
++						MMUPAGE_SIZE) : 1;
+ 
+-			buf.page = pages[i];
++			buf.page = pages[pidx];
+ 			buf.offset = start;
+ 			buf.len = size;
+ 			ret = add_to_pipe(pipe, &buf);
+ 			if (unlikely(ret < 0)) {
++				int j;
++
+ 				iov_iter_revert(from, left);
+-				// this one got dropped by add_to_pipe()
+-				while (++i < n)
+-					put_page(pages[i]);
++				/* add_to_pipe() dropped pages[pidx] */
++				for (j = pidx + 1; j < npages; j++)
++					put_page(pages[j]);
+ 				goto out;
+ 			}
++			/* Release extra sub-page refs within this chunk;
++			 * the pipe buffer took ownership of pages[pidx]. */
++			for (int j = 1; j < skip; j++)
++				put_page(pages[pidx + j]);
++			pidx += skip;
+ 			total += ret;
+ 			left -= size;
+ 			start = 0;
+diff --git a/include/linux/huge_mm.h b/include/linux/huge_mm.h
+index 2949e5acff35..a06ba7ec80d5 100644
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@ -116,11 +116,14 @@ enum tva_type {
+ 
+ #define HPAGE_PMD_ORDER (HPAGE_PMD_SHIFT-PAGE_SHIFT)
+ #define HPAGE_PMD_NR (1<<HPAGE_PMD_ORDER)
++/* MMUPAGE count in a PMD huge page — use for RSS counters (MMUPAGE-granular) */
++#define HPAGE_PMD_MMUNR (1<<(HPAGE_PMD_SHIFT-MMUPAGE_SHIFT))
+ #define HPAGE_PMD_MASK	(~(HPAGE_PMD_SIZE - 1))
+ #define HPAGE_PMD_SIZE	((1UL) << HPAGE_PMD_SHIFT)
+ 
+ #define HPAGE_PUD_ORDER (HPAGE_PUD_SHIFT-PAGE_SHIFT)
+ #define HPAGE_PUD_NR (1<<HPAGE_PUD_ORDER)
++#define HPAGE_PUD_MMUNR (1<<(HPAGE_PUD_SHIFT-MMUPAGE_SHIFT))
+ #define HPAGE_PUD_MASK	(~(HPAGE_PUD_SIZE - 1))
+ #define HPAGE_PUD_SIZE	((1UL) << HPAGE_PUD_SHIFT)
+ 
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index ce53e4d94430..41f8c6be553c 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -430,22 +430,16 @@ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		unsigned int i;
+ 
+ 		/*
+-		 * With page clustering, nr is in kernel pages but each
+-		 * kernel page spans PAGE_MMUCOUNT MMUPAGEs.  Fill
+-		 * nr * PAGE_MMUCOUNT PTEs, using sub-page offsets
+-		 * within each kernel page.
++		 * With page clustering, nr is the number of PTEs
++		 * (MMUPAGE-granular entries) to write.  Each PTE
++		 * maps one MMUPAGE.  Advance physical address by
++		 * MMUPAGE_SIZE per PTE.
+ 		 */
+ 		for (i = 0; i < nr; i++) {
+-			unsigned int j;
+-
+-			for (j = 0; j < PAGE_MMUCOUNT; j++) {
+-				set_pte(ptep, __pte(pte_val(pte) +
+-					__phys_to_pte_val((phys_addr_t)j *
+-							  MMUPAGE_SIZE)));
+-				ptep++;
+-			}
+-			if (i + 1 < nr)
+-				pte = pte_next_pfn(pte);
++			set_pte(ptep, pte);
++			ptep++;
++			pte = __pte(pte_val(pte) +
++				    __phys_to_pte_val(MMUPAGE_SIZE));
+ 		}
+ 	}
+ #else
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 3222cdd22768..987d6c057058 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -1391,7 +1391,7 @@ static void map_anon_folio_pmd_pf(struct folio *folio, pmd_t *pmd,
+ 		struct vm_area_struct *vma, unsigned long haddr)
+ {
+ 	map_anon_folio_pmd_nopf(folio, pmd, vma, haddr);
+-	add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_NR);
++	add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_MMUNR);
+ 	count_vm_event(THP_FAULT_ALLOC);
+ 	count_mthp_stat(HPAGE_PMD_ORDER, MTHP_STAT_ANON_FAULT_ALLOC);
+ 	count_memcg_event_mm(vma->vm_mm, THP_FAULT_ALLOC);
+@@ -1644,7 +1644,7 @@ static vm_fault_t insert_pmd(struct vm_area_struct *vma, unsigned long addr,
+ 		} else {
+ 			folio_get(fop.folio);
+ 			folio_add_file_rmap_pmd(fop.folio, &fop.folio->page, vma);
+-			add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PMD_NR);
++			add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PMD_MMUNR);
+ 		}
+ 	} else {
+ 		entry = pmd_mkhuge(pfn_pmd(fop.pfn, prot));
+@@ -1763,7 +1763,7 @@ static vm_fault_t insert_pud(struct vm_area_struct *vma, unsigned long addr,
+ 
+ 		folio_get(fop.folio);
+ 		folio_add_file_rmap_pud(fop.folio, &fop.folio->page, vma);
+-		add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PUD_NR);
++		add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PUD_MMUNR);
+ 	} else {
+ 		entry = pud_mkhuge(pfn_pud(fop.pfn, prot));
+ 		entry = pud_mkspecial(entry);
+@@ -1915,7 +1915,7 @@ static void copy_huge_non_present_pmd(
+ 					    dst_vma, src_vma);
+ 	}
+ 
+-	add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
++	add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_MMUNR);
+ 	mm_inc_nr_ptes(dst_mm);
+ 	pgtable_trans_huge_deposit(dst_mm, dst_pmd, pgtable);
+ 	if (!userfaultfd_wp(dst_vma))
+@@ -2009,7 +2009,7 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 		__split_huge_pmd(src_vma, src_pmd, addr, false);
+ 		return -EAGAIN;
+ 	}
+-	add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
++	add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_MMUNR);
+ out_zero_page:
+ 	mm_inc_nr_ptes(dst_mm);
+ 	pgtable_trans_huge_deposit(dst_mm, dst_pmd, pgtable);
+@@ -2310,7 +2310,7 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
+ 	if (!migrate_misplaced_folio(folio, target_nid)) {
+ 		flags |= TNF_MIGRATED;
+ 		nid = target_nid;
+-		task_numa_fault(last_cpupid, nid, HPAGE_PMD_NR, flags);
++		task_numa_fault(last_cpupid, nid, HPAGE_PMD_MMUNR, flags);
+ 		return 0;
+ 	}
+ 
+@@ -2331,7 +2331,7 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
+ 	spin_unlock(vmf->ptl);
+ 
+ 	if (nid != NUMA_NO_NODE)
+-		task_numa_fault(last_cpupid, nid, HPAGE_PMD_NR, flags);
++		task_numa_fault(last_cpupid, nid, HPAGE_PMD_MMUNR, flags);
+ 	return 0;
+ }
+ 
+@@ -2428,10 +2428,10 @@ static void zap_huge_pmd_folio(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		folio_remove_rmap_pmd(folio, &folio->page, vma);
+ 
+ 	if (folio_test_anon(folio)) {
+-		add_mm_counter(mm, MM_ANONPAGES, -HPAGE_PMD_NR);
++		add_mm_counter(mm, MM_ANONPAGES, -HPAGE_PMD_MMUNR);
+ 	} else {
+ 		add_mm_counter(mm, mm_counter_file(folio),
+-			       -HPAGE_PMD_NR);
++			       -HPAGE_PMD_MMUNR);
+ 
+ 		if (is_present && pmd_young(pmdval) &&
+ 		    likely(vma_has_recency(vma)))
+@@ -2980,7 +2980,7 @@ int zap_huge_pud(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 		page = pud_page(orig_pud);
+ 		folio = page_folio(page);
+ 		folio_remove_rmap_pud(folio, page, vma);
+-		add_mm_counter(tlb->mm, mm_counter_file(folio), -HPAGE_PUD_NR);
++		add_mm_counter(tlb->mm, mm_counter_file(folio), -HPAGE_PUD_MMUNR);
+ 
+ 		spin_unlock(ptl);
+ 		tlb_remove_page_size(tlb, page, HPAGE_PUD_SIZE);
+@@ -3016,7 +3016,7 @@ static void __split_huge_pud_locked(struct vm_area_struct *vma, pud_t *pud,
+ 		folio_set_referenced(folio);
+ 	folio_remove_rmap_pud(folio, page, vma);
+ 	add_mm_counter(vma->vm_mm, mm_counter_file(folio),
+-		-HPAGE_PUD_NR);
++		-HPAGE_PUD_MMUNR);
+ 	folio_put(folio);
+ }
+ 
+@@ -3137,7 +3137,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 			folio_put(folio);
+ 			return;
+ 		}
+-		add_mm_counter(mm, mm_counter_file(folio), -HPAGE_PMD_NR);
++		add_mm_counter(mm, mm_counter_file(folio), -HPAGE_PMD_MMUNR);
+ 		return;
+ 	}
+ 
+@@ -3195,12 +3195,29 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 		if (!freeze) {
+ 			rmap_t rmap_flags = RMAP_NONE;
+ 
+-			folio_ref_add(folio, HPAGE_PMD_NR - 1);
++			folio_ref_add(folio, HPAGE_PMD_MMUNR - 1);
+ 			if (anon_exclusive)
+ 				rmap_flags |= RMAP_EXCLUSIVE;
+ 
+ 			folio_add_anon_rmap_ptes(folio, page, HPAGE_PMD_NR,
+ 						 vma, haddr, rmap_flags);
++#if PAGE_MMUSHIFT
++			/*
++			 * PGCL rmap fixup: folio_add_anon_rmap_ptes added 1
++			 * mapcount per kernel page, but set_ptes will write
++			 * PAGE_MMUCOUNT PTEs per kernel page.  Each PTE zap
++			 * decrements mapcount by 1, so bump each page's
++			 * _mapcount by (PAGE_MMUCOUNT - 1).
++			 */
++			{
++				int pgcl_i;
++				for (pgcl_i = 0; pgcl_i < HPAGE_PMD_NR; pgcl_i++)
++					atomic_add(PAGE_MMUCOUNT - 1,
++						   &(page + pgcl_i)->_mapcount);
++				folio_add_large_mapcount(folio,
++					HPAGE_PMD_MMUNR - HPAGE_PMD_NR, vma);
++			}
++#endif
+ 		}
+ 	} else {
+ 		/*
+@@ -3263,11 +3280,24 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 		if (!freeze) {
+ 			rmap_t rmap_flags = RMAP_NONE;
+ 
+-			folio_ref_add(folio, HPAGE_PMD_NR - 1);
++			folio_ref_add(folio, HPAGE_PMD_MMUNR - 1);
+ 			if (anon_exclusive)
+ 				rmap_flags |= RMAP_EXCLUSIVE;
+ 			folio_add_anon_rmap_ptes(folio, page, HPAGE_PMD_NR,
+ 						 vma, haddr, rmap_flags);
++#if PAGE_MMUSHIFT
++			/*
++			 * PGCL rmap fixup: same as device private case above.
++			 */
++			{
++				int pgcl_i;
++				for (pgcl_i = 0; pgcl_i < HPAGE_PMD_NR; pgcl_i++)
++					atomic_add(PAGE_MMUCOUNT - 1,
++						   &(page + pgcl_i)->_mapcount);
++				folio_add_large_mapcount(folio,
++					HPAGE_PMD_MMUNR - HPAGE_PMD_NR, vma);
++			}
++#endif
+ 		}
+ 	}
+ 
+@@ -3289,16 +3319,17 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 		pte_t entry;
+ 		swp_entry_t swp_entry;
+ 
+-		for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
++		for (i = 0, addr = haddr; i < HPAGE_PMD_MMUNR;
++		     i++, addr += MMUPAGE_SIZE) {
+ 			if (write)
+ 				swp_entry = make_writable_migration_entry(
+-							page_to_pfn(page + i));
++					page_to_pfn(page + i / PAGE_MMUCOUNT));
+ 			else if (anon_exclusive)
+ 				swp_entry = make_readable_exclusive_migration_entry(
+-							page_to_pfn(page + i));
++					page_to_pfn(page + i / PAGE_MMUCOUNT));
+ 			else
+ 				swp_entry = make_readable_migration_entry(
+-							page_to_pfn(page + i));
++					page_to_pfn(page + i / PAGE_MMUCOUNT));
+ 			if (young)
+ 				swp_entry = make_migration_entry_young(swp_entry);
+ 			if (dirty)
+@@ -3315,7 +3346,8 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 		pte_t entry;
+ 		swp_entry_t swp_entry;
+ 
+-		for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
++		for (i = 0, addr = haddr; i < HPAGE_PMD_MMUNR;
++		     i++, addr += MMUPAGE_SIZE) {
+ 			/*
+ 			 * anon_exclusive was already propagated to the relevant
+ 			 * pages corresponding to the pte entries when freeze
+@@ -3323,10 +3355,10 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 			 */
+ 			if (write)
+ 				swp_entry = make_writable_device_private_entry(
+-							page_to_pfn(page + i));
++					page_to_pfn(page + i / PAGE_MMUCOUNT));
+ 			else
+ 				swp_entry = make_readable_device_private_entry(
+-							page_to_pfn(page + i));
++					page_to_pfn(page + i / PAGE_MMUCOUNT));
+ 			/*
+ 			 * Young and dirty bits are not progated via swp_entry
+ 			 */
+@@ -3354,10 +3386,10 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 		if (uffd_wp)
+ 			entry = pte_mkuffd_wp(entry);
+ 
+-		for (i = 0; i < HPAGE_PMD_NR; i++)
++		for (i = 0; i < HPAGE_PMD_MMUNR; i++)
+ 			VM_WARN_ON(!pte_none(ptep_get(pte + i)));
+ 
+-		set_ptes(mm, haddr, pte, entry, HPAGE_PMD_NR);
++		set_ptes(mm, haddr, pte, entry, HPAGE_PMD_MMUNR);
+ 	}
+ 	pte_unmap(pte);
+ 
+@@ -3511,7 +3543,7 @@ static bool __discard_anon_folio_pmd_locked(struct vm_area_struct *vma,
+ 
+ 	folio_remove_rmap_pmd(folio, pmd_page(orig_pmd), vma);
+ 	zap_deposited_table(mm, pmdp);
+-	add_mm_counter(mm, MM_ANONPAGES, -HPAGE_PMD_NR);
++	add_mm_counter(mm, MM_ANONPAGES, -HPAGE_PMD_MMUNR);
+ 	if (vma->vm_flags & VM_LOCKED)
+ 		mlock_drain_local();
+ 	folio_put(folio);
+diff --git a/mm/memory.c b/mm/memory.c
+index 8f1182c465d7..b8f58c37ac4a 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -6004,7 +6004,7 @@ vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *pa
+ 	if (write)
+ 		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+ 
+-	add_mm_counter(vma->vm_mm, mm_counter_file(folio), HPAGE_PMD_NR);
++	add_mm_counter(vma->vm_mm, mm_counter_file(folio), HPAGE_PMD_MMUNR);
+ 	folio_add_file_rmap_pmd(folio, page, vma);
+ 
+ 	/*
+@@ -6082,20 +6082,6 @@ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 		folio_add_lru_vma(folio, vma);
+ 	} else {
+ 		folio_add_file_rmap_ptes(folio, page, nr, vma);
+-		/*
+-		 * PGCL: set_ptes(nr>1) maps nr*PAGE_MMUCOUNT PTEs,
+-		 * but rmap functions only accept kernel page counts.
+-		 * Bump per-page mapcount and large_mapcount for the
+-		 * extra PGCL sub-page PTEs.
+-		 */
+-		if (PAGE_MMUSHIFT && nr > 1 && folio_test_large(page_folio(page))) {
+-			int i;
+-			for (i = 0; i < nr; i++)
+-				atomic_add(PAGE_MMUCOUNT - 1,
+-					   &(page + i)->_mapcount);
+-			folio_add_large_mapcount(page_folio(page),
+-				(unsigned long)nr * (PAGE_MMUCOUNT - 1), vma);
+-		}
+ 	}
+ 	set_ptes(vma->vm_mm, addr, vmf->pte, entry, nr);
+ 
+diff --git a/mm/migrate_device.c b/mm/migrate_device.c
+index 5961599bad01..1a3909f649c9 100644
+--- a/mm/migrate_device.c
++++ b/mm/migrate_device.c
+@@ -866,7 +866,7 @@ static int migrate_vma_insert_huge_pmd_page(struct migrate_vma *migrate,
+ 	} else if (!pmd_none(*pmdp))
+ 		goto unlock_abort;
+ 
+-	add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_NR);
++	add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_MMUNR);
+ 	folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
+ 	if (!folio_is_zone_device(folio))
+ 		folio_add_lru_vma(folio, vma);
+-- 
+2.54.0
+

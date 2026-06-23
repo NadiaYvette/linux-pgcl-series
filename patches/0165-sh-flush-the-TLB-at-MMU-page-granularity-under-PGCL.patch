@@ -1,0 +1,130 @@
+From 8e141523b71aa4f1f71384376645bb3b6c01f3b8 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 18 Jun 2026 19:05:35 +0200
+Subject: [PATCH 165/174] sh: flush the TLB at MMU-page granularity under PGCL
+
+Each SH-4 UTLB entry maps a single MMU page, but local_flush_tlb_page(),
+local_flush_tlb_range() and local_flush_tlb_kernel_range() all operate in
+PAGE_SIZE units.  Under page clustering a PAGE spans PAGE_MMUCOUNT MMU
+pages, so:
+
+  - local_flush_tlb_page() masked the (precise) faulting address down to
+    PAGE_MASK, i.e. the cluster base, and flushed the sub-page-0 UTLB entry
+    instead of the entry for the address actually being unmapped; and
+  - the range flushers counted in PAGE_SHIFT units and strode by PAGE_SIZE,
+    invalidating only 1 of every PAGE_MMUCOUNT sub-page entries.
+
+This leaves stale UTLB entries behind a teardown/remap.  The COW write
+path is the clean reproducer: a child first reads a sub-page (loading a
+read-only UTLB entry), then writes it.  do_wp_page() ->
+ptep_clear_flush() -> flush_tlb_page() was supposed to drop the old
+read-only entry, but flushed the wrong one; update_mmu_cache_range() then
+LDTLB'd a new writable entry for the same VPN.  Two entries now match the
+faulting VPN, so the retried store raises a TLB multiple-hit (EXPEVT
+0x140) -- a reset-class exception on SH-4 -- and the CPU resets to
+0xA0000000 with no oops.  It only triggers for sub-offsets != 0 within a
+cluster, because sub-offset 0 happens to alias the cluster base that the
+buggy mask produced.
+
+Convert all three flushers to MMUPAGE_SIZE/MMUPAGE_SHIFT/MMUPAGE_MASK so
+every sub-page UTLB entry in the affected range is flushed.  At
+PAGE_MMUSHIFT=0 these macros collapse to the PAGE_* values, so mainline
+behaviour is byte-for-byte unchanged.
+
+Confirmed on qemu-system-sh4 -M r2d at PAGE_MMUSHIFT=4 (PAGE_SIZE=64K,
+MMUPAGE_SIZE=4K): an anon MAP_PRIVATE fork+COW reproducer that previously
+reset the CPU on the first non-zero-sub-offset store now completes every
+sub-page COW write and powers down cleanly.  pgcl-test's fork_cow and
+fork_cow_stress subtests -- previously unreachable because the CPU reset
+first -- both PASS, and the suite runs to its summary.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ arch/sh/mm/tlbflush_32.c | 33 ++++++++++++++++++++++-----------
+ 1 file changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/arch/sh/mm/tlbflush_32.c b/arch/sh/mm/tlbflush_32.c
+index a6a20d6de4c0..f3fee254791c 100644
+--- a/arch/sh/mm/tlbflush_32.c
++++ b/arch/sh/mm/tlbflush_32.c
+@@ -22,7 +22,16 @@ void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
+ 		unsigned long saved_asid = MMU_NO_ASID;
+ 
+ 		asid = cpu_asid(cpu, vma->vm_mm);
+-		page &= PAGE_MASK;
++		/*
++		 * Each SH-4 UTLB entry maps one MMU page, so mask to
++		 * MMUPAGE_MASK rather than PAGE_MASK: under page clustering a
++		 * PAGE spans PAGE_MMUCOUNT MMU pages, and rounding down to the
++		 * cluster base would flush a sibling sub-page's entry instead
++		 * of this one.  The stale entry would then alias a freshly
++		 * loaded entry for the same VPN and trip a TLB multiple-hit (a
++		 * reset-class exception on SH-4).
++		 */
++		page &= MMUPAGE_MASK;
+ 
+ 		local_irq_save(flags);
+ 		if (vma->vm_mm != current->mm) {
+@@ -47,7 +56,8 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		int size;
+ 
+ 		local_irq_save(flags);
+-		size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++		/* Count/iterate in MMU pages: one UTLB entry per MMU page. */
++		size = (end - start + (MMUPAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
+ 		if (size > (MMU_NTLB_ENTRIES/4)) { /* Too many TLB to flush */
+ 			cpu_context(cpu, mm) = NO_CONTEXT;
+ 			if (mm == current->mm)
+@@ -57,16 +67,16 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 			unsigned long saved_asid = MMU_NO_ASID;
+ 
+ 			asid = cpu_asid(cpu, mm);
+-			start &= PAGE_MASK;
+-			end += (PAGE_SIZE - 1);
+-			end &= PAGE_MASK;
++			start &= MMUPAGE_MASK;
++			end += (MMUPAGE_SIZE - 1);
++			end &= MMUPAGE_MASK;
+ 			if (mm != current->mm) {
+ 				saved_asid = get_asid();
+ 				set_asid(asid);
+ 			}
+ 			while (start < end) {
+ 				local_flush_tlb_one(asid, start);
+-				start += PAGE_SIZE;
++				start += MMUPAGE_SIZE;
+ 			}
+ 			if (saved_asid != MMU_NO_ASID)
+ 				set_asid(saved_asid);
+@@ -82,7 +92,8 @@ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 	int size;
+ 
+ 	local_irq_save(flags);
+-	size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++	/* Count/iterate in MMU pages: one UTLB entry per MMU page. */
++	size = (end - start + (MMUPAGE_SIZE - 1)) >> MMUPAGE_SHIFT;
+ 	if (size > (MMU_NTLB_ENTRIES/4)) { /* Too many TLB to flush */
+ 		local_flush_tlb_all();
+ 	} else {
+@@ -90,13 +101,13 @@ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 		unsigned long saved_asid = get_asid();
+ 
+ 		asid = cpu_asid(cpu, &init_mm);
+-		start &= PAGE_MASK;
+-		end += (PAGE_SIZE - 1);
+-		end &= PAGE_MASK;
++		start &= MMUPAGE_MASK;
++		end += (MMUPAGE_SIZE - 1);
++		end &= MMUPAGE_MASK;
+ 		set_asid(asid);
+ 		while (start < end) {
+ 			local_flush_tlb_one(asid, start);
+-			start += PAGE_SIZE;
++			start += MMUPAGE_SIZE;
+ 		}
+ 		set_asid(saved_asid);
+ 	}
+-- 
+2.54.0
+

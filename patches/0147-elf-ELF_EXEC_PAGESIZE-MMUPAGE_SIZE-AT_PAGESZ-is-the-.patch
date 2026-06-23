@@ -1,0 +1,129 @@
+From 34c45e7bd5c136c96119a40e09da04204ac438a2 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 12 Jun 2026 17:03:54 +0200
+Subject: [PATCH 147/174] =?UTF-8?q?elf:=20ELF=5FEXEC=5FPAGESIZE=20=3D=20MM?=
+ =?UTF-8?q?UPAGE=5FSIZE=20=E2=80=94=20AT=5FPAGESZ=20is=20the=20hardware=20?=
+ =?UTF-8?q?page?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ELF_EXEC_PAGESIZE feeds AT_PAGESZ, the page size the kernel advertises to
+userspace.  Userspace (libc, ld.so) drives all of its own stack/mmap/mprotect
+alignment from it, so under page clustering it MUST equal the hardware page
+(MMUPAGE_SIZE), never the kernel's internal clustered PAGE_SIZE.  Otherwise
+the kernel lays out the user stack in one granularity while userspace computes
+addresses in another — the exec-time user-stack desync class.
+
+Three arches defined it as PAGE_SIZE, which scales with the clustered page and
+would advertise e.g. 64 KB to a userspace running on 4 KB hardware pages once
+PGCL is enabled there:
+
+  arch/arc, arch/hexagon, arch/xtensa:  PAGE_SIZE -> MMUPAGE_SIZE
+
+Two more hardcoded the literal hardware-page size; switch them to the named
+invariant so it is correct by construction rather than by luck (both arches
+have a fixed, non-configurable page size, so this is identical at every
+PAGE_MMUSHIFT, including 0):
+
+  arch/arm   (4096) -> MMUPAGE_SIZE
+  arch/alpha (8192) -> MMUPAGE_SIZE
+
+Deliberately NOT touched, to stay byte-identical to mainline at every config
+(Newton limit):
+  - parisc: page size is user-configurable (PARISC_PAGE_SIZE_4KB/16KB/64KB);
+    the 4096 literal already diverges from the hardware page at 16/64 KB, so
+    converting would change behaviour for those (separate, pre-existing issue).
+  - m68k: page size is platform-selected (SUN3/COLDFIRE => 8 KB else 4 KB) via
+    a conditional that cannot be guaranteed equal to MMUPAGE_SIZE on every
+    variant.
+  - microblaze: ELF_EXEC_PAGESIZE lives in uapi/asm/elf.h, where the
+    kernel-internal MMUPAGE_SIZE is not available; its 4096 already equals the
+    fixed hardware page.
+
+MMUPAGE_SIZE is co-defined with PAGE_SIZE in include/vdso/page.h, so it is in
+scope wherever PAGE_SIZE was.  Identity at PAGE_MMUSHIFT==0.  Compile-verified
+fs/binfmt_elf.o on arm and alpha at PAGE_MMUSHIFT=4 and on arc and xtensa at
+their default configs.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/alpha/include/asm/elf.h   | 3 ++-
+ arch/arc/include/asm/elf.h     | 2 +-
+ arch/arm/include/asm/elf.h     | 3 ++-
+ arch/hexagon/include/asm/elf.h | 4 ++--
+ arch/xtensa/include/asm/elf.h  | 2 +-
+ 5 files changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/arch/alpha/include/asm/elf.h b/arch/alpha/include/asm/elf.h
+index 50c82187e60e..2f130b61fcdd 100644
+--- a/arch/alpha/include/asm/elf.h
++++ b/arch/alpha/include/asm/elf.h
+@@ -83,7 +83,8 @@ typedef elf_fpreg_t elf_fpregset_t[ELF_NFPREG];
+ #define ELF_DATA	ELFDATA2LSB
+ #define ELF_ARCH	EM_ALPHA
+ 
+-#define ELF_EXEC_PAGESIZE	8192
++/* AT_PAGESZ = hardware page = MMUPAGE_SIZE under PGCL (8192 on alpha). */
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+    use of this is to invoke "./ld.so someprog" to test out a new version of
+diff --git a/arch/arc/include/asm/elf.h b/arch/arc/include/asm/elf.h
+index 0284ace0e1ab..292185f276ef 100644
+--- a/arch/arc/include/asm/elf.h
++++ b/arch/arc/include/asm/elf.h
+@@ -39,7 +39,7 @@ extern int elf_check_arch(const struct elf32_hdr *);
+ 
+ #define CORE_DUMP_USE_REGSET
+ 
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+diff --git a/arch/arm/include/asm/elf.h b/arch/arm/include/asm/elf.h
+index 9f21e170320f..2071b962e93f 100644
+--- a/arch/arm/include/asm/elf.h
++++ b/arch/arm/include/asm/elf.h
+@@ -119,7 +119,8 @@ extern int arm_elf_read_implies_exec(int);
+ #define elf_read_implies_exec(ex,stk) arm_elf_read_implies_exec(stk)
+ 
+ #define CORE_DUMP_USE_REGSET
+-#define ELF_EXEC_PAGESIZE	4096
++/* AT_PAGESZ = hardware page = MMUPAGE_SIZE under PGCL (4096 on arm). */
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /* This is the base location for PIE (ET_DYN with INTERP) loads. */
+ #define ELF_ET_DYN_BASE		0x400000UL
+diff --git a/arch/hexagon/include/asm/elf.h b/arch/hexagon/include/asm/elf.h
+index 5bfdd9b147fd..0339989c8c37 100644
+--- a/arch/hexagon/include/asm/elf.h
++++ b/arch/hexagon/include/asm/elf.h
+@@ -183,8 +183,8 @@ do {					\
+ 
+ #define CORE_DUMP_USE_REGSET
+ 
+-/* Hrm is this going to cause problems for changing PAGE_SIZE?  */
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++/* AT_PAGESZ is the hardware page userspace sees: MMUPAGE_SIZE under PGCL. */
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ 
+ /*
+  * This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+diff --git a/arch/xtensa/include/asm/elf.h b/arch/xtensa/include/asm/elf.h
+index ffcf1ada19c6..3e7edd8c4c5c 100644
+--- a/arch/xtensa/include/asm/elf.h
++++ b/arch/xtensa/include/asm/elf.h
+@@ -112,7 +112,7 @@ typedef elf_fpreg_t elf_fpregset_t[ELF_NFPREG];
+ #define ELF_CLASS	ELFCLASS32
+ #define ELF_ARCH	EM_XTENSA
+ 
+-#define ELF_EXEC_PAGESIZE	PAGE_SIZE
++#define ELF_EXEC_PAGESIZE	MMUPAGE_SIZE
+ #define CORE_DUMP_USE_REGSET
+ 
+ /*
+-- 
+2.54.0
+

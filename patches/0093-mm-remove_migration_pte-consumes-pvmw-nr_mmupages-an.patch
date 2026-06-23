@@ -1,0 +1,269 @@
+From 8ed685f73aff8e08774b48917777a268c7d9731a Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 17:40:47 +0200
+Subject: [PATCH 093/174] mm: remove_migration_pte consumes pvmw->nr_mmupages
+ (and walker batches migration entries)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Symmetric to the try_to_migrate_one fix (commit 0452d1cbc36c).  After
+that commit, the migration tear-down side correctly emitted one rmap
+event per kernel-page mapping site (one folio_remove_rmap_pte per
+yield, _mapcount -= 1 per kernel page).  The restore side
+(remove_migration_pte) still iterated one PTE at a time because the
+PVMW walker only batched present PTEs — migration entries always
+yielded nr_mmupages == 1.
+
+Result: a migration round-trip on a non-large folio under PGCL=4 left
+the destination folio's _mapcount at 16 instead of 1 (one
+folio_add_anon_rmap_pte per migration entry, 16 entries per kernel-
+page mapping site).  Subsequent try_to_unmap_one (post-fix Bug 1)
+correctly decremented by 1 per yield, so _mapcount could never reach
+0 — the folio was permanently un-reclaimable.  Silent in ordinary
+LTP because compaction is SKIP'd and NUMA-balancing migration isn't
+exercised; would surface under numactl --membind workloads, hot-
+unplug, or memory.compact stress.
+
+Two-part fix:
+
+1. mm/page_vma_mapped.c — extend the PVMW walker's PGCL batching to
+   migration entries.  The new branch:
+
+     - reads the first softleaf, checks softleaf_is_migration()
+     - extracts the encoded PFN via softleaf_to_pfn()
+     - scans forward over consecutive non-present PTEs that are
+       migration entries with the same encoded PFN
+
+   try_to_migrate_one writes the same encoded PFN to every sub-PTE
+   of a kernel-page mapping site, so this batches exactly one site
+   per yield (mirroring the present-PTE case).  Other non-present
+   types (device-private, device-exclusive, hwpoison) keep
+   nr_mmupages == 1.
+
+2. mm/migrate.c — remove_migration_pte and try_to_map_unused_to_zeropage
+   consume nr_mmupages:
+
+     - folio_get(folio) → folio_ref_add(folio, nr_pages)
+     - set_pte_at → set_ptes(... nr_pages) for present new PTEs
+       (auto-strides PFN to reconstruct sub-page topology)
+     - device-private new PTEs are non-present swap entries, so loop
+       set_pte_at (no PFN-stride; every sub-PTE encodes the same
+       destination PFN under PGCL)
+     - one folio_add_anon_rmap_pte / folio_add_file_rmap_pte per
+       yield (one rmap event per kernel-page mapping site)
+     - update_mmu_cache → update_mmu_cache_range(..., nr_pages)
+     - try_to_map_unused_to_zeropage takes nr_pages, uses
+       set_ptes for the zero-page mapping (each sub-PTE maps a
+       successive sub-page of the shared zero page; all-zero
+       contents preserve semantics) and add_mm_counter(-nr_pages)
+
+For non-PGCL builds nr_mmupages is always 1: the walker takes the
+non-batching fall-through, set_ptes(...,1) == set_pte_at,
+folio_ref_add(folio, 1) == folio_get, the device-private loop runs
+once, and update_mmu_cache_range(..., 1) == update_mmu_cache.
+Behavior is byte-identical to the legacy form.
+
+Verified on x86_64 PGCL=4 (LTP 71p/0f/28s — exact baseline match) and
+aarch64 PGCL=4 (cow PASS, PGCL basic 19/19, stress 12/12, all mm
+selftests PASS, zero kernel BUG/Oops/WARNING/Bad-page-state).  Test
+outcomes byte-identical to the post-Bug-3-fix baseline.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/migrate.c         | 57 ++++++++++++++++++++++++++++++++++++++------
+ mm/page_vma_mapped.c | 55 ++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 98 insertions(+), 14 deletions(-)
+
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 6e88993f95d7..4edc3279a231 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -296,7 +296,8 @@ bool isolate_folio_to_list(struct folio *folio, struct list_head *list)
+ }
+ 
+ static bool try_to_map_unused_to_zeropage(struct page_vma_mapped_walk *pvmw,
+-		struct folio *folio, pte_t old_pte, unsigned long idx)
++		struct folio *folio, pte_t old_pte, unsigned long idx,
++		unsigned int nr_pages)
+ {
+ 	struct page *page = folio_page(folio, idx);
+ 	pte_t newpte;
+@@ -329,9 +330,16 @@ static bool try_to_map_unused_to_zeropage(struct page_vma_mapped_walk *pvmw,
+ 	if (pte_swp_uffd_wp(old_pte))
+ 		newpte = pte_mkuffd_wp(newpte);
+ 
+-	set_pte_at(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, newpte);
++	/*
++	 * set_ptes auto-strides PFN: under PGCL each of the nr_pages sub-
++	 * PTEs maps a successive sub-page of the shared zero page (all
++	 * sub-pages contain zeros, so this preserves the original
++	 * sub-page topology).  For non-PGCL nr_pages == 1 and this
++	 * collapses to set_pte_at.
++	 */
++	set_ptes(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, newpte, nr_pages);
+ 
+-	dec_mm_counter(pvmw->vma->vm_mm, mm_counter(folio));
++	add_mm_counter(pvmw->vma->vm_mm, mm_counter(folio), -nr_pages);
+ 	return true;
+ }
+ 
+@@ -356,6 +364,7 @@ static bool remove_migration_pte(struct folio *folio,
+ 		softleaf_t entry;
+ 		struct page *new;
+ 		unsigned long idx = 0;
++		unsigned int nr_pages, i;
+ 
+ 		/* pgoff is invalid for ksm pages, but they are never large */
+ 		if (folio_test_large(folio) && !folio_test_hugetlb(folio))
+@@ -371,12 +380,25 @@ static bool remove_migration_pte(struct folio *folio,
+ 			continue;
+ 		}
+ #endif
++		/*
++		 * Under PGCL the walker batches consecutive migration entries
++		 * encoding the same kernel-page PFN as a single yield of
++		 * pvmw.nr_mmupages PTEs (see page_vma_mapped_walk batching
++		 * extension).  Mirror try_to_migrate_one's symmetry: take
++		 * nr_pages refs, write nr_pages new PTEs, but issue exactly
++		 * one rmap event per yield (one struct page = one _mapcount
++		 * increment).  For non-PGCL nr_mmupages is always 1 and the
++		 * batched calls collapse to legacy per-PTE form.
++		 */
++		nr_pages = pvmw.nr_mmupages;
++
+ 		old_pte = ptep_get(pvmw.pte);
+ 		if (rmap_walk_arg->map_unused_to_zeropage &&
+-		    try_to_map_unused_to_zeropage(&pvmw, folio, old_pte, idx))
++		    try_to_map_unused_to_zeropage(&pvmw, folio, old_pte, idx,
++						  nr_pages))
+ 			continue;
+ 
+-		folio_get(folio);
++		folio_ref_add(folio, nr_pages);
+ 		pte = mk_pte(new, READ_ONCE(vma->vm_page_prot));
+ 
+ 		entry = softleaf_from_pte(old_pte);
+@@ -433,7 +455,27 @@ static bool remove_migration_pte(struct folio *folio,
+ 							pvmw.address, rmap_flags);
+ 			else
+ 				folio_add_file_rmap_pte(folio, new, vma);
+-			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
++			if (unlikely(is_device_private_page(new))) {
++				/*
++				 * Device-private entries are non-present swap
++				 * PTEs; set_ptes' PFN-stride doesn't apply.
++				 * Loop set_pte_at — every sub-PTE encodes the
++				 * same destination PFN under PGCL.
++				 */
++				for (i = 0; i < nr_pages; i++)
++					set_pte_at(vma->vm_mm,
++						pvmw.address + (unsigned long)i * MMUPAGE_SIZE,
++						pvmw.pte + i, pte);
++			} else {
++				/*
++				 * Present PTEs: set_ptes auto-strides PFN to
++				 * reconstruct the original sub-page topology
++				 * (PTE i maps virtual sub-page i to physical
++				 * sub-page i of `new`).
++				 */
++				set_ptes(vma->vm_mm, pvmw.address, pvmw.pte,
++					 pte, nr_pages);
++			}
+ 		}
+ 		if (READ_ONCE(vma->vm_flags) & VM_LOCKED)
+ 			mlock_drain_local();
+@@ -442,7 +484,8 @@ static bool remove_migration_pte(struct folio *folio,
+ 					   compound_order(new));
+ 
+ 		/* No need to invalidate - it was non-present before */
+-		update_mmu_cache(vma, pvmw.address, pvmw.pte);
++		update_mmu_cache_range(NULL, vma, pvmw.address, pvmw.pte,
++				       nr_pages);
+ 	}
+ 
+ 	return true;
+diff --git a/mm/page_vma_mapped.c b/mm/page_vma_mapped.c
+index 1ff3aef7b437..15d5c4b053e6 100644
+--- a/mm/page_vma_mapped.c
++++ b/mm/page_vma_mapped.c
+@@ -297,28 +297,69 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
+ 			 * PTEs that map sub-pages of the same kernel page
+ 			 * (same kernel-PFN).  Caller consumes nr_mmupages PTEs
+ 			 * as a single rmap event (one struct page, one
+-			 * _mapcount).  For non-PGCL or migration/device-
+-			 * private entries (handled below in @check_pte) the
+-			 * batch always has size 1.
++			 * _mapcount).
++			 *
++			 * Two PTE classes batch:
++			 *   - Present PTEs: pte_pfn drops sub-page bits, so all
++			 *     16 sub-PTEs of a kernel page share the same PFN.
++			 *   - Migration entries: try_to_migrate_one writes the
++			 *     same encoded PFN to all sub-PTEs of a kernel-page
++			 *     mapping site.  Batching here lets remove_migration_pte
++			 *     restore the site as a single rmap event, mirroring
++			 *     the symmetry try_to_migrate_one uses on the tear-down
++			 *     side (commit 0452d1cbc36c).
++			 *
++			 * Other non-present types (device-private, device-
++			 * exclusive, hwpoison) keep nr_mmupages == 1 — they have
++			 * device-specific semantics and aren't batched.
+ 			 */
+ 			pvmw->nr_mmupages = 1;
+ 			if (PAGE_MMUSHIFT > 0) {
+ 				pte_t first = ptep_get(pvmw->pte);
+-				if (pte_present(first)) {
++				bool present = pte_present(first);
++				bool is_migration = false;
++				unsigned long match_pfn = 0;
++
++				if (present) {
++					match_pfn = pte_pfn(first);
++				} else {
++					softleaf_t e = softleaf_from_pte(first);
++
++					if (softleaf_is_migration(e)) {
++						is_migration = true;
++						match_pfn = softleaf_to_pfn(e);
++					}
++				}
++
++				if (present || is_migration) {
+ 					unsigned long sub_off =
+ 						(pvmw->address & (PAGE_SIZE - 1))
+ 						>> MMUPAGE_SHIFT;
+ 					unsigned int n = 1;
+ 					unsigned int max = PAGE_MMUCOUNT - sub_off;
+-					unsigned long pfn = pte_pfn(first);
+ 
+ 					if (pvmw->address + max * MMUPAGE_SIZE > end)
+ 						max = (end - pvmw->address)
+ 						      >> MMUPAGE_SHIFT;
+ 					while (n < max) {
+ 						pte_t pe = ptep_get(pvmw->pte + n);
+-						if (!pte_present(pe) ||
+-						    pte_pfn(pe) != pfn)
++						unsigned long pe_pfn;
++
++						if (present) {
++							if (!pte_present(pe))
++								break;
++							pe_pfn = pte_pfn(pe);
++						} else {
++							softleaf_t pe_e;
++
++							if (pte_present(pe))
++								break;
++							pe_e = softleaf_from_pte(pe);
++							if (!softleaf_is_migration(pe_e))
++								break;
++							pe_pfn = softleaf_to_pfn(pe_e);
++						}
++						if (pe_pfn != match_pfn)
+ 							break;
+ 						n++;
+ 					}
+-- 
+2.54.0
+

@@ -1,0 +1,153 @@
+From 16720880538cfd95ddc0b63f106bfd49baa58845 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 06:12:22 +0200
+Subject: [PATCH 084/174] mm: page_vma_mapped_walk yields one kernel page per
+ step under PGCL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add nr_mmupages to struct page_vma_mapped_walk and have the walker
+populate it on each yield: the count of consecutive MMUPAGE PTEs at
+@pte that map sub-pages of the same kernel page (same kernel-PFN).
+For non-PGCL builds (PAGE_MMUSHIFT == 0) nr_mmupages is always 1 and
+no semantic change occurs.
+
+For PGCL the walker scans forward up to PAGE_MMUCOUNT-1 additional
+PTEs after a check_pte hit, comparing pte_pfn (which drops sub-page
+bits) for equality with the first PTE in the kernel page.  The
+populated nr_mmupages lets PVMW callbacks (try_to_unmap_one,
+try_to_migrate_one, remove_migration_pte) split their handling cleanly
+between two unit systems:
+
+  * MMUPAGE-granular operations (set_ptes / get_and_clear_ptes,
+    cache + TLB flush, RSS counter, folio_ref) consume nr_mmupages.
+
+  * Kernel-page-granular operations (rmap, _mapcount, struct page
+    array iteration) treat each yield as a single kernel page.
+
+This commit is a no-op for callers; subsequent commits convert the
+PVMW callbacks to actually use nr_mmupages.  Note that migration and
+device-private entries (handled inside check_pte) are not yet
+batched — they remain at nr_mmupages == 1 — and remap_file_pages()
+is preserved at single-PTE granularity by the same check.
+
+Background: see Documentation/mm/sub-pmd-superpages.rst (Phase 2a)
+and the unit-mismatch analysis in
+project_aarch64_pgcl0_rss.md.  The previous PGCL port papered over
+the unit mismatch with fault-time compensation hacks (e.g.,
+do_anonymous_page's atomic_add(rss-1, &_mapcount)).  Once the
+walker yields per kernel page, those compensations become
+unnecessary and the rmap accounting reduces to a clean 1:1 inc/dec
+per kernel-page mapping site.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ include/linux/rmap.h | 14 ++++++++++++++
+ mm/migrate_device.c  |  1 +
+ mm/page_vma_mapped.c | 37 ++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 8dc0871e5f00..1de461fd86d5 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -871,6 +871,19 @@ struct page_vma_mapped_walk {
+ 	pte_t *pte;
+ 	spinlock_t *ptl;
+ 	unsigned int flags;
++	/*
++	 * Number of consecutive MMUPAGE PTEs at @pte that the current yield
++	 * covers.  For non-PGCL builds (PAGE_MMUSHIFT == 0) always 1.  For
++	 * PGCL the walker yields one kernel page at a time and populates
++	 * this with the count of MMUPAGE PTEs (typically PAGE_MMUCOUNT, less
++	 * at VMA edges or for partial sub-page mappings via remap_file_pages).
++	 *
++	 * PTE-level operations (set_ptes, get_and_clear_ptes, TLB flush, RSS
++	 * accounting, refcount) should consume @nr_mmupages.  Struct-page
++	 * operations (rmap, _mapcount) should treat each yield as a single
++	 * kernel page.
++	 */
++	unsigned int nr_mmupages;
+ };
+ 
+ #define DEFINE_FOLIO_VMA_WALK(name, _folio, _vma, _address, _flags)	\
+@@ -881,6 +894,7 @@ struct page_vma_mapped_walk {
+ 		.vma = _vma,						\
+ 		.address = _address,					\
+ 		.flags = _flags,					\
++		.nr_mmupages = 1,					\
+ 	}
+ 
+ static inline void page_vma_mapped_walk_done(struct page_vma_mapped_walk *pvmw)
+diff --git a/mm/migrate_device.c b/mm/migrate_device.c
+index 1a3909f649c9..fb1d10a7f57b 100644
+--- a/mm/migrate_device.c
++++ b/mm/migrate_device.c
+@@ -199,6 +199,7 @@ static int migrate_vma_collect_huge_pmd(pmd_t *pmdp, unsigned long start,
+ 			.address = start,
+ 			.pmd = pmdp,
+ 			.vma = walk->vma,
++			.nr_mmupages = 1,
+ 		};
+ 
+ 		unsigned long pfn = page_to_pfn(folio_page(folio, 0));
+diff --git a/mm/page_vma_mapped.c b/mm/page_vma_mapped.c
+index 8eeb32cc6df4..1ff3aef7b437 100644
+--- a/mm/page_vma_mapped.c
++++ b/mm/page_vma_mapped.c
+@@ -291,8 +291,42 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
+ 			goto next_pte;
+ 		}
+ this_pte:
+-		if (check_pte(pvmw, 1))
++		if (check_pte(pvmw, 1)) {
++			/*
++			 * Under PGCL, scan forward up to PAGE_MMUCOUNT-1 more
++			 * PTEs that map sub-pages of the same kernel page
++			 * (same kernel-PFN).  Caller consumes nr_mmupages PTEs
++			 * as a single rmap event (one struct page, one
++			 * _mapcount).  For non-PGCL or migration/device-
++			 * private entries (handled below in @check_pte) the
++			 * batch always has size 1.
++			 */
++			pvmw->nr_mmupages = 1;
++			if (PAGE_MMUSHIFT > 0) {
++				pte_t first = ptep_get(pvmw->pte);
++				if (pte_present(first)) {
++					unsigned long sub_off =
++						(pvmw->address & (PAGE_SIZE - 1))
++						>> MMUPAGE_SHIFT;
++					unsigned int n = 1;
++					unsigned int max = PAGE_MMUCOUNT - sub_off;
++					unsigned long pfn = pte_pfn(first);
++
++					if (pvmw->address + max * MMUPAGE_SIZE > end)
++						max = (end - pvmw->address)
++						      >> MMUPAGE_SHIFT;
++					while (n < max) {
++						pte_t pe = ptep_get(pvmw->pte + n);
++						if (!pte_present(pe) ||
++						    pte_pfn(pe) != pfn)
++							break;
++						n++;
++					}
++					pvmw->nr_mmupages = n;
++				}
++			}
+ 			return true;
++		}
+ next_pte:
+ 		do {
+ 			pvmw->address += MMUPAGE_SIZE;
+@@ -347,6 +381,7 @@ unsigned long page_mapped_in_vma(const struct page *page,
+ 		.nr_pages = 1,
+ 		.vma = vma,
+ 		.flags = PVMW_SYNC,
++		.nr_mmupages = 1,
+ 	};
+ 
+ 	pvmw.address = vma_address(vma, page_pgoff(folio, page), 1);
+-- 
+2.54.0
+

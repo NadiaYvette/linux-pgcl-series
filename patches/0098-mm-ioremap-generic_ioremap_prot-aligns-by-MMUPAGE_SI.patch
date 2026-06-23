@@ -1,0 +1,82 @@
+From f081265f204f14af2f18f5b647da7540242885fe Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 7 May 2026 23:18:58 +0200
+Subject: [PATCH 098/174] mm/ioremap: generic_ioremap_prot aligns by
+ MMUPAGE_SIZE
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+generic_ioremap_prot trimmed phys_addr down to PAGE_MASK and inflated
+size with PAGE_ALIGN.  Page tables walk at MMUPAGE (hardware page)
+granularity, so under page-clustering the rounding is excessive — a
+typical 0x200-byte virtio-mmio MMIO region got rounded up to PAGE_SIZE
+which at PGCL=6 (4K MMU) is 256KB.
+
+Two consequences:
+1. The vmap area is inflated PAGE_MMUCOUNT× (256KB instead of 4KB) per
+   ioremap, wasting kernel virtual address space.
+2. The mapping covers a region that crosses well past the device's
+   actual MMIO boundary.  On QEMU virt aarch64 the virtio-mmio bank
+   spans only 0xA000000-0xA003FFF (32 devices × 0x200), so a 256KB
+   mapping starting at 0xA000000 reaches into 0xA040000 which is
+   unmapped bus space.  An ioremap of device 1 (offset 0x200) shifts
+   phys_addr down to 0xA000000 and inflates size to 256KB, mapping
+   the same overlap.  The first read inside virtio_mmio_probe at
+   vm_dev->base + VIRTIO_MMIO_MAGIC_VALUE then takes a synchronous
+   external abort (ESR=0x96000010), pre-fix.
+
+Switch the rounding and iounmap's vaddr calculation to MMUPAGE_SIZE/
+MMUPAGE_MASK.  On non-PGCL builds MMUPAGE_SIZE == PAGE_SIZE so behavior
+is identical.
+
+Verified: aarch64 PGCL=6 standalone boot now progresses past
+virtio_mmio_probe through PCI enumeration, virtio-pci enable, the
+serial driver init, megasas, physmap-flash setup — next blocker is a
+hang during physmap-flash MTD probe (likely another large-mapping
+issue, separate follow-up).
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ mm/ioremap.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/mm/ioremap.c b/mm/ioremap.c
+index c36dd9f62fd5..2d574494e49f 100644
+--- a/mm/ioremap.c
++++ b/mm/ioremap.c
+@@ -28,10 +28,17 @@ void __iomem *generic_ioremap_prot(phys_addr_t phys_addr, size_t size,
+ 	if (!size || last_addr < phys_addr)
+ 		return NULL;
+ 
+-	/* Page-align mappings */
+-	offset = phys_addr & (~PAGE_MASK);
++	/*
++	 * MMUPAGE-align mappings.  Page tables walk at MMUPAGE granularity
++	 * regardless of page-clustering; aligning by PAGE_SIZE inflates the
++	 * vmap area by PAGE_MMUCOUNT× (e.g. 256KB at PGCL=6) for tiny MMIO
++	 * regions like a 0x200-byte virtio-mmio device, and rounds the
++	 * mapping out into adjacent unrelated physical addresses that a
++	 * later access can stray into.
++	 */
++	offset = phys_addr & (~MMUPAGE_MASK);
+ 	phys_addr -= offset;
+-	size = PAGE_ALIGN(size + offset);
++	size = ALIGN(size + offset, MMUPAGE_SIZE);
+ 
+ 	area = __get_vm_area_caller(size, VM_IOREMAP, IOREMAP_START,
+ 				    IOREMAP_END, __builtin_return_address(0));
+@@ -59,7 +66,7 @@ EXPORT_SYMBOL(ioremap_prot);
+ 
+ void generic_iounmap(volatile void __iomem *addr)
+ {
+-	void *vaddr = (void *)((unsigned long)addr & PAGE_MASK);
++	void *vaddr = (void *)((unsigned long)addr & MMUPAGE_MASK);
+ 
+ 	if (is_ioremap_addr(vaddr))
+ 		vunmap(vaddr);
+-- 
+2.54.0
+

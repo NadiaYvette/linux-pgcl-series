@@ -1,0 +1,356 @@
+From 0dc02e9c01c8ac3efce7ce55eeb7a359b0e4ccf1 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 11 Jun 2026 17:54:40 +0200
+Subject: [PATCH 141/174] mm: PGCL: make vmf_insert_pfn() take an
+ MMUPAGE-granular PFN
+
+insert_pfn() (vmf_insert_pfn{,_prot}/vmf_insert_mixed) was never converted
+for page clustering: it did a bare pte_mkspecial(pfn_pte(pfn, prot)), so it
+could only ever map sub-page 0 of a kernel page.  That is wrong for any
+caller that needs to map an arbitrary hardware (MMU) page within a cluster
+-- most importantly the TTM/GPU fault path, whose mmap()s of BO backing
+store and MMIO register/doorbell windows then landed on the wrong physical
+page (16x off at PAGE_MMUSHIFT=4).  On real GPU hardware this corrupts BO
+contents and, because IRQ ack/mask/doorbell register writes reach the wrong
+page, leaves device interrupts permanently asserted -> interrupt storm ->
+RCU stalls/softlockups.  It also feeds a bogus 16x-high paddr into the PAT
+memtype path (pfnmap_setup_cachemode_pfn -> paddr = pfn << PAGE_SHIFT),
+producing a flood of overlapping/garbage memtype reservations.  None of
+this is reachable under QEMU (no GPU), so the architecture test matrix
+never exercised it -- it only bites real x86_64 hardware.
+
+The TTM io_mem path (ttm_bo_io_mem_pfn) and the comment in
+ttm_bo_vm_fault_reserved already documented the intended convention: the
+PFN passed to vmf_insert_pfn() is MMUPAGE-granular (phys >> MMUPAGE_SHIFT),
+high bits selecting the kernel page and the low PAGE_MMUSHIFT bits the
+sub-page.  Complete that:
+
+  - insert_pfn(): build the PTE from pgpfn = pfn >> PAGE_MMUSHIFT and add
+    the sub-page offset with pte_mksub(); derive a PAGE-granular pgpfn for
+    the struct-page / memtype helpers (pfn_valid, pfn_to_page,
+    pfn_modify_allowed, pfnmap_setup_cachemode_pfn, is_zero_pfn) in
+    vmf_insert_pfn_prot() and __vm_insert_mixed().  Identity at
+    PAGE_MMUSHIFT == 0.
+  - x86 vdso (pvclock/hvclock) and SGX EPC fault paths: emit MMUPAGE PFNs.
+    The SGX change also fixes a latent aliasing bug -- consecutive 4K EPC
+    pages share a kernel page and previously all mapped to sub-page 0.
+  - TTM struct-page and dummy-page paths: shift the kernel-page PFN up by
+    PAGE_MMUSHIFT before adding the sub-page index.
+  - xe: xe_ttm_io_mem_pfn() returns MMUPAGE PFNs (mirror i915); the MMIO
+    GEM and doorbell fault loops stride MMUPAGE_SIZE and emit MMUPAGE PFNs
+    (they previously stepped PAGE_SIZE, leaving 15/16 of each register
+    window unmapped).
+
+Compile-verified at PAGE_MMUSHIFT=4 (x86_64, incl. ttm/xe/i915 modules).
+The remaining tree-wide vmf_insert_pfn() callers (powerpc spufs/book3s/vas,
+ocxl, vhost, the other drm drivers, udmabuf, vfio, etc.) still pass
+PAGE-granular PFNs and must be converted before this is upstreamable; they
+are not in the x86_64 boot path or the test-matrix initramfs, and are
+identity at PAGE_MMUSHIFT == 0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/x86/entry/vdso/vma.c        |  7 +++--
+ arch/x86/kernel/cpu/sgx/encl.c   |  6 +++--
+ arch/x86/kernel/cpu/sgx/virt.c   |  3 ++-
+ drivers/gpu/drm/ttm/ttm_bo_vm.c  | 10 ++++++--
+ drivers/gpu/drm/xe/xe_bo.c       | 10 +++++---
+ drivers/gpu/drm/xe/xe_device.c   |  9 ++++---
+ drivers/gpu/drm/xe/xe_mmio_gem.c | 10 +++++---
+ mm/memory.c                      | 44 ++++++++++++++++++++++++--------
+ 8 files changed, 72 insertions(+), 27 deletions(-)
+
+diff --git a/arch/x86/entry/vdso/vma.c b/arch/x86/entry/vdso/vma.c
+index a89f462859a3..c9905407b115 100644
+--- a/arch/x86/entry/vdso/vma.c
++++ b/arch/x86/entry/vdso/vma.c
+@@ -94,8 +94,9 @@ static vm_fault_t vvar_vclock_fault(const struct vm_special_mapping *sm,
+ 			pvclock_get_pvti_cpu0_va();
+ 
+ 		if (pvti && vclock_was_used(VDSO_CLOCKMODE_PVCLOCK))
++			/* vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN. */
+ 			return vmf_insert_pfn_prot(vma, vmf->address,
+-					__pa(pvti) >> PAGE_SHIFT,
++					__pa(pvti) >> MMUPAGE_SHIFT,
+ 					pgprot_decrypted(vma->vm_page_prot));
+ 		break;
+ 	}
+@@ -103,7 +104,9 @@ static vm_fault_t vvar_vclock_fault(const struct vm_special_mapping *sm,
+ 	{
+ 		unsigned long pfn = hv_get_tsc_pfn();
+ 		if (pfn && vclock_was_used(VDSO_CLOCKMODE_HVCLOCK))
+-			return vmf_insert_pfn(vma, vmf->address, pfn);
++			/* hv_get_tsc_pfn() is PAGE-granular; vmf_insert_pfn() takes MMUPAGE. */
++			return vmf_insert_pfn(vma, vmf->address,
++					      pfn << PAGE_MMUSHIFT);
+ 		break;
+ 	}
+ 	}
+diff --git a/arch/x86/kernel/cpu/sgx/encl.c b/arch/x86/kernel/cpu/sgx/encl.c
+index f100d5bf9cff..ff21e8a293dd 100644
+--- a/arch/x86/kernel/cpu/sgx/encl.c
++++ b/arch/x86/kernel/cpu/sgx/encl.c
+@@ -405,7 +405,8 @@ static vm_fault_t sgx_encl_eaug_page(struct vm_area_struct *vma,
+ 	 * Do not undo everything when creating PTE entry fails - next #PF
+ 	 * would find page ready for a PTE.
+ 	 */
+-	vmret = vmf_insert_pfn(vma, addr, PFN_DOWN(phys_addr));
++	/* vmf_insert_pfn() takes an MMUPAGE-granular PFN. */
++	vmret = vmf_insert_pfn(vma, addr, phys_addr >> MMUPAGE_SHIFT);
+ 	if (vmret != VM_FAULT_NOPAGE) {
+ 		mutex_unlock(&encl->lock);
+ 		return VM_FAULT_SIGBUS;
+@@ -471,7 +472,8 @@ static vm_fault_t sgx_vma_fault(struct vm_fault *vmf)
+ 
+ 	phys_addr = sgx_get_epc_phys_addr(entry->epc_page);
+ 
+-	ret = vmf_insert_pfn(vma, addr, PFN_DOWN(phys_addr));
++	/* vmf_insert_pfn() takes an MMUPAGE-granular PFN. */
++	ret = vmf_insert_pfn(vma, addr, phys_addr >> MMUPAGE_SHIFT);
+ 	if (ret != VM_FAULT_NOPAGE) {
+ 		mutex_unlock(&encl->lock);
+ 
+diff --git a/arch/x86/kernel/cpu/sgx/virt.c b/arch/x86/kernel/cpu/sgx/virt.c
+index db6806c40483..ebe5f13463f7 100644
+--- a/arch/x86/kernel/cpu/sgx/virt.c
++++ b/arch/x86/kernel/cpu/sgx/virt.c
+@@ -55,7 +55,8 @@ static int __sgx_vepc_fault(struct sgx_vepc *vepc,
+ 	if (ret)
+ 		goto err_free;
+ 
+-	pfn = PFN_DOWN(sgx_get_epc_phys_addr(epc_page));
++	/* vmf_insert_pfn() takes an MMUPAGE-granular PFN. */
++	pfn = sgx_get_epc_phys_addr(epc_page) >> MMUPAGE_SHIFT;
+ 
+ 	ret = vmf_insert_pfn(vma, addr, pfn);
+ 	if (ret != VM_FAULT_NOPAGE) {
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index e823888fce90..36b571f0e444 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -257,7 +257,12 @@ vm_fault_t ttm_bo_vm_fault_reserved(struct vm_fault *vmf,
+ 			} else if (unlikely(!page)) {
+ 				break;
+ 			}
+-			pfn = page_to_pfn(page) +
++			/*
++			 * vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN:
++			 * the kernel-page PFN shifted up by PAGE_MMUSHIFT, plus
++			 * the sub-page (MMU page) index within the kernel page.
++			 */
++			pfn = (page_to_pfn(page) << PAGE_MMUSHIFT) +
+ 			      (page_offset & (PAGE_MMUCOUNT - 1));
+ 		}
+ 
+@@ -313,7 +318,8 @@ vm_fault_t ttm_bo_vm_dummy_page(struct vm_fault *vmf, pgprot_t prot)
+ 				     page))
+ 		return VM_FAULT_OOM;
+ 
+-	pfn = page_to_pfn(page);
++	/* vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN (sub-page 0). */
++	pfn = page_to_pfn(page) << PAGE_MMUSHIFT;
+ 
+ 	/* Prefault the entire VMA range right away to avoid further faults */
+ 	for (address = vma->vm_start; address < vma->vm_end;
+diff --git a/drivers/gpu/drm/xe/xe_bo.c b/drivers/gpu/drm/xe/xe_bo.c
+index 6b518858538f..90f6cf580898 100644
+--- a/drivers/gpu/drm/xe/xe_bo.c
++++ b/drivers/gpu/drm/xe/xe_bo.c
+@@ -1639,12 +1639,16 @@ static unsigned long xe_ttm_io_mem_pfn(struct ttm_buffer_object *ttm_bo,
+ 	struct xe_res_cursor cursor;
+ 	struct xe_vram_region *vram;
+ 
++	/*
++	 * page_offset is in MMUPAGE units and the TTM io_mem path feeds the
++	 * result straight to vmf_insert_pfn_prot(), so return an MMUPAGE PFN.
++	 */
+ 	if (ttm_bo->resource->mem_type == XE_PL_STOLEN)
+-		return xe_ttm_stolen_io_offset(bo, page_offset << PAGE_SHIFT) >> PAGE_SHIFT;
++		return xe_ttm_stolen_io_offset(bo, page_offset << MMUPAGE_SHIFT) >> MMUPAGE_SHIFT;
+ 
+ 	vram = res_to_mem_region(ttm_bo->resource);
+-	xe_res_first(ttm_bo->resource, (u64)page_offset << PAGE_SHIFT, 0, &cursor);
+-	return (vram->io_start + cursor.start) >> PAGE_SHIFT;
++	xe_res_first(ttm_bo->resource, (u64)page_offset << MMUPAGE_SHIFT, 0, &cursor);
++	return (vram->io_start + cursor.start) >> MMUPAGE_SHIFT;
+ }
+ 
+ static void __xe_bo_vunmap(struct xe_bo *bo);
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+index ffea4a453c01..66f92e673e8d 100644
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -285,8 +285,9 @@ static vm_fault_t barrier_fault(struct vm_fault *vmf)
+ 		unsigned long pfn;
+ 
+ #define LAST_DB_PAGE_OFFSET 0x7ff001
+-		pfn = PHYS_PFN(pci_resource_start(to_pci_dev(dev->dev), 0) +
+-				LAST_DB_PAGE_OFFSET);
++		/* vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN. */
++		pfn = (pci_resource_start(to_pci_dev(dev->dev), 0) +
++				LAST_DB_PAGE_OFFSET) >> MMUPAGE_SHIFT;
+ 		ret = vmf_insert_pfn_prot(vma, vma->vm_start, pfn,
+ 					  pgprot_noncached(prot));
+ 		drm_dev_exit(idx);
+@@ -302,7 +303,9 @@ static vm_fault_t barrier_fault(struct vm_fault *vmf)
+ 		if (drmm_add_action_or_reset(dev, barrier_release_dummy_page, page))
+ 			return VM_FAULT_OOM;
+ 
+-		ret = vmf_insert_pfn_prot(vma, vma->vm_start, page_to_pfn(page),
++		/* vmf_insert_pfn_prot() takes an MMUPAGE-granular PFN. */
++		ret = vmf_insert_pfn_prot(vma, vma->vm_start,
++					  page_to_pfn(page) << PAGE_MMUSHIFT,
+ 					  prot);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/xe/xe_mmio_gem.c b/drivers/gpu/drm/xe/xe_mmio_gem.c
+index 8c803ef233cc..8703ed53e6a3 100644
+--- a/drivers/gpu/drm/xe/xe_mmio_gem.c
++++ b/drivers/gpu/drm/xe/xe_mmio_gem.c
+@@ -178,10 +178,11 @@ static vm_fault_t xe_mmio_gem_vm_fault_dummy_page(struct vm_area_struct *vma)
+ 	if (drmm_add_action_or_reset(dev, xe_mmio_gem_release_dummy_page, page))
+ 		return VM_FAULT_OOM;
+ 
+-	pfn = page_to_pfn(page);
++	/* vmf_insert_pfn() maps one MMUPAGE and takes an MMUPAGE-granular PFN. */
++	pfn = page_to_pfn(page) << PAGE_MMUSHIFT;
+ 
+ 	/* Map the entire VMA to the same dummy page */
+-	for (i = 0; i < base->size; i += PAGE_SIZE) {
++	for (i = 0; i < base->size; i += MMUPAGE_SIZE) {
+ 		unsigned long addr = vma->vm_start + i;
+ 
+ 		ret = vmf_insert_pfn(vma, addr, pfn);
+@@ -212,11 +213,12 @@ static vm_fault_t xe_mmio_gem_vm_fault(struct vm_fault *vmf)
+ 		return xe_mmio_gem_vm_fault_dummy_page(vma);
+ 	}
+ 
+-	for (i = 0; i < base->size; i += PAGE_SIZE) {
++	/* vmf_insert_pfn() maps one MMUPAGE and takes an MMUPAGE-granular PFN. */
++	for (i = 0; i < base->size; i += MMUPAGE_SIZE) {
+ 		unsigned long addr = vma->vm_start + i;
+ 		unsigned long phys_addr = obj->phys_addr + i;
+ 
+-		ret = vmf_insert_pfn(vma, addr, PHYS_PFN(phys_addr));
++		ret = vmf_insert_pfn(vma, addr, phys_addr >> MMUPAGE_SHIFT);
+ 		if (ret & VM_FAULT_ERROR)
+ 			break;
+ 	}
+diff --git a/mm/memory.c b/mm/memory.c
+index c219394fcc64..7014e75e60b2 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2832,6 +2832,14 @@ static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pte_t *pte, entry;
+ 	spinlock_t *ptl;
++	/*
++	 * Under PGCL @pfn is MMUPAGE-granular (phys >> MMUPAGE_SHIFT): the high
++	 * bits select the kernel page (struct-page PFN) and the low PAGE_MMUSHIFT
++	 * bits select the sub-page (hardware MMU page) within it.  pgpfn is the
++	 * PAGE-granular PFN used by struct-page / memtype helpers.  Identity at
++	 * PAGE_MMUSHIFT == 0.
++	 */
++	unsigned long pgpfn = pfn >> PAGE_MMUSHIFT;
+ 
+ 	pte = get_locked_pte(mm, addr, &ptl);
+ 	if (!pte)
+@@ -2849,7 +2857,7 @@ static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
+ 			 * allocation and mapping invalidation so just skip the
+ 			 * update.
+ 			 */
+-			if (pte_pfn(entry) != pfn) {
++			if (pte_pfn(entry) != pgpfn) {
+ 				WARN_ON_ONCE(!is_zero_pfn(pte_pfn(entry)));
+ 				goto out_unlock;
+ 			}
+@@ -2862,7 +2870,10 @@ static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
+ 	}
+ 
+ 	/* Ok, finally just insert the thing.. */
+-	entry = pte_mkspecial(pfn_pte(pfn, prot));
++	entry = pfn_pte(pgpfn, prot);
++	if (PAGE_MMUSHIFT > 0)
++		entry = pte_mksub(entry, (pfn & (PAGE_MMUCOUNT - 1)) << MMUPAGE_SHIFT);
++	entry = pte_mkspecial(entry);
+ 
+ 	if (mkwrite) {
+ 		entry = pte_mkyoung(entry);
+@@ -2919,19 +2930,25 @@ vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr,
+ 	 * consistency in testing and feature parity among all, so we should
+ 	 * try to keep these invariants in place for everybody.
+ 	 */
++	/*
++	 * Under PGCL @pfn is MMUPAGE-granular; the struct-page / memtype helpers
++	 * below operate on PAGE-granular PFNs.  Identity at PAGE_MMUSHIFT == 0.
++	 */
++	unsigned long pgpfn = pfn >> PAGE_MMUSHIFT;
++
+ 	BUG_ON(!(vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)));
+ 	BUG_ON((vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) ==
+ 						(VM_PFNMAP|VM_MIXEDMAP));
+ 	BUG_ON((vma->vm_flags & VM_PFNMAP) && is_cow_mapping(vma->vm_flags));
+-	BUG_ON((vma->vm_flags & VM_MIXEDMAP) && pfn_valid(pfn));
++	BUG_ON((vma->vm_flags & VM_MIXEDMAP) && pfn_valid(pgpfn));
+ 
+ 	if (addr < vma->vm_start || addr >= vma->vm_end)
+ 		return VM_FAULT_SIGBUS;
+ 
+-	if (!pfn_modify_allowed(pfn, pgprot))
++	if (!pfn_modify_allowed(pgpfn, pgprot))
+ 		return VM_FAULT_SIGBUS;
+ 
+-	pfnmap_setup_cachemode_pfn(pfn, &pgprot);
++	pfnmap_setup_cachemode_pfn(pgpfn, &pgprot);
+ 
+ 	return insert_pfn(vma, addr, pfn, pgprot, false);
+ }
+@@ -2982,17 +2999,19 @@ static vm_fault_t __vm_insert_mixed(struct vm_area_struct *vma,
+ 		unsigned long addr, unsigned long pfn, bool mkwrite)
+ {
+ 	pgprot_t pgprot = vma->vm_page_prot;
++	/* @pfn is MMUPAGE-granular under PGCL; pgpfn is PAGE-granular. */
++	unsigned long pgpfn = pfn >> PAGE_MMUSHIFT;
+ 	int err;
+ 
+-	if (!vm_mixed_ok(vma, pfn, mkwrite))
++	if (!vm_mixed_ok(vma, pgpfn, mkwrite))
+ 		return VM_FAULT_SIGBUS;
+ 
+ 	if (addr < vma->vm_start || addr >= vma->vm_end)
+ 		return VM_FAULT_SIGBUS;
+ 
+-	pfnmap_setup_cachemode_pfn(pfn, &pgprot);
++	pfnmap_setup_cachemode_pfn(pgpfn, &pgprot);
+ 
+-	if (!pfn_modify_allowed(pfn, pgprot))
++	if (!pfn_modify_allowed(pgpfn, pgprot))
+ 		return VM_FAULT_SIGBUS;
+ 
+ 	/*
+@@ -3002,15 +3021,20 @@ static vm_fault_t __vm_insert_mixed(struct vm_area_struct *vma,
+ 	 * than insert_pfn).  If a zero_pfn were inserted into a VM_MIXEDMAP
+ 	 * without pte special, it would there be refcounted as a normal page.
+ 	 */
+-	if (!IS_ENABLED(CONFIG_ARCH_HAS_PTE_SPECIAL) && pfn_valid(pfn)) {
++	if (!IS_ENABLED(CONFIG_ARCH_HAS_PTE_SPECIAL) && pfn_valid(pgpfn)) {
+ 		struct page *page;
+ 
+ 		/*
+ 		 * At this point we are committed to insert_page()
+ 		 * regardless of whether the caller specified flags that
+ 		 * result in pfn_t_has_page() == false.
++		 *
++		 * NB: this !ARCH_HAS_PTE_SPECIAL fallback maps a whole kernel
++		 * page (sub-page 0); it cannot honour a non-zero sub-page from
++		 * an MMUPAGE-granular @pfn.  All PGCL arches that drive
++		 * VM_MIXEDMAP with sub-page offsets select ARCH_HAS_PTE_SPECIAL.
+ 		 */
+-		page = pfn_to_page(pfn);
++		page = pfn_to_page(pgpfn);
+ 		err = insert_page(vma, addr, page, pgprot, mkwrite);
+ 	} else {
+ 		return insert_pfn(vma, addr, pfn, pgprot, mkwrite);
+-- 
+2.54.0
+

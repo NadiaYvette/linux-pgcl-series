@@ -1,0 +1,92 @@
+From d1e4f241346866773df522229e78c22516463e27 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 13 Mar 2026 13:15:15 +0100
+Subject: [PATCH 019/174] PGCL: fix vmalloc vmap_pte_range PTE stride for huge
+ PTE mappings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The vmap_pte_range loop was hardcoded to advance by one PTE (pte++) and
+one MMUPAGE_SIZE per iteration. When arch_vmap_pte_range_map_size returns
+a larger size (e.g. CONT_PTE_SIZE = 64KB on arm64), set_huge_pte_at maps
+multiple PTEs at once, but the loop only advanced by one — causing the
+next iteration to find an already-mapped PTE and BUG().
+
+Fix: advance pte and addr by size >> MMUPAGE_SHIFT entries, matching the
+upstream pattern of pte += PFN_DOWN(size) but using MMUPAGE granularity
+instead of PAGE granularity.
+
+Also fix arm64 vmalloc.h to return MMUPAGE_SIZE (not PAGE_SIZE) from
+arch_vmap_pte_range_map_size and arch_vmap_pte_range_unmap_size for the
+non-contiguous case, and use MMUPAGE_SHIFT in arch_vmap_pte_supported_shift.
+
+Boot tested: x86_64 (PAGE_MMUSHIFT=4), arm64 (PAGE_MMUSHIFT=0),
+riscv64 (PAGE_MMUSHIFT=0), arm32 (PAGE_MMUSHIFT=0), ppc64 (PAGE_MMUSHIFT=0)
+— all pass.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm64/include/asm/vmalloc.h | 12 ++++++------
+ mm/vmalloc.c                     |  2 +-
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/include/asm/vmalloc.h b/arch/arm64/include/asm/vmalloc.h
+index 4ec1acd3c1b3..27a19e293de5 100644
+--- a/arch/arm64/include/asm/vmalloc.h
++++ b/arch/arm64/include/asm/vmalloc.h
+@@ -29,16 +29,16 @@ static inline unsigned long arch_vmap_pte_range_map_size(unsigned long addr,
+ 	 * block using the PTE_CONT bit for more efficient use of the TLB.
+ 	 */
+ 	if (max_page_shift < CONT_PTE_SHIFT)
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	if (end - addr < CONT_PTE_SIZE)
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	if (!IS_ALIGNED(addr, CONT_PTE_SIZE))
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	if (!IS_ALIGNED(PFN_PHYS(pfn), CONT_PTE_SIZE))
+-		return PAGE_SIZE;
++		return MMUPAGE_SIZE;
+ 
+ 	return CONT_PTE_SIZE;
+ }
+@@ -51,7 +51,7 @@ static inline unsigned long arch_vmap_pte_range_unmap_size(unsigned long addr,
+ 	 * The caller handles alignment so it's sufficient just to check
+ 	 * PTE_CONT.
+ 	 */
+-	return pte_valid_cont(__ptep_get(ptep)) ? CONT_PTE_SIZE : PAGE_SIZE;
++	return pte_valid_cont(__ptep_get(ptep)) ? CONT_PTE_SIZE : MMUPAGE_SIZE;
+ }
+ 
+ #define arch_vmap_pte_supported_shift arch_vmap_pte_supported_shift
+@@ -60,7 +60,7 @@ static inline int arch_vmap_pte_supported_shift(unsigned long size)
+ 	if (size >= CONT_PTE_SIZE)
+ 		return CONT_PTE_SHIFT;
+ 
+-	return PAGE_SHIFT;
++	return MMUPAGE_SHIFT;
+ }
+ 
+ #endif
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 8b9a70c8f0a1..39c5a500ab51 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -150,7 +150,7 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
+ 			   pfn_pte(paddr >> PAGE_SHIFT, prot));
+ #endif
+ 		paddr += MMUPAGE_SIZE;
+-	} while (pte++, addr += MMUPAGE_SIZE, addr != end);
++	} while (pte += (size >> MMUPAGE_SHIFT), addr += size, addr != end);
+ 
+ 	lazy_mmu_mode_disable();
+ 	*mask |= PGTBL_PTE_MODIFIED;
+-- 
+2.54.0
+

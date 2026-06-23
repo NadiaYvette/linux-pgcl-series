@@ -1,0 +1,55 @@
+From 12241c4d059306c0d0dcb45e76690de1db63036b Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 17 Jun 2026 22:49:37 +0200
+Subject: [PATCH 158/174] mm: PGCL: scale total_swap_pages to MMUPAGE in
+ overcommit accounting
+
+vm_commit_limit() and __vm_enough_memory()'s OVERCOMMIT_GUESS check build
+their limit in MMUPAGE units -- totalram_pages() << PAGE_MMUSHIFT,
+sysctl_overcommit_kbytes >> (MMUPAGE_SHIFT - 10), and the request `pages`
+is MMUPAGE-granular -- but added total_swap_pages raw.  total_swap_pages
+counts swap slots, which under PGCL are PAGE (cluster) sized, so swap was
+under-counted by PAGE_MMUCOUNT (16x at PGCL=4, 64x at PGCL=6): e.g. the
+laptop's 80G of swap would be treated as 5G (pgcl4) / 1.25G (pgcl6) of
+overcommit headroom, spuriously denying mmap/brk under OVERCOMMIT_GUESS
+and lowering the OVERCOMMIT_NEVER limit.
+
+Scale total_swap_pages by << PAGE_MMUSHIFT at both sites.  Identity at
+PAGE_MMUSHIFT == 0.  Compile-verified mm/util.o at PGCL=6.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ mm/util.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/mm/util.c b/mm/util.c
+index 0cd11e262d32..d03ed9e1b539 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -911,7 +911,12 @@ unsigned long vm_commit_limit(void)
+ 		allowed = (((totalram_pages() - hugetlb_total_pages())
+ 			    << PAGE_MMUSHIFT)
+ 			   * sysctl_overcommit_ratio / 100);
+-	allowed += total_swap_pages;
++	/*
++	 * total_swap_pages counts swap slots, which are PAGE (cluster) sized;
++	 * the rest of this limit is in MMUPAGE units, so scale swap up too.
++	 * Identity at PAGE_MMUSHIFT == 0.
++	 */
++	allowed += total_swap_pages << PAGE_MMUSHIFT;
+ 
+ 	return allowed;
+ }
+@@ -971,7 +976,8 @@ int __vm_enough_memory(const struct mm_struct *mm, long pages, int cap_sys_admin
+ 		return 0;
+ 
+ 	if (sysctl_overcommit_memory == OVERCOMMIT_GUESS) {
+-		if (pages > (totalram_pages() << PAGE_MMUSHIFT) + total_swap_pages)
++		if (pages > (totalram_pages() << PAGE_MMUSHIFT) +
++			    (total_swap_pages << PAGE_MMUSHIFT))
+ 			goto error;
+ 		return 0;
+ 	}
+-- 
+2.54.0
+

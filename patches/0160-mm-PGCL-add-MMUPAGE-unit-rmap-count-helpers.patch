@@ -1,0 +1,116 @@
+From 5fcce15c7627d4b73e647b788cf6a8682cd0ad50 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 18 Jun 2026 06:28:02 +0200
+Subject: [PATCH 160/174] mm: PGCL add MMUPAGE-unit rmap count-helpers
+
+folio_{add,remove}_rmap_subptes(folio, page, count, vma): apply +/-count
+MMUPAGE sub-PTE mappings to a single kernel page (cluster) of a folio, the
+primitive for the MMUPAGE-uniform mapcount contract (anon and file alike).
+
+Mapcount counts hardware (MMUPAGE) PTEs: the cluster page's _mapcount and the
+folio _large_mapcount advance by count; _nr_pages_mapped (clusters with >=1
+sub-PTE) flips once via the page's own first/last transition (_mapcount ==
+-1), so straddling / non-cluster-aligned / partial clusters need no scan or
+anchoring -- the count simply accumulates on the real per-page counter across
+pte tables.  NR_{ANON,FILE}_MAPPED is MMUPAGE-granular, matching rss.
+
+Gated #if PAGE_MMUSHIFT (no effect at PGCL=0).  Callers (fault add, zap
+remove, fork, migrate, COW) convert in following commits; this commit only
+adds the unused-for-now primitives (compile-verified at pgcl6).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ include/linux/rmap.h |  7 ++++++
+ mm/rmap.c            | 57 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 1de461fd86d5..38c4cc998998 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -421,6 +421,13 @@ void folio_remove_rmap_ptes(struct folio *, struct page *, int nr_pages,
+ 		struct vm_area_struct *);
+ #define folio_remove_rmap_pte(folio, page, vma) \
+ 	folio_remove_rmap_ptes(folio, page, 1, vma)
++#if PAGE_MMUSHIFT
++/* PGCL: add/remove @count MMUPAGE sub-PTE mappings of ONE kernel page (cluster) */
++void folio_add_rmap_subptes(struct folio *, struct page *, int count,
++		struct vm_area_struct *);
++void folio_remove_rmap_subptes(struct folio *, struct page *, int count,
++		struct vm_area_struct *);
++#endif
+ void folio_remove_rmap_pmd(struct folio *, struct page *,
+ 		struct vm_area_struct *);
+ void folio_remove_rmap_pud(struct folio *, struct page *,
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 8d938a5f4554..edcafaf4efd6 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1804,6 +1804,63 @@ void folio_add_file_rmap_ptes(struct folio *folio, struct page *page,
+ 	__folio_add_file_rmap(folio, page, nr_pages, vma, PGTABLE_LEVEL_PTE);
+ }
+ 
++#if PAGE_MMUSHIFT
++/**
++ * folio_add_rmap_subptes - add @count MMUPAGE sub-PTE mappings of one kernel
++ *			    page (cluster) of @folio  [PGCL]
++ * @folio: the folio
++ * @page:  the kernel page (cluster) within @folio taking the sub-PTEs
++ * @count: number of MMUPAGE sub-PTEs being mapped (1..PAGE_MMUCOUNT)
++ * @vma:   the VM area the mappings are added to
++ *
++ * MMUPAGE-uniform mapcount contract (anon and file alike): mapcount counts
++ * hardware (MMUPAGE) PTEs.  @page's _mapcount and the folio _large_mapcount
++ * advance by @count; _nr_pages_mapped (kernel pages with >=1 sub-PTE) is bumped
++ * once, when @page takes its first sub-PTE (_mapcount -1 -> >=0).  The
++ * NR_{ANON,FILE}_MAPPED stat is MMUPAGE-granular, matching rss.  PTE level only
++ * (folios mapped at PTE level here are never PMD/entire-mapped, so the
++ * ENTIRELY_MAPPED interaction does not arise).
++ *
++ * The caller needs to hold the page table lock.
++ */
++void folio_add_rmap_subptes(struct folio *folio, struct page *page,
++		int count, struct vm_area_struct *vma)
++{
++	__folio_rmap_sanity_checks(folio, page, 1, PGTABLE_LEVEL_PTE);
++
++	if (!folio_test_large(folio)) {
++		atomic_add(count, &folio->_mapcount);
++	} else {
++		if (atomic_fetch_add(count, &page->_mapcount) == -1)
++			atomic_inc(&folio->_nr_pages_mapped);
++		folio_add_large_mapcount(folio, count, vma);
++	}
++	__folio_mod_stat(folio, count, 0);
++}
++
++/**
++ * folio_remove_rmap_subptes - remove @count MMUPAGE sub-PTE mappings of one
++ *			       kernel page (cluster) of @folio  [PGCL]
++ *
++ * Symmetric inverse of folio_add_rmap_subptes(); _nr_pages_mapped is
++ * decremented once, when @page loses its last sub-PTE (_mapcount -> -1).
++ */
++void folio_remove_rmap_subptes(struct folio *folio, struct page *page,
++		int count, struct vm_area_struct *vma)
++{
++	__folio_rmap_sanity_checks(folio, page, 1, PGTABLE_LEVEL_PTE);
++
++	if (!folio_test_large(folio)) {
++		atomic_sub(count, &folio->_mapcount);
++	} else {
++		folio_sub_large_mapcount(folio, count, vma);
++		if (atomic_sub_return(count, &page->_mapcount) == -1)
++			atomic_dec(&folio->_nr_pages_mapped);
++	}
++	__folio_mod_stat(folio, -count, 0);
++}
++#endif /* PAGE_MMUSHIFT */
++
+ /**
+  * folio_add_file_rmap_pmd - add a PMD mapping to a page range of a folio
+  * @folio:	The folio to add the mapping to
+-- 
+2.54.0
+

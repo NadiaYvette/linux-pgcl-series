@@ -1,0 +1,56 @@
+From 123c948942e08bebca338e1b7dd481f43bca9fa2 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 22 Mar 2026 14:06:23 +0100
+Subject: [PATCH 037/174] PGCL: mips initrd alignment and memory boundary fixes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two fixes in arch/mips/kernel/setup.c for PGCL:
+
+1. initrd_start alignment check: PAGE_MASK → MMUPAGE_MASK
+   QEMU firmware aligns initrd to hardware page size (4KB), not
+   kernel page size. With PGCL PAGE_SIZE=64KB, the PAGE_MASK check
+   wrongly rejects properly-aligned initrds.
+
+2. initrd end-of-memory check: PFN_PHYS(max_low_pfn) → memblock_end_of_DRAM()
+   With PGCL, max_low_pfn is in 64KB kernel pages, so PFN_PHYS
+   truncates to 64KB boundaries. MIPS reserves 256KB at the top of
+   RAM, and QEMU places the initrd in the gap between the last kernel
+   page boundary and the actual memory end. Using memblock_end_of_DRAM()
+   checks against the real physical memory extent.
+
+MIPS64 (Malta) boots to userspace with PAGE_MMUSHIFT=4. TLB refill
+uasm field overflow warnings are non-fatal (truncated andi immediates
+work because high bits are already zero for valid addresses).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/mips/kernel/setup.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/mips/kernel/setup.c b/arch/mips/kernel/setup.c
+index 1ae6d0c0e1d6..b9cbc0ed0267 100644
+--- a/arch/mips/kernel/setup.c
++++ b/arch/mips/kernel/setup.c
+@@ -154,7 +154,7 @@ static unsigned long __init init_initrd(void)
+ 	if (!initrd_start || initrd_end <= initrd_start)
+ 		goto disable;
+ 
+-	if (initrd_start & ~PAGE_MASK) {
++	if (initrd_start & ~MMUPAGE_MASK) {
+ 		pr_err("initrd start must be page aligned\n");
+ 		goto disable;
+ 	}
+@@ -220,7 +220,7 @@ static void __init finalize_initrd(void)
+ 		printk(KERN_INFO "Initrd not found or empty");
+ 		goto disable;
+ 	}
+-	if (__pa(initrd_end) > PFN_PHYS(max_low_pfn)) {
++	if (__pa(initrd_end) > memblock_end_of_DRAM()) {
+ 		printk(KERN_ERR "Initrd extends beyond end of memory");
+ 		goto disable;
+ 	}
+-- 
+2.54.0
+

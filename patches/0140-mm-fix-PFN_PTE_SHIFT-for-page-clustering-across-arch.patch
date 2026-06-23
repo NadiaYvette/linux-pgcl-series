@@ -1,0 +1,155 @@
+From bc4559989b382d0fd959dd46bb14f3d0a01fe20d Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 11 Jun 2026 12:33:13 +0200
+Subject: [PATCH 140/174] mm: fix PFN_PTE_SHIFT for page clustering across
+ arches
+
+Several arches define PFN_PTE_SHIFT as PAGE_SHIFT (or PAGE_SHIFT-relative), assuming the PTE PFN field sits at the kernel page shift.  Under page clustering the hardware PTE field stays at MMUPAGE granularity while PAGE_SHIFT grows, so the unmasked stride in pte_advance_pfn() (used by set_ptes()/folio_pte_batch()) runs PAGE_MMUCOUNT times too far -- benign on small memory (it just disables batching) but a reserved-bit fault once it overflows the physical-address width on large memory.  Convert the affected arches to MMUPAGE_SHIFT (sparc32: MMUPAGE_SHIFT - 4, matching its SRMMU PPN position).  Arches with a fixed-position PFN_PTE_SHIFT (alpha, riscv, parisc, m68k/sun3), already-MMUPAGE-relative ones (s390, mips, loongarch), and arm64 (own MMUPAGE pte_advance_pfn) are unaffected.  powerpc is left for a separate change since its PFN_PTE_SHIFT aliases PTE_RPN_SHIFT.  Identity when PAGE_MMUSHIFT == 0.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/arc/include/asm/pgtable-levels.h    | 2 +-
+ arch/arm/include/asm/pgtable.h           | 2 +-
+ arch/csky/include/asm/pgtable.h          | 2 +-
+ arch/m68k/include/asm/mcf_pgtable.h      | 2 +-
+ arch/m68k/include/asm/motorola_pgtable.h | 2 +-
+ arch/microblaze/include/asm/pgtable.h    | 2 +-
+ arch/sh/include/asm/pgtable_32.h         | 2 +-
+ arch/sparc/include/asm/pgtable_32.h      | 2 +-
+ arch/sparc/include/asm/pgtable_64.h      | 2 +-
+ arch/xtensa/include/asm/pgtable.h        | 2 +-
+ 10 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/arch/arc/include/asm/pgtable-levels.h b/arch/arc/include/asm/pgtable-levels.h
+index c8f9273372c0..9123adcc7b83 100644
+--- a/arch/arc/include/asm/pgtable-levels.h
++++ b/arch/arc/include/asm/pgtable-levels.h
+@@ -168,7 +168,7 @@
+ #define pte_ERROR(e) \
+ 	pr_crit("%s:%d: bad pte %08lx.\n", __FILE__, __LINE__, pte_val(e))
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ #define pte_none(x)		(!pte_val(x))
+ #define pte_present(x)		(pte_val(x) & _PAGE_PRESENT)
+ #define pte_clear(mm,addr,ptep)	set_pte_at(mm, addr, ptep, __pte(0))
+diff --git a/arch/arm/include/asm/pgtable.h b/arch/arm/include/asm/pgtable.h
+index 1da094e7380a..deacdf536205 100644
+--- a/arch/arm/include/asm/pgtable.h
++++ b/arch/arm/include/asm/pgtable.h
+@@ -204,7 +204,7 @@ static inline void __sync_icache_dcache(pte_t pteval)
+ extern void __sync_icache_dcache(pte_t pteval);
+ #endif
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ 
+ void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		      pte_t *ptep, pte_t pteval, unsigned int nr);
+diff --git a/arch/csky/include/asm/pgtable.h b/arch/csky/include/asm/pgtable.h
+index bafcd5823531..045b312824f7 100644
+--- a/arch/csky/include/asm/pgtable.h
++++ b/arch/csky/include/asm/pgtable.h
+@@ -28,7 +28,7 @@
+ #define pgd_ERROR(e) \
+ 	pr_err("%s:%d: bad pgd %08lx.\n", __FILE__, __LINE__, pgd_val(e))
+ 
+-#define PFN_PTE_SHIFT	PAGE_SHIFT
++#define PFN_PTE_SHIFT	MMUPAGE_SHIFT
+ #define pmd_pfn(pmd)	(pmd_phys(pmd) >> PAGE_SHIFT)
+ #define pmd_page(pmd)	(pfn_to_page(pmd_phys(pmd) >> PAGE_SHIFT))
+ #define pte_clear(mm, addr, ptep)	set_pte((ptep), \
+diff --git a/arch/m68k/include/asm/mcf_pgtable.h b/arch/m68k/include/asm/mcf_pgtable.h
+index 189bb7b1e663..8757979ce663 100644
+--- a/arch/m68k/include/asm/mcf_pgtable.h
++++ b/arch/m68k/include/asm/mcf_pgtable.h
+@@ -285,7 +285,7 @@ static inline pte_t pte_swp_clear_exclusive(pte_t pte)
+ 	return pte;
+ }
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ #define pmd_pfn(pmd)		(pmd_val(pmd) >> PAGE_SHIFT)
+ #define pmd_page(pmd)		(pfn_to_page(pmd_val(pmd) >> PAGE_SHIFT))
+ 
+diff --git a/arch/m68k/include/asm/motorola_pgtable.h b/arch/m68k/include/asm/motorola_pgtable.h
+index 78bdc6036f7a..6b3f0055193d 100644
+--- a/arch/m68k/include/asm/motorola_pgtable.h
++++ b/arch/m68k/include/asm/motorola_pgtable.h
+@@ -106,7 +106,7 @@ static inline void pud_set(pud_t *pudp, pmd_t *pmdp)
+ #define pte_present(pte)	(pte_val(pte) & (_PAGE_PRESENT | _PAGE_PROTNONE))
+ #define pte_clear(mm,addr,ptep)		({ pte_val(*(ptep)) = 0; })
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ #define pte_page(pte)		virt_to_page(__va(pte_val(pte)))
+ #define pte_pfn(pte)		(pte_val(pte) >> PAGE_SHIFT)
+ #define pfn_pte(pfn, prot)	__pte(((pfn) << PAGE_SHIFT) | pgprot_val(prot))
+diff --git a/arch/microblaze/include/asm/pgtable.h b/arch/microblaze/include/asm/pgtable.h
+index b476270d8fdc..d72c639e7d76 100644
+--- a/arch/microblaze/include/asm/pgtable.h
++++ b/arch/microblaze/include/asm/pgtable.h
+@@ -224,7 +224,7 @@ extern pte_t *va_to_pte(unsigned long address);
+  */
+ #define pte_page(x)		(mem_map + (unsigned long) \
+ 				(((pte_val(x) & MMUPAGE_MASK) - memory_start) >> PAGE_SHIFT))
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ 
+ #define pte_pfn(x)		(pte_val(x) >> PFN_PTE_SHIFT)
+ 
+diff --git a/arch/sh/include/asm/pgtable_32.h b/arch/sh/include/asm/pgtable_32.h
+index 5f51af18997b..b2c0e15f53f3 100644
+--- a/arch/sh/include/asm/pgtable_32.h
++++ b/arch/sh/include/asm/pgtable_32.h
+@@ -313,7 +313,7 @@ static inline void set_pte(pte_t *ptep, pte_t pte)
+  */
+ #define set_pmd(pmdptr, pmdval) (*(pmdptr) = pmdval)
+ 
+-#define PFN_PTE_SHIFT	PAGE_SHIFT
++#define PFN_PTE_SHIFT	MMUPAGE_SHIFT
+ #define pfn_pte(pfn, prot) \
+ 	__pte(((unsigned long long)(pfn) << PAGE_SHIFT) | pgprot_val(prot))
+ #define pfn_pmd(pfn, prot) \
+diff --git a/arch/sparc/include/asm/pgtable_32.h b/arch/sparc/include/asm/pgtable_32.h
+index f89b1250661d..1baff25d41fb 100644
+--- a/arch/sparc/include/asm/pgtable_32.h
++++ b/arch/sparc/include/asm/pgtable_32.h
+@@ -246,7 +246,7 @@ static inline pte_t pte_mkyoung(pte_t pte)
+ 	return __pte(pte_val(pte) | SRMMU_REF);
+ }
+ 
+-#define PFN_PTE_SHIFT			(PAGE_SHIFT - 4)
++#define PFN_PTE_SHIFT			(MMUPAGE_SHIFT - 4)
+ 
+ static inline pte_t pfn_pte(unsigned long pfn, pgprot_t pgprot)
+ {
+diff --git a/arch/sparc/include/asm/pgtable_64.h b/arch/sparc/include/asm/pgtable_64.h
+index 35f899c2af94..0198a5d98a09 100644
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@ -929,7 +929,7 @@ static inline void __set_pte_at(struct mm_struct *mm, unsigned long addr,
+ 	maybe_tlb_batch_add(mm, addr, ptep, orig, fullmm, MMUPAGE_SHIFT);
+ }
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ 
+ static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
+ 		pte_t *ptep, pte_t pte, unsigned int nr)
+diff --git a/arch/xtensa/include/asm/pgtable.h b/arch/xtensa/include/asm/pgtable.h
+index f00a879dc298..f1bce79208d0 100644
+--- a/arch/xtensa/include/asm/pgtable.h
++++ b/arch/xtensa/include/asm/pgtable.h
+@@ -264,7 +264,7 @@ static inline pte_t pte_mkwrite_novma(pte_t pte)
+ 		((__pgprot((pgprot_val(prot) & ~_PAGE_CA_MASK) | \
+ 			   _PAGE_CA_BYPASS)))
+ 
+-#define PFN_PTE_SHIFT		PAGE_SHIFT
++#define PFN_PTE_SHIFT		MMUPAGE_SHIFT
+ #define pte_pfn(pte)		(pte_val(pte) >> PAGE_SHIFT)
+ #define pte_same(a,b)		(pte_val(a) == pte_val(b))
+ #define pte_page(x)		pfn_to_page(pte_pfn(x))
+-- 
+2.54.0
+

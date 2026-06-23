@@ -1,0 +1,148 @@
+From f0365355d3b2ae8447bb525812dde7b52e28c84b Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Mon, 11 May 2026 16:33:28 +0200
+Subject: [PATCH 108/174] mips: shm_align_mask is hardware-cache, not
+ kernel-page, granularity
+
+shm_align_mask defines the cache-aliasing constraint for shared
+mappings and shm segments.  On MIPS that is the hardware dcache way
+size (probed in c-r4k.c, set explicitly on Octeon) -- it has nothing to
+do with the kernel PAGE_SIZE.  Pre-PGCL these happened to coincide
+because PAGE_SIZE == hardware page; under PGCL with PAGE_MMUSHIFT>0
+they diverge.
+
+Three concrete symptoms at PAGE_MMUSHIFT=4 (PAGE_SIZE=64KB, MMUPAGE=4KB):
+
+  - arch_get_unmapped_area_common() MAP_FIXED+MAP_SHARED check at the
+    top of the function compares (addr - pgoff*PAGE_SIZE) & mask, with
+    mask = PAGE_SIZE-1 = 0xFFFF.  An MMUPAGE-aligned hint such as
+    addr1+4KB (where addr1 is a 64KB-aligned mmap return) trips the
+    check and returns EINVAL.  LTP mmap04 hits this on every iteration.
+
+  - LTP mremap06 (bug reproducer for upstream 7e7757876f25) and LTP
+    mlockall03 fail in the same way, since both pin file mappings at
+    MMUPAGE granularity.
+
+  - The pgoff<<PAGE_SHIFT colour-alignment offsets misalign the
+    vm_unmapped_area search by PAGE_MMUCOUNT, leaking sub-page bits and
+    further breaking get_unmapped_area at MMUPAGE granularity.
+
+Mirror loongarch64's PGCL-correct mmap.c: switch pgoff shifts to
+MMUPAGE_SHIFT, address-alignment masks to MMUPAGE_MASK, low_limit to
+MMUPAGE_SIZE, and the "sane caches" default of shm_align_mask to
+MMUPAGE_SIZE-1.  c-r4k.c and c-octeon.c initialise shm_align_mask after
+probing the dcache, so update their fallbacks to match.
+
+Test results (mips64 malta -m 2G, init=autotest LTP mm):
+  before:  PGCL=4  65p / 6f / 30s  (mmap04, mremap06, mlockall03 +
+                                    three intermittent infra fails)
+  after:   PGCL=4  67p / 3f / 31s  (only intermittent "applet not
+                                    found" busybox-infra noise; varies
+                                    per run, not deterministic)
+  mainline (PGCL=0):       73p / 1f / 27s
+
+The remaining mips64 PGCL=6 gap (51p / 24f under 2G Malta) is a
+separate, memory-pressure issue: 256KB kernel pages cause page-table
+allocations to consume 35% of physical RAM, leading to fork-heavy LTP
+tests OOM-cascading.  Malta caps at -m 2G, so PGCL=6 LTP on mips64
+needs a higher-memory machine (e.g. loongson3-virt with an LE
+userspace) for clean validation.  Not addressed here.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ arch/mips/mm/c-octeon.c |  2 +-
+ arch/mips/mm/c-r4k.c    |  8 ++++----
+ arch/mips/mm/mmap.c     | 20 +++++++++++++-------
+ 3 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/arch/mips/mm/c-octeon.c b/arch/mips/mm/c-octeon.c
+index b7393b61cfa7..52ad59397e08 100644
+--- a/arch/mips/mm/c-octeon.c
++++ b/arch/mips/mm/c-octeon.c
+@@ -267,7 +267,7 @@ void octeon_cache_init(void)
+ {
+ 	probe_octeon();
+ 
+-	shm_align_mask = PAGE_SIZE - 1;
++	shm_align_mask = MMUPAGE_SIZE - 1;
+ 
+ 	flush_cache_all			= octeon_flush_icache_all;
+ 	__flush_cache_all		= octeon_flush_icache_all;
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index 8ef65c7a569c..838124ac11b6 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -1724,11 +1724,11 @@ void r4k_cache_init(void)
+ 	 * unnecessarily inefficient on physically indexed processors.
+ 	 */
+ 	if (c->dcache.linesz && cpu_has_dc_aliases)
+-		shm_align_mask = max_t( unsigned long,
+-					c->dcache.sets * c->dcache.linesz - 1,
+-					PAGE_SIZE - 1);
++		shm_align_mask = max_t(unsigned long,
++				       c->dcache.sets * c->dcache.linesz - 1,
++				       MMUPAGE_SIZE - 1);
+ 	else
+-		shm_align_mask = PAGE_SIZE-1;
++		shm_align_mask = MMUPAGE_SIZE - 1;
+ 
+ 	__flush_cache_vmap	= r4k__flush_cache_vmap;
+ 	__flush_cache_vunmap	= r4k__flush_cache_vunmap;
+diff --git a/arch/mips/mm/mmap.c b/arch/mips/mm/mmap.c
+index 5d2a1225785b..0b39d71edb91 100644
+--- a/arch/mips/mm/mmap.c
++++ b/arch/mips/mm/mmap.c
+@@ -17,12 +17,18 @@
+ #include <linux/sched/signal.h>
+ #include <linux/sched/mm.h>
+ 
+-unsigned long shm_align_mask = PAGE_SIZE - 1;	/* Sane caches */
++/*
++ * Cache-aliasing constraint mask.  Reflects hardware dcache way size, not
++ * the kernel PAGE_SIZE (which under PGCL may be many times larger than the
++ * MMU page).  Initialised to MMUPAGE_SIZE-1 ("sane caches"); c-r4k.c and
++ * c-octeon.c bump it to max(dcache.waybit, MMUPAGE_SIZE-1) on init.
++ */
++unsigned long shm_align_mask = MMUPAGE_SIZE - 1;	/* Sane caches */
+ EXPORT_SYMBOL(shm_align_mask);
+ 
+ #define COLOUR_ALIGN(addr, pgoff)				\
+ 	((((addr) + shm_align_mask) & ~shm_align_mask) +	\
+-	 (((pgoff) << PAGE_SHIFT) & shm_align_mask))
++	 (((pgoff) << MMUPAGE_SHIFT) & shm_align_mask))
+ 
+ enum mmap_allocation_direction {UP, DOWN};
+ 
+@@ -49,7 +55,7 @@ static unsigned long arch_get_unmapped_area_common(struct file *filp,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if ((flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & shm_align_mask))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & shm_align_mask))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -72,16 +78,16 @@ static unsigned long arch_get_unmapped_area_common(struct file *filp,
+ 	}
+ 
+ 	info.length = len;
+-	info.align_mask = do_color_align ? (PAGE_MASK & shm_align_mask) : 0;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_mask = do_color_align ? (MMUPAGE_MASK & shm_align_mask) : 0;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 
+ 	if (dir == DOWN) {
+ 		info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+-		info.low_limit = PAGE_SIZE;
++		info.low_limit = MMUPAGE_SIZE;
+ 		info.high_limit = mm->mmap_base;
+ 		addr = vm_unmapped_area(&info);
+ 
+-		if (!(addr & ~PAGE_MASK))
++		if (!(addr & ~MMUPAGE_MASK))
+ 			return addr;
+ 
+ 		/*
+-- 
+2.54.0
+

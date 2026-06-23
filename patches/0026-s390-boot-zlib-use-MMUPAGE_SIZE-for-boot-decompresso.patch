@@ -1,0 +1,55 @@
+From 180697a64175997c989fbf6090d83300552914c8 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 17 Mar 2026 18:36:52 +0100
+Subject: [PATCH 026/174] s390/boot, zlib: use MMUPAGE_SIZE for boot
+ decompressor workspace
+
+The s390 boot decompressor has a limited heap (BOOT_HEAP_SIZE). With
+PGCL (PAGE_MMUSHIFT>0), PAGE_SIZE grows beyond the hardware page size,
+causing two problems:
+
+1. lib/zlib_inflate/infutil.h: The DFLTCC working_window uses PAGE_SIZE
+   for alignment padding, inflating struct inflate_workspace beyond what
+   the boot heap can allocate.
+
+2. arch/s390/boot/decompressor.c: mem_safe_offset() aligns to PAGE_SIZE,
+   wasting boot heap address space.
+
+Both should use MMUPAGE_SIZE since these operate on hardware-page-sized
+structures during early boot.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/s390/boot/decompressor.c | 2 +-
+ lib/zlib_inflate/infutil.h    | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/s390/boot/decompressor.c b/arch/s390/boot/decompressor.c
+index 8d1bc25a6bf4..3e98884b154e 100644
+--- a/arch/s390/boot/decompressor.c
++++ b/arch/s390/boot/decompressor.c
+@@ -73,7 +73,7 @@ static void decompress_error(char *m)
+ 
+ unsigned long mem_safe_offset(void)
+ {
+-	return ALIGN(free_mem_end_ptr, PAGE_SIZE);
++	return ALIGN(free_mem_end_ptr, MMUPAGE_SIZE);
+ }
+ 
+ void deploy_kernel(void *output)
+diff --git a/lib/zlib_inflate/infutil.h b/lib/zlib_inflate/infutil.h
+index 784ab33b7842..f053e213411d 100644
+--- a/lib/zlib_inflate/infutil.h
++++ b/lib/zlib_inflate/infutil.h
+@@ -23,7 +23,7 @@ struct inflate_workspace {
+ 	struct inflate_state inflate_state;
+ #ifdef CONFIG_ZLIB_DFLTCC
+ 	struct dfltcc_state dfltcc_state;
+-	unsigned char working_window[(1 << MAX_WBITS) + PAGE_SIZE];
++	unsigned char working_window[(1 << MAX_WBITS) + MMUPAGE_SIZE];
+ #else
+ 	unsigned char working_window[(1 << MAX_WBITS)];
+ #endif
+-- 
+2.54.0
+

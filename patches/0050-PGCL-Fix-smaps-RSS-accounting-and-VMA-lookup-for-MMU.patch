@@ -1,0 +1,109 @@
+From 2c6c682fb0519830a7fa54bf919ccda7d75acfd1 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 26 Mar 2026 18:09:36 +0100
+Subject: [PATCH 050/174] PGCL: Fix smaps RSS accounting and VMA lookup for
+ MMUSHIFT>0
+
+Three related fixes for PGCL page clustering:
+
+1. fs/proc/task_mmu.c: smaps_account() used PAGE_SIZE for PTE-level
+   entries, overcounting RSS by PAGE_MMUCOUNT (16x with MMUSHIFT=4).
+   Each PTE maps MMUPAGE_SIZE of virtual address space, so use
+   MMUPAGE_SIZE for non-compound entries. Fixes mlock2-tests basic
+   lock checks (RSS == Size comparison) and corrects Rss/Pss/
+   Private/Shared fields in /proc/self/smaps.
+
+2. mm/hugetlb.c: vma_mmu_pagesize() returned PAGE_SIZE (64KB) for
+   non-hugetlb VMAs. The MMU hardware page size is MMUPAGE_SIZE
+   (4KB). Return MMUPAGE_SIZE for non-hugetlb VMAs so smaps
+   MMUPageSize field is correct.
+
+3. tools/testing/selftests/mm/vm_util.c: __get_smap_entry() searched
+   for VMA start == addr. With PGCL, adjacent anonymous mappings with
+   identical flags merge more aggressively (mmap allocator places
+   consecutive allocations contiguously). The merged VMA's start
+   address differs from the test's mmap return value. Fix by searching
+   for a VMA containing the target address (start <= addr < end).
+   Fixes guard-regions smaps test and madv_populate VmFlags lookups.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ fs/proc/task_mmu.c                   |  7 ++++++-
+ mm/vma.c                             |  5 ++++-
+ tools/testing/selftests/mm/vm_util.c | 21 +++++++++++++--------
+ 3 files changed, 23 insertions(+), 10 deletions(-)
+
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 01deb4997fb2..82ff6a68b1b4 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -919,7 +919,12 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
+ {
+ 	struct folio *folio = page_folio(page);
+ 	int i, nr = compound ? compound_nr(page) : 1;
+-	unsigned long size = nr * PAGE_SIZE;
++	/*
++	 * For PTE-level entries (compound=false), each call represents one
++	 * MMUPAGE of virtual address space.  For PMD-level entries
++	 * (compound=true), nr is in kernel pages.
++	 */
++	unsigned long size = compound ? nr * PAGE_SIZE : MMUPAGE_SIZE;
+ 	bool exclusive;
+ 	int mapcount;
+ 
+diff --git a/mm/vma.c b/mm/vma.c
+index e7b6efcfc850..b946ac8bbe72 100644
+--- a/mm/vma.c
++++ b/mm/vma.c
+@@ -3349,5 +3349,8 @@ int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+  */
+ __weak unsigned long vma_mmu_pagesize(struct vm_area_struct *vma)
+ {
+-	return vma_kernel_pagesize(vma);
++	/* For hugetlb, delegate to kernel pagesize; otherwise MMUPAGE_SIZE */
++	if (is_vm_hugetlb_page(vma))
++		return vma_kernel_pagesize(vma);
++	return MMUPAGE_SIZE;
+ }
+diff --git a/tools/testing/selftests/mm/vm_util.c b/tools/testing/selftests/mm/vm_util.c
+index db94564f4431..7946c761fcfb 100644
+--- a/tools/testing/selftests/mm/vm_util.c
++++ b/tools/testing/selftests/mm/vm_util.c
+@@ -197,21 +197,26 @@ unsigned long rss_anon(void)
+ 
+ char *__get_smap_entry(void *addr, const char *pattern, char *buf, size_t len)
+ {
+-	int ret;
+ 	FILE *fp;
+ 	char *entry = NULL;
+-	char addr_pattern[MAX_LINE_LENGTH];
+-
+-	ret = snprintf(addr_pattern, MAX_LINE_LENGTH, "%08lx-",
+-		       (unsigned long) addr);
+-	if (ret >= MAX_LINE_LENGTH)
+-		ksft_exit_fail_msg("%s: Pattern is too long\n", __func__);
++	unsigned long target = (unsigned long)addr;
+ 
+ 	fp = fopen(SMAP_FILE_PATH, "r");
+ 	if (!fp)
+ 		ksft_exit_fail_msg("%s: Failed to open file %s\n", __func__, SMAP_FILE_PATH);
+ 
+-	if (!check_for_pattern(fp, addr_pattern, buf, len))
++	/*
++	 * Find the VMA containing addr. Adjacent anonymous mappings with
++	 * the same flags get merged, so addr may not be the VMA start.
++	 */
++	while (fgets(buf, len, fp)) {
++		unsigned long vma_start, vma_end;
++
++		if (sscanf(buf, "%lx-%lx", &vma_start, &vma_end) == 2 &&
++		    target >= vma_start && target < vma_end)
++			break;
++	}
++	if (feof(fp))
+ 		goto err_out;
+ 
+ 	/* Fetch the pattern in the same block */
+-- 
+2.54.0
+

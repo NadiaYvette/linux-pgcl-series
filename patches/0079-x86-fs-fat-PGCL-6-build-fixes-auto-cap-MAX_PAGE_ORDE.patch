@@ -1,0 +1,218 @@
+From 52e09a22bcbcc7d0a7b20f22a8b154262ffed988 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 1 May 2026 01:59:16 +0200
+Subject: [PATCH 079/174] =?UTF-8?q?x86,=20fs/fat:=20PGCL=3D6=20build=20fix?=
+ =?UTF-8?q?es=20=E2=80=94=20auto-cap=20MAX=5FPAGE=5FORDER,=20heap=20bhs[]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two build failures showed up when widening PAGE_SIZE to 2^18 (PGCL
+PAGE_MMUSHIFT=6 on x86_64) — both are upstream-style scaling
+assumptions that finally bite at the larger page size, not PGCL bugs
+per se.
+
+arch/x86/Kconfig
+================
+
+Add `config ARCH_FORCE_MAX_ORDER` with a default that scales down as
+PAGE_MMUSHIFT grows.  Without this, mmzone.h's invariant
+  MAX_PAGE_ORDER + PAGE_SHIFT <= SECTION_SIZE_BITS
+fires at compile time:
+  include/linux/mmzone.h:1964:2: error: #error Allocator MAX_PAGE_ORDER exceeds SECTION_SIZE
+because SECTION_SIZE_BITS=27 on x86_64 and PAGE_SHIFT becomes 18 at
+PGCL=6, leaving only 9 bits of room while the upstream default for
+MAX_PAGE_ORDER is 10.
+
+Other arches that hit this scaling cap (arm64, powerpc, sparc, …)
+already define their own `config ARCH_FORCE_MAX_ORDER` with
+appropriate defaults; x86 didn't because base PAGE_SIZE is fixed at
+4 KiB.  Use a four-way default ladder so PGCL=0/2/4/6 all build.
+
+fs/fat/dir.c, fs/fat/fatent.c
+=============================
+
+`fat_alloc_new_dir`, `fat_add_new_entries`, `fat_alloc_clusters`,
+`fat_free_clusters` declare `struct buffer_head *bhs[MAX_BUF_PER_PAGE]`
+on the stack.  `MAX_BUF_PER_PAGE = PAGE_SIZE / 512` scales linearly
+with PAGE_SIZE: at 4 KiB it's 8 entries (64 bytes), at 256 KiB it's
+512 entries (4096 bytes), which exceeds the kernel's 2 KiB
+-Wframe-larger-than budget and fails the build.
+
+Heap-allocate via kmalloc_array() in each of the four functions and
+kfree() on every return path.  Functionally identical at any
+PAGE_SIZE; only the storage location differs.
+---
+ arch/x86/Kconfig | 14 ++++++++++++++
+ fs/fat/dir.c     | 25 +++++++++++++++++++++++--
+ fs/fat/fatent.c  | 22 ++++++++++++++++++++--
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index f3f7cb01d69d..f4fbe8de5c6b 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1575,6 +1575,20 @@ config ARCH_SPARSEMEM_ENABLE
+ config ARCH_SPARSEMEM_DEFAULT
+ 	def_bool X86_64 || (NUMA && X86_32)
+ 
++# x86 has no notion of multiple base page sizes, but PGCL widens
++# PAGE_SIZE by 2**PAGE_MMUSHIFT.  The mmzone.h invariant
++# MAX_PAGE_ORDER + PAGE_SHIFT <= SECTION_SIZE_BITS (=27 on x86_64,
++# =29/26 on x86_32) breaks at the upstream default of 10 once
++# PAGE_MMUSHIFT reaches 4 on x86_32-PAE / 6 on x86_64.  Provide a
++# default that scales down so the buddy allocator fits within the
++# section.
++config ARCH_FORCE_MAX_ORDER
++	int
++	default 4 if PAGE_MMUSHIFT >= 6
++	default 6 if PAGE_MMUSHIFT >= 4
++	default 8 if PAGE_MMUSHIFT >= 2
++	default 10
++
+ config ARCH_SELECT_MEMORY_MODEL
+ 	def_bool y
+ 	depends on ARCH_SPARSEMEM_ENABLE && ARCH_FLATMEM_ENABLE
+diff --git a/fs/fat/dir.c b/fs/fat/dir.c
+index 4f6f42f33613..fc6d3d4060be 100644
+--- a/fs/fat/dir.c
++++ b/fs/fat/dir.c
+@@ -1149,13 +1149,22 @@ int fat_alloc_new_dir(struct inode *dir, struct timespec64 *ts)
+ {
+ 	struct super_block *sb = dir->i_sb;
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+-	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	struct buffer_head **bhs;
+ 	struct msdos_dir_entry *de;
+ 	sector_t blknr;
+ 	__le16 date, time;
+ 	u8 time_cs;
+ 	int err, cluster;
+ 
++	/*
++	 * MAX_BUF_PER_PAGE scales with PAGE_SIZE (PAGE_SIZE / 512), so
++	 * a stack array can blow the 2 KiB frame budget under PGCL with
++	 * PAGE_MMUSHIFT >= 4.  Heap-allocate instead.
++	 */
++	bhs = kmalloc_array(MAX_BUF_PER_PAGE, sizeof(*bhs), GFP_KERNEL);
++	if (!bhs)
++		return -ENOMEM;
++
+ 	err = fat_alloc_clusters(dir, &cluster, 1);
+ 	if (err)
+ 		goto error;
+@@ -1201,11 +1210,13 @@ int fat_alloc_new_dir(struct inode *dir, struct timespec64 *ts)
+ 	if (err)
+ 		goto error_free;
+ 
++	kfree(bhs);
+ 	return cluster;
+ 
+ error_free:
+ 	fat_free_clusters(dir, cluster);
+ error:
++	kfree(bhs);
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(fat_alloc_new_dir);
+@@ -1216,11 +1227,19 @@ static int fat_add_new_entries(struct inode *dir, void *slots, int nr_slots,
+ {
+ 	struct super_block *sb = dir->i_sb;
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+-	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	struct buffer_head **bhs;
+ 	sector_t blknr, start_blknr, last_blknr;
+ 	unsigned long size, copy;
+ 	int err, i, n, offset, cluster[2];
+ 
++	/*
++	 * MAX_BUF_PER_PAGE scales with PAGE_SIZE; heap-allocate to avoid
++	 * blowing the 2 KiB stack frame budget under PGCL.
++	 */
++	bhs = kmalloc_array(MAX_BUF_PER_PAGE, sizeof(*bhs), GFP_KERNEL);
++	if (!bhs)
++		return -ENOMEM;
++
+ 	/*
+ 	 * The minimum cluster size is 512bytes, and maximum entry
+ 	 * size is 32*slots (672bytes).  So, iff the cluster size is
+@@ -1279,6 +1298,7 @@ static int fat_add_new_entries(struct inode *dir, void *slots, int nr_slots,
+ 	if (err)
+ 		goto error_free;
+ 
++	kfree(bhs);
+ 	return cluster[0];
+ 
+ error_free:
+@@ -1290,6 +1310,7 @@ static int fat_add_new_entries(struct inode *dir, void *slots, int nr_slots,
+ 		bforget(bhs[i]);
+ 	fat_free_clusters(dir, cluster[0]);
+ error:
++	kfree(bhs);
+ 	return err;
+ }
+ 
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index f0801d99dd62..a75fe3af9b8d 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -474,11 +474,19 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent, prev_ent;
+-	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	struct buffer_head **bhs;
+ 	int i, count, err, nr_bhs, idx_clus;
+ 
+ 	BUG_ON(nr_cluster > (MAX_BUF_PER_PAGE / 2));	/* fixed limit */
+ 
++	/*
++	 * MAX_BUF_PER_PAGE scales with PAGE_SIZE; heap-allocate to avoid
++	 * blowing the 2 KiB stack frame budget under PGCL.
++	 */
++	bhs = kmalloc_array(MAX_BUF_PER_PAGE, sizeof(*bhs), GFP_KERNEL);
++	if (!bhs)
++		return -ENOMEM;
++
+ 	lock_fat(sbi);
+ 	if (sbi->free_clusters != -1 && sbi->free_clus_valid &&
+ 	    sbi->free_clusters < nr_cluster) {
+@@ -553,6 +561,7 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 	if (err && idx_clus)
+ 		fat_free_clusters(inode, cluster[0]);
+ 
++	kfree(bhs);
+ 	return err;
+ }
+ 
+@@ -562,10 +571,18 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent;
+-	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	struct buffer_head **bhs;
+ 	int i, err, nr_bhs;
+ 	int first_cl = cluster, dirty_fsinfo = 0;
+ 
++	/*
++	 * MAX_BUF_PER_PAGE scales with PAGE_SIZE; heap-allocate to avoid
++	 * blowing the 2 KiB stack frame budget under PGCL.
++	 */
++	bhs = kmalloc_array(MAX_BUF_PER_PAGE, sizeof(*bhs), GFP_KERNEL);
++	if (!bhs)
++		return -ENOMEM;
++
+ 	nr_bhs = 0;
+ 	fatent_init(&fatent);
+ 	lock_fat(sbi);
+@@ -635,6 +652,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 	if (dirty_fsinfo)
+ 		mark_fsinfo_dirty(sb);
+ 
++	kfree(bhs);
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(fat_free_clusters);
+-- 
+2.54.0
+

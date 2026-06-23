@@ -1,0 +1,59 @@
+From 862ea6617b621058cd0503805ba68bd6d21bab16 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 22 May 2026 12:31:42 +0200
+Subject: [PATCH 122/174] fs/exec: align stack_top to MMUPAGE granularity, not
+ PAGE
+
+setup_arg_pages() rounded the user-supplied stack_top up to PAGE_SIZE
+with PAGE_ALIGN. Under page clustering PAGE_SIZE > MMUPAGE_SIZE, so an
+input that is MMUPAGE-aligned but not PAGE-aligned (the common case for
+STACK_TOP_MAX on archs whose vdso/stack-guard arithmetic uses
+MMUPAGE-granular sizes -- s390x is the canonical example) overshoots to
+the next PAGE boundary, which is above STACK_TOP_MAX itself.
+
+When that happens stack_shift = vma->vm_end - stack_top underflows to a
+huge unsigned value. relocate_vma_down() then computes new_start =
+old_start - stack_shift, which wraps to an address just above old_start,
+and vma_expand() trips VM_WARN_ON_VMG(target->vm_start < vmg->start)
+because it sees the original stack VMA extending below the bogus new
+start. The maple tree is left holding a stale partial entry that a
+subsequent validate_mm() catches as a BUG_ON.
+
+Stack VMAs are MMUPAGE-aligned (their vm_end equals STACK_TOP_MAX, which
+is computed from vdso_size() in MMUPAGE units). Aligning stack_top to
+the same granularity matches the VMA layout and avoids the underflow.
+
+Fixes intermittent maple_tree validate_mm BUG_ON during execve under
+PGCL=4 on s390x; reproduced as 1/96 runs in a parallel matrix loop with
+mm/vma.c instrumentation, and dropped to 0/36 (then 0/N in extended
+verify) after this change.
+
+Signed-off-by: Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
+---
+ fs/exec.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/exec.c b/fs/exec.c
+index ba12b4c466f6..6017b09603dd 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -626,14 +626,14 @@ int setup_arg_pages(struct linux_binprm *bprm,
+ 	if (vma->vm_end - vma->vm_start > stack_base)
+ 		return -ENOMEM;
+ 
+-	stack_base = PAGE_ALIGN(stack_top - stack_base);
++	stack_base = MMUPAGE_ALIGN(stack_top - stack_base);
+ 
+ 	stack_shift = vma->vm_start - stack_base;
+ 	mm->arg_start = bprm->p - stack_shift;
+ 	bprm->p = vma->vm_end - stack_shift;
+ #else
+ 	stack_top = arch_align_stack(stack_top);
+-	stack_top = PAGE_ALIGN(stack_top);
++	stack_top = MMUPAGE_ALIGN(stack_top);
+ 
+ 	if (unlikely(stack_top < mmap_min_addr) ||
+ 	    unlikely(vma->vm_end - vma->vm_start >= stack_top - mmap_min_addr))
+-- 
+2.54.0
+

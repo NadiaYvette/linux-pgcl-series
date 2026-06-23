@@ -1,0 +1,106 @@
+From 20bb54d020522c4f509bea2bed22a3468a73ed07 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 29 Apr 2026 01:03:56 +0200
+Subject: [PATCH 073/174] PGCL: fix arm64/sparc arch_setup_zero_pages for
+ empty_zero_page misalignment
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After commit 5500e2631b2d ("PGCL: fix empty_zero_page alignment overflow
+on alpha/microblaze") the static empty_zero_page buffer is declared with
+__aligned(MMUPAGE_SIZE) when PAGE_MMUSHIFT > 0, to avoid exceeding the
+assembler's maximum .align directive on alpha/microblaze.
+
+arm64 and sparc each carry their own arch_setup_zero_pages() that
+derives __zero_page directly from the empty_zero_page symbol address
+(arm64 via __pa_symbol; sparc via kern_base + offset).  With the
+relaxed alignment, the symbol address is no longer guaranteed to be
+PAGE_SIZE aligned, so phys_to_page() returns a struct page covering
+the kernel page that contains empty_zero_page _and_ adjacent BSS data.
+The zero-page mapping then leaks that BSS data through reads.
+
+This caused two LTP regressions on arm64:
+  - madvise03: MAP_SIZE=8KB anon, memset(1) + MADV_DONTNEED, then read
+    expects zeros — saw 0x01 (the original memset) and other BSS bytes.
+  - madvise10: MAP_SIZE=16KB anon, MADV_WIPEONFORK + fork, child reads
+    expect zeros — saw 0x83 at offset 3992 (random adjacent BSS).
+
+Make arm64 and sparc allocate a fresh PAGE_SIZE-aligned zero page from
+memblock when PAGE_MMUSHIFT > 0, matching the generic mm_init.c path.
+The mips and s390 overrides already use memblock_alloc_or_panic, so
+they were unaffected.
+
+Verified on aarch64 QEMU: madvise03 1/0, madvise10 12/0 (both PASS).
+x86_64 was unaffected because it uses the generic arch_setup_zero_pages
+which already calls memblock_alloc.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ arch/arm64/mm/init.c    | 17 +++++++++++++++++
+ arch/sparc/mm/init_64.c | 16 ++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index 97987f850a33..1d1faafc4d8f 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -330,7 +330,24 @@ void __init bootmem_init(void)
+ 
+ void __init arch_setup_zero_pages(void)
+ {
++#if PAGE_MMUSHIFT > 0
++	/*
++	 * PGCL: the static empty_zero_page buffer is only MMUPAGE_SIZE
++	 * aligned (assembler limit on some arches forced relaxation in
++	 * mm_init.c).  phys_to_page() on a symbol that is not PAGE_SIZE
++	 * aligned returns a struct page covering a kernel page that also
++	 * contains adjacent BSS data, leaking it through the zero-page
++	 * mapping.  Allocate a fresh PAGE_SIZE-aligned zero page from
++	 * memblock instead.
++	 */
++	void *z = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
++
++	if (!z)
++		panic("Failed to allocate zero page");
++	__zero_page = virt_to_page(z);
++#else
+ 	__zero_page = phys_to_page(__pa_symbol(empty_zero_page));
++#endif
+ }
+ 
+ void __init arch_mm_preinit(void)
+diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
+index 4f79dfa2c06f..adf9e68d9bf7 100644
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -2504,10 +2504,26 @@ static void __init register_page_bootmem_info(void)
+ 
+ void __init arch_setup_zero_pages(void)
+ {
++#if PAGE_MMUSHIFT > 0
++	/*
++	 * PGCL: the static empty_zero_page buffer is only MMUPAGE_SIZE
++	 * aligned (assembler limit on some arches forced relaxation in
++	 * mm_init.c).  Using its symbol address would yield a struct
++	 * page covering a kernel page that also contains adjacent BSS
++	 * data, leaking it through the zero-page mapping.  Allocate a
++	 * fresh PAGE_SIZE-aligned zero page from memblock instead.
++	 */
++	void *z = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
++
++	if (!z)
++		panic("Failed to allocate zero page");
++	__zero_page = virt_to_page(z);
++#else
+ 	phys_addr_t zero_page_pa = kern_base +
+ 		((unsigned long)&empty_zero_page[0] - KERNBASE);
+ 
+ 	__zero_page = phys_to_page(zero_page_pa);
++#endif
+ }
+ 
+ void __init mem_init(void)
+-- 
+2.54.0
+

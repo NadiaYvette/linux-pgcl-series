@@ -1,0 +1,99 @@
+From a476a067ef99d9ea148e75067cc3fb82d6fb851d Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sat, 2 May 2026 12:13:16 +0200
+Subject: [PATCH 087/174] mm/huge_memory: fix phantom head _mapcount post-split
+ for partial mTHP
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When an anonymous mTHP folio is partially mapped (the fault path
+created only a single PTE for the user's address while
+`folio_add_new_anon_rmap()` bulk-initialized `_mapcount = 0` for
+all PAGE_MMUCOUNT sub-pages), `unmap_folio()` during
+`__folio_split` only decrements `_mapcount` for the sub-page that
+actually carries a PTE (which becomes the migration entry).
+Sub-pages that never had a PTE retain `_mapcount = 0` (= "1
+mapping" by convention).
+
+For the head sub-folio specifically, this phantom mapping survives
+`__split_folio_to_order` (which only verifies and resets sub-folios
+at idx > 0).  Post-split, `folio_mapped(head)` returns true even
+when no PTE references the head, and `remap_page()` does not
+restore a mapping (the migration entry is for a different
+sub-page).  The caller's protective `folio_put()` (e.g., in
+`madvise_cold_or_pageout_pte_range()` line 504) then drops the
+last reference and frees a folio that still self-reports as
+mapped — leading to a use-after-free PTE for the actually-mapped
+post-split sub-folio and the canonical
+"BUG: Bad rss-counter state ... val:1 FILE / val:-1 ANON"
+fired by `check_mm()` at `__mmput`.
+
+Reset the head's `_mapcount` to -1 after `ClearPageCompound`,
+matching the invariant `__split_folio_to_order` enforces for
+sub-folios via `VM_BUG_ON_PAGE`.  `remap_page()` will then
+correctly inc the head's `_mapcount` back to 0 iff it finds a
+migration entry for the head's PFN range; otherwise the head
+remains unmapped (`_mapcount = -1`) and `folio_put()` cleanly
+frees it.
+
+Bug captured on aarch64 PGCL=0 + THP=always running cow.c
+selftest (`run_with_base_page_swap` triggers MADV_PAGEOUT, which
+calls `split_folio` on a partially-mapped mTHP allocation).
+Pre-split state: `rc=2 mc=1 order=4` — caller_get + 1 PTE for a
+non-head sub-page.  Post-split state pre-fix: `rc=1 mc=1 order=0`
+(phantom mc=1 on head from bulk init).  Post-split state
+post-fix: `rc=1 mc=0 order=0` — clean.
+
+Verified clean: aarch64 PGCL=4 + THP=always (cow.c PASS, zero
+BUG/Oops events).
+
+The phantom-mapping pattern likely affects other split paths
+beyond `madvise`; this commit handles the
+`madvise_cold_or_pageout_pte_range` case.  PGCL=0 still shows
+some rss-counter BUGs from other paths (likely
+`shrink_folio_list` reclaim and other unmap routes that don't
+go through `__folio_split`); those need separate fixes building
+on this same phantom-mapping understanding.
+
+Signed-off-by: Nadia Chambers <nadia.yvette.chambers@gmail.com>
+---
+ mm/huge_memory.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 40479b7cc474..9e61fd9ac127 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -3718,6 +3718,28 @@ static void __split_folio_to_order(struct folio *folio, int old_order,
+ 		folio_set_order(folio, new_order);
+ 	else
+ 		ClearPageCompound(&folio->page);
++
++	/*
++	 * PGCL fix: Reset head's _mapcount to -1 (= 0 mappings) when
++	 * splitting to order 0.  folio_add_new_anon_rmap() bulk-initializes
++	 * all per-page _mapcount to 0 even when the fault path only creates
++	 * one PTE (partial mapping under THP=on).  unmap_folio() dec's
++	 * _mapcount only for the PTE-present sub-page; if the head sub-page
++	 * was never PTE-mapped, its _mapcount stays at 0 (phantom mapping).
++	 *
++	 * After split, that phantom causes folio_mapped(head) to return
++	 * true, and the caller's folio_put (e.g., in
++	 * madvise_cold_or_pageout_pte_range) frees the folio while
++	 * "still mapped" — leading to a stale PTE for the actually-mapped
++	 * post-split sub-folio and rss-counter imbalance at exit_mmap.
++	 *
++	 * Sub-folios at idx > 0 already have _mapcount == -1 (per the
++	 * VM_BUG_ON_PAGE check at the top of this function).  This fix
++	 * extends the same invariant to the head, which remap_page() will
++	 * inc back to 0 if and only if there's a migration entry for it.
++	 */
++	if (!new_order && IS_ENABLED(CONFIG_PAGE_MAPCOUNT))
++		atomic_set(&folio->page._mapcount, -1);
+ }
+ 
+ /**
+-- 
+2.54.0
+

@@ -1,0 +1,66 @@
+From 6a3d6b12be62c5bcf5853665e5d7de33ec707863 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 17 Jun 2026 22:20:48 +0200
+Subject: [PATCH 157/174] x86/mm: PGCL: PAGE-align the realmode-trampoline W+X
+ suppression range
+
+note_wx() suppresses the (intentional) trampoline W+X warning under
+PAGE_MMUSHIFT>0, but bounded the suppressed range by
+[real_mode_header, real_mode_header + PAGE_ALIGN(blob_size)].  The
+trampoline is only MMUPAGE-aligned -- reserve_real_mode() allocates with
+MMUPAGE_SIZE alignment because a PAGE_SIZE (e.g. 256K) alignment is
+unsatisfiable in a fragmented sub-1M e820 -- while
+set_real_mode_permissions() clears NX on the whole PAGE_SIZE page(s) via
+set_memory_x(__va(PAGE_ALIGN_DOWN(text_start))).  The resulting W+X run
+therefore begins at the PAGE boundary *below* real_mode_header, so
+ptdump's start_address < rm_base, the `start_address >= rm_base` test
+fails, and the warning fires anyway.
+
+Observed on the laptop's real (fragmented) e820: trampoline blob at phys
+0x90000 (MMUPAGE/64K-aligned); with a 256K PAGE the W+X run lands at
+__va(0x80000) = 0xffff888000080000, below real_mode_header = __va(0x90000).
+Both pgcl6 (#16) and pgcl4 (#17) hit it; QEMU's contiguous low memory
+happens to place the trampoline PAGE-aligned, so the matrix never saw it.
+
+PAGE-align the suppression range to cover exactly the page(s) that
+set_memory_x() marks.  Gated on PAGE_MMUSHIFT>0; identity at
+PAGE_MMUSHIFT==0 (the trampoline is PAGE-aligned there).  dump_pagetables.o
+compile-verified at PGCL=6; laptop-boot reconfirmation pending (not
+reproducible under QEMU).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/x86/mm/dump_pagetables.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/mm/dump_pagetables.c b/arch/x86/mm/dump_pagetables.c
+index 139209ef3191..5924e816b6b2 100644
+--- a/arch/x86/mm/dump_pagetables.c
++++ b/arch/x86/mm/dump_pagetables.c
+@@ -249,9 +249,20 @@ static void note_wx(struct pg_state *st, unsigned long addr)
+ 	 * is intentionally W+X.  Suppress the warning.
+ 	 */
+ 	if (PAGE_MMUSHIFT > 0 && real_mode_header) {
+-		unsigned long rm_base = (unsigned long)real_mode_header;
+-		unsigned long rm_end = rm_base +
+-			PAGE_ALIGN(real_mode_blob_end - real_mode_blob);
++		/*
++		 * The trampoline is only MMUPAGE-aligned (a PAGE_SIZE alignment
++		 * is unsatisfiable in a fragmented sub-1M e820), but
++		 * set_real_mode_permissions() clears NX on the whole PAGE_SIZE
++		 * page(s) containing it via set_memory_x(PAGE_ALIGN_DOWN(...)).
++		 * The resulting W+X run therefore begins at the PAGE boundary
++		 * *below* real_mode_header, so the suppression range must be
++		 * PAGE-aligned to actually cover it.
++		 */
++		unsigned long rm_base =
++			PAGE_ALIGN_DOWN((unsigned long)real_mode_header);
++		unsigned long rm_end =
++			PAGE_ALIGN((unsigned long)real_mode_header +
++				   (real_mode_blob_end - real_mode_blob));
+ 
+ 		if (st->start_address >= rm_base &&
+ 		    addr <= rm_end) {
+-- 
+2.54.0
+

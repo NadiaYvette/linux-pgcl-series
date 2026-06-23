@@ -1,0 +1,97 @@
+From 0874b2940a859aee7a0e54ffb2e406d1688f2754 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 18 Jun 2026 18:35:31 +0200
+Subject: [PATCH 164/174] sh: MMUPAGE-based cache colouring under PGCL
+
+sh4 is a VIPT cache-aliasing arch (cpu_dcache_is_aliasing() == true) whose
+arch_get_unmapped_area[_topdown]() colour arithmetic in arch/sh/mm/mmap.c used
+PAGE_SHIFT/PAGE_MASK:
+
+  COLOUR_ALIGN:    (pgoff << PAGE_SHIFT) & shm_align_mask
+  MAP_FIXED check: (addr - (pgoff << PAGE_SHIFT)) & shm_align_mask
+  align_mask:      PAGE_MASK & shm_align_mask
+  align_offset:    pgoff << PAGE_SHIFT
+  topdown errchk:  addr & ~PAGE_MASK
+
+pgoff is in MMUPAGE units and the colour bits live between MMUPAGE_SHIFT and
+shm_align_mask. Under page clustering (PAGE_MMUSHIFT > 0) PAGE_SIZE can exceed
+shm_align_mask, so PAGE_MASK & shm_align_mask collapses to 0 (no colour
+alignment) and pgoff << PAGE_SHIFT overshoots the colour by PAGE_MMUCOUNT; a
+shared/file mapping then comes back only MMUPAGE-aligned instead of colour-
+aligned (risking VIPT aliasing and the MREMAP_FIXED -EINVAL path), and the
+topdown ~PAGE_MASK error check mis-detects a valid MMUPAGE-aligned result.
+Convert all colour arithmetic to MMUPAGE units; identical when
+PAGE_MMUSHIFT == 0. This is the sh piece missed by the arm/csky/xtensa/sparc32
+MMUPAGE cache-colouring commit.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ arch/sh/mm/mmap.c | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/arch/sh/mm/mmap.c b/arch/sh/mm/mmap.c
+index c442734d9b0c..ccdfb5db68da 100644
+--- a/arch/sh/mm/mmap.c
++++ b/arch/sh/mm/mmap.c
+@@ -46,7 +46,7 @@ static inline unsigned long COLOUR_ALIGN(unsigned long addr,
+ 					 unsigned long pgoff)
+ {
+ 	unsigned long base = (addr + shm_align_mask) & ~shm_align_mask;
+-	unsigned long off = (pgoff << PAGE_SHIFT) & shm_align_mask;
++	unsigned long off = (pgoff << MMUPAGE_SHIFT) & shm_align_mask;
+ 
+ 	return base + off;
+ }
+@@ -65,7 +65,7 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if ((flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & shm_align_mask))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & shm_align_mask))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -92,8 +92,8 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,
+ 	info.length = len;
+ 	info.low_limit = TASK_UNMAPPED_BASE;
+ 	info.high_limit = TASK_SIZE;
+-	info.align_mask = do_colour_align ? (PAGE_MASK & shm_align_mask) : 0;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_mask = do_colour_align ? (MMUPAGE_MASK & shm_align_mask) : 0;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	return vm_unmapped_area(&info);
+ }
+ 
+@@ -113,7 +113,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 		 * cache aliasing constraints.
+ 		 */
+ 		if ((flags & MAP_SHARED) &&
+-		    ((addr - (pgoff << PAGE_SHIFT)) & shm_align_mask))
++		    ((addr - (pgoff << MMUPAGE_SHIFT)) & shm_align_mask))
+ 			return -EINVAL;
+ 		return addr;
+ 	}
+@@ -142,8 +142,8 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	info.length = len;
+ 	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = mm->mmap_base;
+-	info.align_mask = do_colour_align ? (PAGE_MASK & shm_align_mask) : 0;
+-	info.align_offset = pgoff << PAGE_SHIFT;
++	info.align_mask = do_colour_align ? (MMUPAGE_MASK & shm_align_mask) : 0;
++	info.align_offset = pgoff << MMUPAGE_SHIFT;
+ 	addr = vm_unmapped_area(&info);
+ 
+ 	/*
+@@ -152,7 +152,7 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
+ 	 * can happen with large stack limits and large mmap()
+ 	 * allocations.
+ 	 */
+-	if (addr & ~PAGE_MASK) {
++	if (addr & ~MMUPAGE_MASK) {
+ 		VM_BUG_ON(addr != -ENOMEM);
+ 		info.flags = 0;
+ 		info.low_limit = TASK_UNMAPPED_BASE;
+-- 
+2.54.0
+

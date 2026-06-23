@@ -1,0 +1,32 @@
+From c5226b759d3480477065cca4fc5f2fdb5eb395f1 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Tue, 17 Mar 2026 11:05:25 +0100
+Subject: [PATCH 023/174] PGCL: fix __tlb_remove_page_size call for v7.0-rc4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upstream removed the delay_rmap bool parameter from
+__tlb_remove_page_size() — adapt our PGCL zap_present_ptes path.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ mm/memory.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index e07e6da7a27f..ff8a051f65cb 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1831,7 +1831,7 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
+ 			if (nr > 1)
+ 				folio_ref_sub(folio, nr - 1);
+ 			if (unlikely(__tlb_remove_page_size(tlb,
+-					page, false,
++					page,
+ 					MMUPAGE_SIZE))) {
+ 				*force_flush = true;
+ 				*force_break = true;
+-- 
+2.54.0
+

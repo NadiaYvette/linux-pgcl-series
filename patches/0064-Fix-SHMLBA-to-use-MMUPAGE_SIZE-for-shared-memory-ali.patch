@@ -1,0 +1,166 @@
+From 9cf589a7b902cd9152fef1bd4df8f0ada3c62281 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 1 Apr 2026 20:12:38 +0200
+Subject: [PATCH 064/174] Fix SHMLBA to use MMUPAGE_SIZE for shared memory
+ alignment
+
+SHMLBA controls shared memory attach alignment. With PGCL,
+PAGE_SIZE is the kernel allocation granularity (e.g. 64KB-256KB)
+but shared memory alignment should be at hardware MMU page
+granularity (MMUPAGE_SIZE). Using PAGE_SIZE causes EINVAL on
+MAP_FIXED|MAP_SHARED at MMUPAGE-aligned addresses that aren't
+PAGE-aligned.
+
+Confirmed fix for loongarch64 mmap04 LTP TBROK (EINVAL on
+MAP_FIXED at 0x7ffff1838000 which is 16KB-aligned but not
+256KB-aligned).
+
+Changed in 10 files:
+- include/asm-generic/shmparam.h (generic default)
+- arch/{x86,alpha,powerpc}/include/asm/shmparam.h (no cache aliasing)
+- arch/arm64/include/asm/shmparam.h (COMPAT_SHMLBA for 32-bit compat)
+- arch/sparc/include/asm/shmparam_{32,64}.h (cache aliasing uses L1DCACHE_SIZE)
+- arch/{csky,arc}/include/asm/shmparam.h (cache aliasing multiples)
+- arch/loongarch/mm/mmap.c (SHM_ALIGN_MASK directly)
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/alpha/include/asm/shmparam.h    | 2 +-
+ arch/arc/include/asm/shmparam.h      | 2 +-
+ arch/arm64/include/asm/shmparam.h    | 2 +-
+ arch/csky/include/asm/shmparam.h     | 2 +-
+ arch/loongarch/mm/mmap.c             | 2 +-
+ arch/powerpc/include/asm/shmparam.h  | 2 +-
+ arch/sparc/include/asm/shmparam_32.h | 2 +-
+ arch/sparc/include/asm/shmparam_64.h | 2 +-
+ arch/x86/include/asm/shmparam.h      | 2 +-
+ include/asm-generic/shmparam.h       | 2 +-
+ 10 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/arch/alpha/include/asm/shmparam.h b/arch/alpha/include/asm/shmparam.h
+index 0c04fde1aeba..3a7a1cb4a9b1 100644
+--- a/arch/alpha/include/asm/shmparam.h
++++ b/arch/alpha/include/asm/shmparam.h
+@@ -2,6 +2,6 @@
+ #ifndef _ASMAXP_SHMPARAM_H
+ #define _ASMAXP_SHMPARAM_H
+ 
+-#define	SHMLBA PAGE_SIZE		 /* attach addr a multiple of this */
++#define	SHMLBA MMUPAGE_SIZE		 /* attach addr a multiple of this */
+ 
+ #endif /* _ASMAXP_SHMPARAM_H */
+diff --git a/arch/arc/include/asm/shmparam.h b/arch/arc/include/asm/shmparam.h
+index 719112af0f41..a4350c318921 100644
+--- a/arch/arc/include/asm/shmparam.h
++++ b/arch/arc/include/asm/shmparam.h
+@@ -7,7 +7,7 @@
+ #define __ARC_ASM_SHMPARAM_H
+ 
+ /* Handle up to 2 cache bins */
+-#define	SHMLBA	(2 * PAGE_SIZE)
++#define	SHMLBA	(2 * MMUPAGE_SIZE)
+ 
+ /* Enforce SHMLBA in shmat */
+ #define __ARCH_FORCE_SHMLBA
+diff --git a/arch/arm64/include/asm/shmparam.h b/arch/arm64/include/asm/shmparam.h
+index f920e22ec677..23cd7bbafe24 100644
+--- a/arch/arm64/include/asm/shmparam.h
++++ b/arch/arm64/include/asm/shmparam.h
+@@ -10,7 +10,7 @@
+  * alignment value. Since we don't have aliasing D-caches, the rest of
+  * the time we can safely use PAGE_SIZE.
+  */
+-#define COMPAT_SHMLBA	(4 * PAGE_SIZE)
++#define COMPAT_SHMLBA	(4 * MMUPAGE_SIZE)
+ 
+ #include <asm-generic/shmparam.h>
+ 
+diff --git a/arch/csky/include/asm/shmparam.h b/arch/csky/include/asm/shmparam.h
+index 2fe6cea0dae9..76ce14a4e3a2 100644
+--- a/arch/csky/include/asm/shmparam.h
++++ b/arch/csky/include/asm/shmparam.h
+@@ -3,7 +3,7 @@
+ #ifndef __ASM_CSKY_SHMPARAM_H
+ #define __ASM_CSKY_SHMPARAM_H
+ 
+-#define SHMLBA	(4 * PAGE_SIZE)
++#define SHMLBA	(4 * MMUPAGE_SIZE)
+ 
+ #define __ARCH_FORCE_SHMLBA
+ 
+diff --git a/arch/loongarch/mm/mmap.c b/arch/loongarch/mm/mmap.c
+index 2a5eccb19b84..96285b68f8a7 100644
+--- a/arch/loongarch/mm/mmap.c
++++ b/arch/loongarch/mm/mmap.c
+@@ -10,7 +10,7 @@
+ #include <linux/mm.h>
+ #include <linux/mman.h>
+ 
+-#define SHM_ALIGN_MASK	(SHMLBA - 1)
++#define SHM_ALIGN_MASK	(MMUPAGE_SIZE - 1)
+ 
+ #define COLOUR_ALIGN(addr, pgoff)			\
+ 	((((addr) + SHM_ALIGN_MASK) & ~SHM_ALIGN_MASK)	\
+diff --git a/arch/powerpc/include/asm/shmparam.h b/arch/powerpc/include/asm/shmparam.h
+index bc0968839565..af9b7a13993e 100644
+--- a/arch/powerpc/include/asm/shmparam.h
++++ b/arch/powerpc/include/asm/shmparam.h
+@@ -2,6 +2,6 @@
+ #ifndef _ASM_POWERPC_SHMPARAM_H
+ #define _ASM_POWERPC_SHMPARAM_H
+ 
+-#define	SHMLBA PAGE_SIZE		 /* attach addr a multiple of this */
++#define	SHMLBA MMUPAGE_SIZE		 /* attach addr a multiple of this */
+ 
+ #endif	/* _ASM_POWERPC_SHMPARAM_H */
+diff --git a/arch/sparc/include/asm/shmparam_32.h b/arch/sparc/include/asm/shmparam_32.h
+index 9767a8b30242..49fedb92092f 100644
+--- a/arch/sparc/include/asm/shmparam_32.h
++++ b/arch/sparc/include/asm/shmparam_32.h
+@@ -5,6 +5,6 @@
+ #define __ARCH_FORCE_SHMLBA 	1
+ 
+ extern int vac_cache_size;
+-#define SHMLBA (vac_cache_size ? vac_cache_size : PAGE_SIZE)
++#define SHMLBA (vac_cache_size ? vac_cache_size : MMUPAGE_SIZE)
+ 
+ #endif /* _ASMSPARC_SHMPARAM_H */
+diff --git a/arch/sparc/include/asm/shmparam_64.h b/arch/sparc/include/asm/shmparam_64.h
+index c0731b57124c..42faa5fccb7e 100644
+--- a/arch/sparc/include/asm/shmparam_64.h
++++ b/arch/sparc/include/asm/shmparam_64.h
+@@ -6,6 +6,6 @@
+ 
+ #define __ARCH_FORCE_SHMLBA	1
+ /* attach addr a multiple of this */
+-#define	SHMLBA	((PAGE_SIZE > L1DCACHE_SIZE) ? PAGE_SIZE : L1DCACHE_SIZE)
++#define	SHMLBA	((MMUPAGE_SIZE > L1DCACHE_SIZE) ? MMUPAGE_SIZE : L1DCACHE_SIZE)
+ 
+ #endif /* _ASMSPARC64_SHMPARAM_H */
+diff --git a/arch/x86/include/asm/shmparam.h b/arch/x86/include/asm/shmparam.h
+index c4041819c3e5..6574f168d504 100644
+--- a/arch/x86/include/asm/shmparam.h
++++ b/arch/x86/include/asm/shmparam.h
+@@ -2,6 +2,6 @@
+ #ifndef _ASM_X86_SHMPARAM_H
+ #define _ASM_X86_SHMPARAM_H
+ 
+-#define SHMLBA PAGE_SIZE	 /* attach addr a multiple of this */
++#define SHMLBA MMUPAGE_SIZE	 /* attach addr a multiple of this */
+ 
+ #endif /* _ASM_X86_SHMPARAM_H */
+diff --git a/include/asm-generic/shmparam.h b/include/asm-generic/shmparam.h
+index b8f9035ffc2c..fa3e3e9cebb6 100644
+--- a/include/asm-generic/shmparam.h
++++ b/include/asm-generic/shmparam.h
+@@ -2,6 +2,6 @@
+ #ifndef __ASM_GENERIC_SHMPARAM_H
+ #define __ASM_GENERIC_SHMPARAM_H
+ 
+-#define SHMLBA PAGE_SIZE	 /* attach addr a multiple of this */
++#define SHMLBA MMUPAGE_SIZE	 /* attach addr a multiple of this */
+ 
+ #endif /* _ASM_GENERIC_SHMPARAM_H */
+-- 
+2.54.0
+

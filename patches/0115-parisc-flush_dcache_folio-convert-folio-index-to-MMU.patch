@@ -1,0 +1,121 @@
+From e16d4f40cb6db36ed216307c2acb101148cc7a00 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 13 May 2026 08:20:57 +0200
+Subject: [PATCH 115/174] parisc: flush_dcache_folio: convert folio->index to
+ MMUPAGE units
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Under PGCL `vma->vm_pgoff` is in MMUPAGE units while `folio->index`
+is in PAGE (kernel-page) units, but the existing code in
+flush_dcache_folio() passed `folio->index` straight to
+vma_interval_tree_foreach() and then computed
+`offset = pgoff - vma->vm_pgoff` against vma->vm_pgoff that uses the
+other unit.
+
+The damage chain:
+
+  pgoff = folio->index;              /* PAGE units */
+  vma_interval_tree_foreach(... pgoff, pgoff + nr - 1) { /* tree is MMU */
+      unsigned long offset = pgoff - vma->vm_pgoff; /* mixed units */
+      ...
+      if (offset > -nr) { ... } else {
+          addr += offset * PAGE_SIZE;       /* large positive ⇒ overshoots */
+      }
+      if (addr + nr * PAGE_SIZE > vma->vm_end)
+          nr = (vma->vm_end - addr) / PAGE_SIZE; /* underflow on unsigned */
+      for (i = 0; i < nr; i++) __flush_cache_page(...);
+  }
+
+LTP mremap01 hits this on the second sparse-extending write to a
+tmpfs file that is also mmap'd MAP_SHARED: the unit-mismatched
+foreach returns the mmap's vma even though the folio's file offset
+is past the mmap's end, the ELSE branch sets addr to ~8 MB into a
+4 MB vma, the unsigned `vma->vm_end - addr` underflows to a huge
+value, and `nr = (huge unsigned) / PAGE_SIZE` ≈ 2^48.  The for loop
+calling __flush_cache_page that many times is an effective hang
+(observed at 0 % CPU after the kernel finishes calling out to the
+cache-line-flush instructions for the bogus addresses in the host
+emulator's wait state).
+
+Convert folio->index to MMUPAGE units up front so the foreach query
+matches the tree's units, then convert offset to PAGE units (signed)
+for the address arithmetic.  Also guard the unsigned-clamp with a
+check that addr is still inside the vma.
+
+Without PGCL (PAGE_MMUSHIFT=0) PAGE_SIZE == MMUPAGE_SIZE and the
+shift collapses to a no-op, so non-PGCL builds are unaffected.
+
+Verified: hppa64 PGCL=4 LTP boot now completes cleanly (66 passed,
+3 failed, 32 skipped) where it previously hung at mremap01.
+
+Signed-off-by: Nadia Yvette Chambers <nadia.yvette.chambers@gmail.com>
+---
+ arch/parisc/kernel/cache.c | 35 ++++++++++++++++++++++++++++-------
+ 1 file changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/arch/parisc/kernel/cache.c b/arch/parisc/kernel/cache.c
+index 8c4ca4aab9a2..77a696262c40 100644
+--- a/arch/parisc/kernel/cache.c
++++ b/arch/parisc/kernel/cache.c
+@@ -493,7 +493,17 @@ void flush_dcache_folio(struct folio *folio)
+ 	if (!mapping)
+ 		return;
+ 
+-	pgoff = folio->index;
++	/*
++	 * vma->vm_pgoff is in MMUPAGE units under PGCL but folio->index is
++	 * in PAGE units; convert folio->index to MMUPAGE units so the
++	 * interval-tree query and the per-vma `offset` arithmetic both
++	 * speak the same units as vma->vm_pgoff.  Without this conversion
++	 * the foreach can return vmas that don't actually overlap the
++	 * folio's file range, sending the inner addr arithmetic past
++	 * vma->vm_end and underflowing the unsigned `nr` clamp into a
++	 * 2^48-sized for-loop that hangs the system.  See LTP mremap01.
++	 */
++	pgoff = (pgoff_t)folio->index << PAGE_MMUSHIFT;
+ 
+ 	/*
+ 	 * We have carefully arranged in arch_get_unmapped_area() that
+@@ -503,20 +513,31 @@ void flush_dcache_folio(struct folio *folio)
+ 	 * on machines that support equivalent aliasing
+ 	 */
+ 	flush_dcache_mmap_lock_irqsave(mapping, flags);
+-	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff + nr - 1) {
+-		unsigned long offset = pgoff - vma->vm_pgoff;
++	vma_interval_tree_foreach(vma, &mapping->i_mmap,
++				  pgoff,
++				  pgoff + ((pgoff_t)nr << PAGE_MMUSHIFT) - 1) {
++		/* Both pgoff and vma->vm_pgoff are MMUPAGE units. */
++		long offset_mmu = (long)(pgoff - vma->vm_pgoff);
++		long offset_pages = offset_mmu >> PAGE_MMUSHIFT;
+ 		unsigned long pfn = folio_pfn(folio);
+ 
+ 		addr = vma->vm_start;
+ 		nr = folio_nr_pages(folio);
+-		if (offset > -nr) {
+-			pfn -= offset;
+-			nr += offset;
++		if (offset_pages < 0) {
++			/* folio extends before vma — drop front pages */
++			pfn -= offset_pages;	/* offset is negative ⇒ +|offset| */
++			nr += offset_pages;	/* drop |offset| pages */
++			if ((long)nr <= 0)
++				continue;
+ 		} else {
+-			addr += offset * PAGE_SIZE;
++			addr += offset_pages * PAGE_SIZE;
+ 		}
++		if (addr >= vma->vm_end)
++			continue;
+ 		if (addr + nr * PAGE_SIZE > vma->vm_end)
+ 			nr = (vma->vm_end - addr) / PAGE_SIZE;
++		if (nr == 0)
++			continue;
+ 
+ 		if (old_addr == 0 || (old_addr & (SHM_COLOUR - 1))
+ 					!= (addr & (SHM_COLOUR - 1))) {
+-- 
+2.54.0
+

@@ -1,0 +1,103 @@
+From d91c6eb3722ba24180b61d0a1172d395a7dd58a6 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 29 Apr 2026 02:30:16 +0200
+Subject: [PATCH 074/174] PGCL: fix mmap_mem_prepare pgoff/PFN unit mismatch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The /dev/mem mmap path in drivers/char/mem.c uses desc->pgoff as a
+PAGE-granular PFN — passing it to valid_mmap_phys_addr_range,
+range_is_allowed, phys_mem_access_prot{,_allowed}, and
+mmap_action_remap_full, all of which shift by PAGE_SHIFT internally
+or treat the value as a PAGE-PFN.
+
+In PGCL, desc->pgoff is MMUPAGE-granular (4KB units when
+PAGE_MMUSHIFT > 0).  Passing it through unchanged over-counts by
+PAGE_MMUCOUNT and yields phys addresses 16x too large.  On arm64
+that points to non-existent physical memory; the kernel installs a
+Device-typed PTE there, and the user read-fault traps to SIGBUS.
+
+x86_64 happened to "work" because find_ram_target picks the first
+"System RAM" range, which on x86 starts in the low 1MB region; the
+incorrect pfn maps to other addresses x86's devmem_is_allowed treats
+as zero-fill, and the test never observes the corruption.
+
+Convert pgoff to PAGE-granular pfn at function entry and require the
+offset to be PAGE-aligned (i.e. pgoff a multiple of PAGE_MMUCOUNT).
+This permits /dev/mem mappings only at PAGE granularity for PGCL,
+which matches what remap_pfn_range can express today.
+
+Verified on aarch64: pfnmap selftest 6/6 PASS (was SIGBUS).
+x86_64 still 6/6 PASS.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ drivers/char/mem.c | 27 ++++++++++++++++++++-------
+ 1 file changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/char/mem.c b/drivers/char/mem.c
+index 5fd421e48c04..97797bbeb55a 100644
+--- a/drivers/char/mem.c
++++ b/drivers/char/mem.c
+@@ -331,37 +331,50 @@ static int mmap_mem_prepare(struct vm_area_desc *desc)
+ {
+ 	struct file *file = desc->file;
+ 	const size_t size = vma_desc_size(desc);
+-	const phys_addr_t offset = (phys_addr_t)desc->pgoff << PAGE_SHIFT;
++	/*
++	 * PGCL: desc->pgoff is MMUPAGE-granular, but the upstream APIs
++	 * here (valid_mmap_phys_addr_range, range_is_allowed,
++	 * phys_mem_access_prot, mmap_action_remap_full) expect PAGE-
++	 * granular PFNs (they shift by PAGE_SHIFT internally).  Require
++	 * the offset to be PAGE-aligned and convert.
++	 */
++	const unsigned long pfn = desc->pgoff >> PAGE_MMUSHIFT;
++	const phys_addr_t offset = (phys_addr_t)pfn << PAGE_SHIFT;
++
++#if PAGE_MMUSHIFT > 0
++	if (desc->pgoff & (PAGE_MMUCOUNT - 1))
++		return -EINVAL;
++#endif
+ 
+ 	/* Does it even fit in phys_addr_t? */
+-	if (offset >> PAGE_SHIFT != desc->pgoff)
++	if (offset >> PAGE_SHIFT != pfn)
+ 		return -EINVAL;
+ 
+ 	/* It's illegal to wrap around the end of the physical address space. */
+ 	if (offset + (phys_addr_t)size - 1 < offset)
+ 		return -EINVAL;
+ 
+-	if (!valid_mmap_phys_addr_range(desc->pgoff, size))
++	if (!valid_mmap_phys_addr_range(pfn, size))
+ 		return -EINVAL;
+ 
+ 	if (!private_mapping_ok(desc))
+ 		return -ENOSYS;
+ 
+-	if (!range_is_allowed(desc->pgoff, size))
++	if (!range_is_allowed(pfn, size))
+ 		return -EPERM;
+ 
+-	if (!phys_mem_access_prot_allowed(file, desc->pgoff, size,
++	if (!phys_mem_access_prot_allowed(file, pfn, size,
+ 					  &desc->page_prot))
+ 		return -EINVAL;
+ 
+-	desc->page_prot = phys_mem_access_prot(file, desc->pgoff,
++	desc->page_prot = phys_mem_access_prot(file, pfn,
+ 					       size,
+ 					       desc->page_prot);
+ 
+ 	desc->vm_ops = &mmap_mem_ops;
+ 
+ 	/* Remap-pfn-range will mark the range with the I/O flag. */
+-	mmap_action_remap_full(desc, desc->pgoff);
++	mmap_action_remap_full(desc, pfn);
+ 	/* We filter remap errors to -EAGAIN. */
+ 	desc->action.error_hook = mmap_filter_error;
+ 
+-- 
+2.54.0
+

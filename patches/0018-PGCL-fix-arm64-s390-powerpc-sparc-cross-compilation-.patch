@@ -1,0 +1,856 @@
+From 34d8e37604b0ddf9da3c0366276fe4eee44398d1 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 13 Mar 2026 10:42:58 +0100
+Subject: [PATCH 018/174] PGCL: fix arm64, s390, powerpc, sparc
+ cross-compilation with PAGE_MMUSHIFT=4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+arm64:
+- pgtable-hwdef.h: PTDESC_TABLE_SHIFT, ARM64_HW_PGTABLE_LEVELS, PTE_ADDR_LOW,
+  CONT_PTE_SHIFT/SIZE all use MMUPAGE_SHIFT (page table pages are hardware-
+  page-sized, not kernel-page-sized)
+- pgtable.h: pte_advance_pfn uses MMUPAGE_SHIFT for sub-page stride; set_ptes,
+  clear_full_ptes, wrprotect_ptes, clear_young_dirty_ptes, contpte_try_fold,
+  pte_leaf_size, folded page table alignment all MMUPAGE-aware
+- kernel-pgtable.h: SWAPPER_BLOCK_SHIFT, INIT_DIR_SIZE, INIT_IDMAP_DIR_SIZE,
+  INIT_IDMAP_FDT_SIZE use MMUPAGE_SIZE for page table page sizing
+- memory.h: THREAD_SHIFT, NVHE_STACK_SHIFT use MMUPAGE_SHIFT
+- vmlinux.lds.S: page directory spacing uses MMUPAGE_SIZE
+- pi/map_range.c: early identity mapping uses MMUPAGE_SHIFT/SIZE/MASK
+- kvm/mmu.c: stage-2 page fault vma_shift uses MMUPAGE_SHIFT; guard
+  CONT_PTE_SHIFT case when it equals MMUPAGE_SHIFT to avoid duplicate case
+
+s390:
+- thread_info.h: THREAD_SIZE and BOOT_STACK_SIZE use MMUPAGE_SIZE
+- relocate_kernel.S: lghi→lgfi for PAGE_SIZE (exceeds 16-bit signed imm);
+  nill mask generalized to (PAGE_MASK & 0xffff)
+- sclp.h: EARLY_SCCB_SIZE, EXT_SCCB_READ_SCP/CPU use MMUPAGE_SIZE (hardware
+  SCCB buffers are 4KB-page-aligned)
+- sclp drivers: SCCB allocation sizes use MMUPAGE_SIZE
+
+powerpc:
+- Kconfig: relax ARCH_FORCE_MAX_ORDER range from 12..12 to 8..12 for PPC64
+  with 4K pages (MAX_ORDER + PAGE_SHIFT must not exceed SECTION_SIZE_BITS)
+- vmlinux.lds.S: DATA_SHIFT check uses MMUPAGE_SIZE instead of PAGE_SIZE
+
+sparc:
+- pgtable_64.h: PMD_SHIFT, PMD_BITS, PUD_BITS, PGDIR_BITS, PTRS_PER_PTE all
+  use MMUPAGE_SHIFT (page table pages are hardware-page-sized)
+- page_64.h: DCACHE_ALIASING_POSSIBLE checks MMUPAGE_SHIFT
+- tsb.h: all page table walk macros use MMUPAGE_SHIFT for index computation
+- copy_page.S: PAGE_SIZE_REM computed from PAGE_SIZE modulo, not PAGE_SHIFT
+- ultra.S: dcache flush check uses MMUPAGE_SHIFT
+
+Cross-compile results with PAGE_MMUSHIFT=4: 11/11 architectures PASS
+(x86_64, arm64, riscv64, arm32, powerpc64, s390x, mips, sparc64, alpha,
+m68k, loongarch).
+
+x86_64 boot test: PASS (SMP=4, all fork/COW/clustering tests pass).
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ arch/arm64/include/asm/kernel-pgtable.h |  8 +++---
+ arch/arm64/include/asm/memory.h         | 10 +++----
+ arch/arm64/include/asm/pgtable-hwdef.h  | 29 +++++++++++--------
+ arch/arm64/include/asm/pgtable.h        | 37 ++++++++++++++-----------
+ arch/arm64/kernel/pi/map_range.c        | 12 ++++----
+ arch/arm64/kernel/vmlinux.lds.S         |  8 +++---
+ arch/arm64/kvm/mmu.c                    | 18 ++++++------
+ arch/powerpc/Kconfig                    |  2 +-
+ arch/powerpc/kernel/vmlinux.lds.S       |  4 +--
+ arch/s390/include/asm/sclp.h            |  7 +++--
+ arch/s390/include/asm/thread_info.h     |  4 +--
+ arch/s390/kernel/relocate_kernel.S      | 12 ++++----
+ arch/sparc/include/asm/page_64.h        |  2 +-
+ arch/sparc/include/asm/pgtable_64.h     | 17 +++++++-----
+ arch/sparc/include/asm/tsb.h            | 18 ++++++------
+ arch/sparc/lib/copy_page.S              | 16 ++++++++---
+ arch/sparc/mm/ultra.S                   |  4 +--
+ drivers/s390/char/sclp.h                |  6 ++--
+ drivers/s390/char/sclp_cmd.c            |  2 +-
+ drivers/s390/char/sclp_early.c          |  2 +-
+ drivers/s390/char/sclp_early_core.c     |  2 +-
+ 21 files changed, 123 insertions(+), 97 deletions(-)
+
+diff --git a/arch/arm64/include/asm/kernel-pgtable.h b/arch/arm64/include/asm/kernel-pgtable.h
+index 229ee7976f69..fb9a22cd9474 100644
+--- a/arch/arm64/include/asm/kernel-pgtable.h
++++ b/arch/arm64/include/asm/kernel-pgtable.h
+@@ -22,7 +22,7 @@
+ #define SWAPPER_BLOCK_SHIFT	PMD_SHIFT
+ #define SWAPPER_SKIP_LEVEL	1
+ #else
+-#define SWAPPER_BLOCK_SHIFT	PAGE_SHIFT
++#define SWAPPER_BLOCK_SHIFT	MMUPAGE_SHIFT
+ #define SWAPPER_SKIP_LEVEL	0
+ #endif
+ #define SWAPPER_BLOCK_SIZE	(UL(1) << SWAPPER_BLOCK_SHIFT)
+@@ -55,14 +55,14 @@
+ 	+ EARLY_LEVEL(3, (lvls), (vstart), (vend), add) /* each entry needs a next level page table */	\
+ 	+ EARLY_LEVEL(2, (lvls), (vstart), (vend), add)	/* each entry needs a next level page table */	\
+ 	+ EARLY_LEVEL(1, (lvls), (vstart), (vend), add))/* each entry needs a next level page table */
+-#define INIT_DIR_SIZE (PAGE_SIZE * (EARLY_PAGES(SWAPPER_PGTABLE_LEVELS, KIMAGE_VADDR, _end, EXTRA_PAGE) \
++#define INIT_DIR_SIZE (MMUPAGE_SIZE * (EARLY_PAGES(SWAPPER_PGTABLE_LEVELS, KIMAGE_VADDR, _end, EXTRA_PAGE) \
+ 				    + EARLY_SEGMENT_EXTRA_PAGES))
+ 
+ #define INIT_IDMAP_DIR_PAGES	(EARLY_PAGES(INIT_IDMAP_PGTABLE_LEVELS, KIMAGE_VADDR, kimage_limit, 1))
+-#define INIT_IDMAP_DIR_SIZE	((INIT_IDMAP_DIR_PAGES + EARLY_IDMAP_EXTRA_PAGES) * PAGE_SIZE)
++#define INIT_IDMAP_DIR_SIZE	((INIT_IDMAP_DIR_PAGES + EARLY_IDMAP_EXTRA_PAGES) * MMUPAGE_SIZE)
+ 
+ #define INIT_IDMAP_FDT_PAGES	(EARLY_PAGES(INIT_IDMAP_PGTABLE_LEVELS, 0UL, UL(MAX_FDT_SIZE), 1) - 1)
+-#define INIT_IDMAP_FDT_SIZE	((INIT_IDMAP_FDT_PAGES + EARLY_IDMAP_EXTRA_FDT_PAGES) * PAGE_SIZE)
++#define INIT_IDMAP_FDT_SIZE	((INIT_IDMAP_FDT_PAGES + EARLY_IDMAP_EXTRA_FDT_PAGES) * MMUPAGE_SIZE)
+ 
+ /* The number of segments in the kernel image (text, rodata, inittext, initdata, data+bss) */
+ #define KERNEL_SEGMENT_COUNT	5
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index a2b7a33966ff..8418f4f2c974 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -118,8 +118,8 @@
+  * VMAP'd stacks are allocated at page granularity, so we must ensure that such
+  * stacks are a multiple of page size.
+  */
+-#if (MIN_THREAD_SHIFT < PAGE_SHIFT)
+-#define THREAD_SHIFT		PAGE_SHIFT
++#if (MIN_THREAD_SHIFT < MMUPAGE_SHIFT)
++#define THREAD_SHIFT		MMUPAGE_SHIFT
+ #else
+ #define THREAD_SHIFT		MIN_THREAD_SHIFT
+ #endif
+@@ -141,7 +141,7 @@
+ 
+ #define OVERFLOW_STACK_SIZE	SZ_4K
+ 
+-#define NVHE_STACK_SHIFT       PAGE_SHIFT
++#define NVHE_STACK_SHIFT       MMUPAGE_SHIFT
+ #define NVHE_STACK_SIZE        (UL(1) << NVHE_STACK_SHIFT)
+ 
+ /*
+@@ -204,13 +204,13 @@
+  *  Open-coded (swapper_pg_dir - reserved_pg_dir) as this cannot be calculated
+  *  until link time.
+  */
+-#define RESERVED_SWAPPER_OFFSET	(PAGE_SIZE)
++#define RESERVED_SWAPPER_OFFSET	(MMUPAGE_SIZE)
+ 
+ /*
+  *  Open-coded (swapper_pg_dir - tramp_pg_dir) as this cannot be calculated
+  *  until link time.
+  */
+-#define TRAMP_SWAPPER_OFFSET	(2 * PAGE_SIZE)
++#define TRAMP_SWAPPER_OFFSET	(2 * MMUPAGE_SIZE)
+ 
+ #ifndef __ASSEMBLER__
+ 
+diff --git a/arch/arm64/include/asm/pgtable-hwdef.h b/arch/arm64/include/asm/pgtable-hwdef.h
+index 72f31800c703..6cda3a71cf4b 100644
+--- a/arch/arm64/include/asm/pgtable-hwdef.h
++++ b/arch/arm64/include/asm/pgtable-hwdef.h
+@@ -9,22 +9,29 @@
+ 
+ #define PTDESC_ORDER 3
+ 
+-/* Number of VA bits resolved by a single translation table level */
+-#define PTDESC_TABLE_SHIFT	(PAGE_SHIFT - PTDESC_ORDER)
++/*
++ * Number of VA bits resolved by a single translation table level.
++ *
++ * Page table pages are always MMUPAGE_SIZE (hardware MMU page size),
++ * not PAGE_SIZE (which may be larger with PGCL/page clustering).
++ * Each page table page holds MMUPAGE_SIZE/sizeof(u64) = 2^(MMUPAGE_SHIFT-3)
++ * entries, so each level resolves (MMUPAGE_SHIFT - PTDESC_ORDER) bits.
++ */
++#define PTDESC_TABLE_SHIFT	(MMUPAGE_SHIFT - PTDESC_ORDER)
+ 
+ /*
+  * Number of page-table levels required to address 'va_bits' wide
+- * address, without section mapping. We resolve the top (va_bits - PAGE_SHIFT)
++ * address, without section mapping. We resolve the top (va_bits - MMUPAGE_SHIFT)
+  * bits with PTDESC_TABLE_SHIFT bits at each page table level. Hence:
+  *
+- *  levels = DIV_ROUND_UP((va_bits - PAGE_SHIFT), PTDESC_TABLE_SHIFT)
++ *  levels = DIV_ROUND_UP((va_bits - MMUPAGE_SHIFT), PTDESC_TABLE_SHIFT)
+  *
+  * where DIV_ROUND_UP(n, d) => (((n) + (d) - 1) / (d))
+  *
+  * We cannot include linux/kernel.h which defines DIV_ROUND_UP here
+  * due to build issues. So we open code DIV_ROUND_UP here:
+  *
+- *	((((va_bits) - PAGE_SHIFT) + PTDESC_TABLE_SHIFT - 1) / PTDESC_TABLE_SHIFT)
++ *	((((va_bits) - MMUPAGE_SHIFT) + PTDESC_TABLE_SHIFT - 1) / PTDESC_TABLE_SHIFT)
+  *
+  * which gets simplified as :
+  */
+@@ -33,13 +40,13 @@
+ 
+ /*
+  * Size mapped by an entry at level n ( -1 <= n <= 3)
+- * We map PTDESC_TABLE_SHIFT at all translation levels and PAGE_SHIFT bits
++ * We map PTDESC_TABLE_SHIFT at all translation levels and MMUPAGE_SHIFT bits
+  * in the final page. The maximum number of translation levels supported by
+  * the architecture is 5. Hence, starting at level n, we have further
+  * ((4 - n) - 1) levels of translation excluding the offset within the page.
+  * So, the total number of bits mapped by an entry at level n is :
+  *
+- *  ((4 - n) - 1) * PTDESC_TABLE_SHIFT + PAGE_SHIFT
++ *  ((4 - n) - 1) * PTDESC_TABLE_SHIFT + MMUPAGE_SHIFT
+  *
+  * Rearranging it a bit we get :
+  *   (4 - n) * PTDESC_TABLE_SHIFT + PTDESC_ORDER
+@@ -87,9 +94,9 @@
+ /*
+  * Contiguous page definitions.
+  */
+-#define CONT_PTE_SHIFT		(CONFIG_ARM64_CONT_PTE_SHIFT + PAGE_SHIFT)
+-#define CONT_PTES		(1 << (CONT_PTE_SHIFT - PAGE_SHIFT))
+-#define CONT_PTE_SIZE		(CONT_PTES * PAGE_SIZE)
++#define CONT_PTE_SHIFT		(CONFIG_ARM64_CONT_PTE_SHIFT + MMUPAGE_SHIFT)
++#define CONT_PTES		(1 << (CONT_PTE_SHIFT - MMUPAGE_SHIFT))
++#define CONT_PTE_SIZE		(CONT_PTES * MMUPAGE_SIZE)
+ #define CONT_PTE_MASK		(~(CONT_PTE_SIZE - 1))
+ 
+ #define CONT_PMD_SHIFT		(CONFIG_ARM64_CONT_PMD_SHIFT + PMD_SHIFT)
+@@ -176,7 +183,7 @@
+ #define PTE_UXN			(_AT(pteval_t, 1) << 54)	/* User XN */
+ #define PTE_SWBITS_MASK		_AT(pteval_t, (BIT(63) | GENMASK(58, 55)))
+ 
+-#define PTE_ADDR_LOW		(((_AT(pteval_t, 1) << (50 - PAGE_SHIFT)) - 1) << PAGE_SHIFT)
++#define PTE_ADDR_LOW		(((_AT(pteval_t, 1) << (50 - MMUPAGE_SHIFT)) - 1) << MMUPAGE_SHIFT)
+ #ifdef CONFIG_ARM64_PA_BITS_52
+ #ifdef CONFIG_ARM64_64K_PAGES
+ #define PTE_ADDR_HIGH		(_AT(pteval_t, 0xf) << 12)
+diff --git a/arch/arm64/include/asm/pgtable.h b/arch/arm64/include/asm/pgtable.h
+index 4dfa42b7d053..58f81008cba1 100644
+--- a/arch/arm64/include/asm/pgtable.h
++++ b/arch/arm64/include/asm/pgtable.h
+@@ -464,7 +464,12 @@ static inline pgprot_t pte_pgprot(pte_t pte)
+ #define pte_advance_pfn pte_advance_pfn
+ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
+ {
+-	return pfn_pte(pte_pfn(pte) + nr, pte_pgprot(pte));
++	/*
++	 * With PGCL, "pfn" units are MMUPAGE-sized (hardware page granularity).
++	 * Advance the physical address by nr * MMUPAGE_SIZE.
++	 */
++	phys_addr_t phys = __pte_to_phys(pte) + (nr << MMUPAGE_SHIFT);
++	return __pte(__phys_to_pte_val(phys) | pgprot_val(pte_pgprot(pte)));
+ }
+ 
+ /*
+@@ -674,10 +679,10 @@ static inline void __set_ptes_anysz(struct mm_struct *mm, unsigned long addr,
+ 				    pte_t *ptep, pte_t pte, unsigned int nr,
+ 				    unsigned long pgsize)
+ {
+-	unsigned long stride = pgsize >> PAGE_SHIFT;
++	unsigned long stride = pgsize >> MMUPAGE_SHIFT;
+ 
+ 	switch (pgsize) {
+-	case PAGE_SIZE:
++	case MMUPAGE_SIZE:
+ 		page_table_check_ptes_set(mm, addr, ptep, pte, nr);
+ 		break;
+ 	case PMD_SIZE:
+@@ -711,7 +716,7 @@ static inline void __set_ptes_anysz(struct mm_struct *mm, unsigned long addr,
+ static inline void __set_ptes(struct mm_struct *mm, unsigned long addr,
+ 			      pte_t *ptep, pte_t pte, unsigned int nr)
+ {
+-	__set_ptes_anysz(mm, addr, ptep, pte, nr, PAGE_SIZE);
++	__set_ptes_anysz(mm, addr, ptep, pte, nr, MMUPAGE_SIZE);
+ }
+ 
+ static inline void __set_pmds(struct mm_struct *mm, unsigned long addr,
+@@ -788,7 +793,7 @@ static inline bool pmd_leaf(pmd_t pmd)
+ #define pmd_bad(pmd)		(!pmd_table(pmd))
+ 
+ #define pmd_leaf_size(pmd)	(pmd_cont(pmd) ? CONT_PMD_SIZE : PMD_SIZE)
+-#define pte_leaf_size(pte)	(pte_cont(pte) ? CONT_PTE_SIZE : PAGE_SIZE)
++#define pte_leaf_size(pte)	(pte_cont(pte) ? CONT_PTE_SIZE : MMUPAGE_SIZE)
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ static inline int pmd_trans_huge(pmd_t pmd)
+@@ -997,7 +1002,7 @@ static inline pud_t *p4d_to_folded_pud(p4d_t *p4dp, unsigned long addr)
+ 	/* Ensure that 'p4dp' indexes a page table according to 'addr' */
+ 	VM_BUG_ON(((addr >> P4D_SHIFT) ^ ((u64)p4dp >> 3)) % PTRS_PER_P4D);
+ 
+-	return (pud_t *)PTR_ALIGN_DOWN(p4dp, PAGE_SIZE) + pud_index(addr);
++	return (pud_t *)PTR_ALIGN_DOWN(p4dp, MMUPAGE_SIZE) + pud_index(addr);
+ }
+ 
+ static inline pud_t *p4d_pgtable(p4d_t p4d)
+@@ -1125,7 +1130,7 @@ static inline p4d_t *pgd_to_folded_p4d(pgd_t *pgdp, unsigned long addr)
+ 	/* Ensure that 'pgdp' indexes a page table according to 'addr' */
+ 	VM_BUG_ON(((addr >> PGDIR_SHIFT) ^ ((u64)pgdp >> 3)) % PTRS_PER_PGD);
+ 
+-	return (p4d_t *)PTR_ALIGN_DOWN(pgdp, PAGE_SIZE) + p4d_index(addr);
++	return (p4d_t *)PTR_ALIGN_DOWN(pgdp, MMUPAGE_SIZE) + p4d_index(addr);
+ }
+ 
+ static inline phys_addr_t p4d_offset_phys(pgd_t *pgdp, unsigned long addr)
+@@ -1357,7 +1362,7 @@ static inline pte_t __ptep_get_and_clear_anysz(struct mm_struct *mm,
+ 	pte_t pte = __pte(xchg_relaxed(&pte_val(*ptep), 0));
+ 
+ 	switch (pgsize) {
+-	case PAGE_SIZE:
++	case MMUPAGE_SIZE:
+ 		page_table_check_pte_clear(mm, address, pte);
+ 		break;
+ 	case PMD_SIZE:
+@@ -1378,7 +1383,7 @@ static inline pte_t __ptep_get_and_clear_anysz(struct mm_struct *mm,
+ static inline pte_t __ptep_get_and_clear(struct mm_struct *mm,
+ 				       unsigned long address, pte_t *ptep)
+ {
+-	return __ptep_get_and_clear_anysz(mm, address, ptep, PAGE_SIZE);
++	return __ptep_get_and_clear_anysz(mm, address, ptep, MMUPAGE_SIZE);
+ }
+ 
+ static inline void __clear_full_ptes(struct mm_struct *mm, unsigned long addr,
+@@ -1389,7 +1394,7 @@ static inline void __clear_full_ptes(struct mm_struct *mm, unsigned long addr,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ 
+@@ -1402,7 +1407,7 @@ static inline pte_t __get_and_clear_full_ptes(struct mm_struct *mm,
+ 	pte = __ptep_get_and_clear(mm, addr, ptep);
+ 	while (--nr) {
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 		tmp_pte = __ptep_get_and_clear(mm, addr, ptep);
+ 		if (pte_dirty(tmp_pte))
+ 			pte = pte_mkdirty(pte);
+@@ -1450,7 +1455,7 @@ static inline void __wrprotect_ptes(struct mm_struct *mm, unsigned long address,
+ {
+ 	unsigned int i;
+ 
+-	for (i = 0; i < nr; i++, address += PAGE_SIZE, ptep++)
++	for (i = 0; i < nr; i++, address += MMUPAGE_SIZE, ptep++)
+ 		__ptep_set_wrprotect(mm, address, ptep);
+ }
+ 
+@@ -1490,7 +1495,7 @@ static inline void __clear_young_dirty_ptes(struct vm_area_struct *vma,
+ 		if (--nr == 0)
+ 			break;
+ 		ptep++;
+-		addr += PAGE_SIZE;
++		addr += MMUPAGE_SIZE;
+ 	}
+ }
+ 
+@@ -1616,11 +1621,11 @@ static inline void update_mmu_cache_range(struct vm_fault *vmf,
+  * entry), and HPA can coalesce it (4 pages into 1 TLB entry) when 16K base
+  * pages are in use.
+  */
+-#define exec_folio_order() ilog2(SZ_64K >> PAGE_SHIFT)
++#define exec_folio_order() ilog2(SZ_64K >> MMUPAGE_SHIFT)
+ 
+ static inline bool pud_sect_supported(void)
+ {
+-	return PAGE_SIZE == SZ_4K;
++	return MMUPAGE_SIZE == SZ_4K;
+ }
+ 
+ 
+@@ -1689,7 +1694,7 @@ static __always_inline void contpte_try_fold(struct mm_struct *mm,
+ 	 */
+ 
+ 	const unsigned long contmask = CONT_PTES - 1;
+-	bool valign = ((addr >> PAGE_SHIFT) & contmask) == contmask;
++	bool valign = ((addr >> MMUPAGE_SHIFT) & contmask) == contmask;
+ 
+ 	if (unlikely(valign)) {
+ 		bool palign = (pte_pfn(pte) & contmask) == contmask;
+diff --git a/arch/arm64/kernel/pi/map_range.c b/arch/arm64/kernel/pi/map_range.c
+index de52cd85c691..b3d13ba7f0a9 100644
+--- a/arch/arm64/kernel/pi/map_range.c
++++ b/arch/arm64/kernel/pi/map_range.c
+@@ -33,13 +33,13 @@ void __init map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
+ 	u64 cmask = (level == 3) ? CONT_PTE_SIZE - 1 : U64_MAX;
+ 	ptdesc_t protval = pgprot_val(prot) & ~PTE_TYPE_MASK;
+ 	int lshift = (3 - level) * PTDESC_TABLE_SHIFT;
+-	u64 lmask = (PAGE_SIZE << lshift) - 1;
++	u64 lmask = (MMUPAGE_SIZE << lshift) - 1;
+ 
+-	start	&= PAGE_MASK;
+-	pa	&= PAGE_MASK;
++	start	&= MMUPAGE_MASK;
++	pa	&= MMUPAGE_MASK;
+ 
+ 	/* Advance tbl to the entry that covers start */
+-	tbl += (start >> (lshift + PAGE_SHIFT)) % PTRS_PER_PTE;
++	tbl += (start >> (lshift + MMUPAGE_SHIFT)) % PTRS_PER_PTE;
+ 
+ 	/*
+ 	 * Set the right block/page bits for this level unless we are
+@@ -49,7 +49,7 @@ void __init map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
+ 		protval |= (level == 2) ? PMD_TYPE_SECT : PTE_TYPE_PAGE;
+ 
+ 	while (start < end) {
+-		u64 next = min((start | lmask) + 1, PAGE_ALIGN(end));
++		u64 next = min((start | lmask) + 1, ALIGN(end, MMUPAGE_SIZE));
+ 
+ 		if (level < 2 || (level == 2 && (start | next | pa) & lmask)) {
+ 			/*
+@@ -90,7 +90,7 @@ void __init map_range(phys_addr_t *pte, u64 start, u64 end, phys_addr_t pa,
+ 
+ asmlinkage phys_addr_t __init create_init_idmap(pgd_t *pg_dir, ptdesc_t clrmask)
+ {
+-	phys_addr_t ptep = (phys_addr_t)pg_dir + PAGE_SIZE; /* MMU is off */
++	phys_addr_t ptep = (phys_addr_t)pg_dir + MMUPAGE_SIZE; /* MMU is off */
+ 	pgprot_t text_prot = PAGE_KERNEL_ROX;
+ 	pgprot_t data_prot = PAGE_KERNEL;
+ 
+diff --git a/arch/arm64/kernel/vmlinux.lds.S b/arch/arm64/kernel/vmlinux.lds.S
+index e1ac876200a3..6f0502b2df28 100644
+--- a/arch/arm64/kernel/vmlinux.lds.S
++++ b/arch/arm64/kernel/vmlinux.lds.S
+@@ -233,18 +233,18 @@ SECTIONS
+ 	}
+ 
+ 	idmap_pg_dir = .;
+-	. += PAGE_SIZE;
++	. += MMUPAGE_SIZE;
+ 
+ #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+ 	tramp_pg_dir = .;
+-	. += PAGE_SIZE;
++	. += MMUPAGE_SIZE;
+ #endif
+ 
+ 	reserved_pg_dir = .;
+-	. += PAGE_SIZE;
++	. += MMUPAGE_SIZE;
+ 
+ 	swapper_pg_dir = .;
+-	. += PAGE_SIZE;
++	. += MMUPAGE_SIZE;
+ 
+ 	. = ALIGN(SEGMENT_ALIGN);
+ 	__init_begin = .;
+diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
+index ab9b3a63bf2b..cfd614d6b260 100644
+--- a/arch/arm64/kvm/mmu.c
++++ b/arch/arm64/kvm/mmu.c
+@@ -1724,7 +1724,7 @@ static int pkvm_mem_abort(const struct kvm_s2_fault_desc *s2fd)
+ 	}
+ 
+ 	write_lock(&kvm->mmu_lock);
+-	ret = pkvm_pgtable_stage2_map(pgt, s2fd->fault_ipa, PAGE_SIZE,
++	ret = pkvm_pgtable_stage2_map(pgt, s2fd->fault_ipa, MMUPAGE_SIZE,
+ 				      page_to_phys(page), KVM_PGTABLE_PROT_RWX,
+ 				      hyp_memcache, 0);
+ 	write_unlock(&kvm->mmu_lock);
+@@ -1749,8 +1749,8 @@ static short kvm_s2_resolve_vma_size(const struct kvm_s2_fault_desc *s2fd,
+ 	short vma_shift;
+ 
+ 	if (memslot_is_logging(s2fd->memslot)) {
+-		s2vi->max_map_size = PAGE_SIZE;
+-		vma_shift = PAGE_SHIFT;
++		s2vi->max_map_size = MMUPAGE_SIZE;
++		vma_shift = MMUPAGE_SHIFT;
+ 	} else {
+ 		s2vi->max_map_size = PUD_SIZE;
+ 		vma_shift = get_vma_page_shift(vma, s2fd->hva);
+@@ -1770,11 +1770,13 @@ static short kvm_s2_resolve_vma_size(const struct kvm_s2_fault_desc *s2fd,
+ 		if (fault_supports_stage2_huge_mapping(s2fd->memslot, s2fd->hva, PMD_SIZE))
+ 			break;
+ 		fallthrough;
++#if CONT_PTE_SHIFT != MMUPAGE_SHIFT
+ 	case CONT_PTE_SHIFT:
+-		vma_shift = PAGE_SHIFT;
+-		s2vi->max_map_size = PAGE_SIZE;
++		vma_shift = MMUPAGE_SHIFT;
++		s2vi->max_map_size = MMUPAGE_SIZE;
+ 		fallthrough;
+-	case PAGE_SHIFT:
++#endif
++	case MMUPAGE_SHIFT:
+ 		break;
+ 	default:
+ 		WARN_ONCE(1, "Unknown vma_shift %d", vma_shift);
+@@ -1798,8 +1800,8 @@ static short kvm_s2_resolve_vma_size(const struct kvm_s2_fault_desc *s2fd,
+ 		 */
+ 		if (max_map_size >= PMD_SIZE && max_map_size < PUD_SIZE)
+ 			max_map_size = PMD_SIZE;
+-		else if (max_map_size >= PAGE_SIZE && max_map_size < PMD_SIZE)
+-			max_map_size = PAGE_SIZE;
++		else if (max_map_size >= MMUPAGE_SIZE && max_map_size < PMD_SIZE)
++			max_map_size = MMUPAGE_SIZE;
+ 
+ 		s2vi->max_map_size = max_map_size;
+ 		vma_shift = min_t(short, vma_shift, __ffs(max_map_size));
+diff --git a/arch/powerpc/Kconfig b/arch/powerpc/Kconfig
+index e93df95b79e7..f41b0b648759 100644
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -917,7 +917,7 @@ config ARCH_FORCE_MAX_ORDER
+ 	int "Order of maximal physically contiguous allocations"
+ 	range 7 8 if PPC64 && PPC_64K_PAGES
+ 	default "8" if PPC64 && PPC_64K_PAGES
+-	range 12 12 if PPC64 && !PPC_64K_PAGES
++	range 8 12 if PPC64 && !PPC_64K_PAGES
+ 	default "12" if PPC64 && !PPC_64K_PAGES
+ 	range 8 10 if PPC32 && PPC_16K_PAGES
+ 	default "8" if PPC32 && PPC_16K_PAGES
+diff --git a/arch/powerpc/kernel/vmlinux.lds.S b/arch/powerpc/kernel/vmlinux.lds.S
+index 8fc11d6565bf..6ffc012520ef 100644
+--- a/arch/powerpc/kernel/vmlinux.lds.S
++++ b/arch/powerpc/kernel/vmlinux.lds.S
+@@ -27,8 +27,8 @@
+ 
+ #define STRICT_ALIGN_SIZE	(1 << CONFIG_DATA_SHIFT)
+ 
+-#if STRICT_ALIGN_SIZE < PAGE_SIZE
+-#error "CONFIG_DATA_SHIFT must be >= PAGE_SHIFT"
++#if STRICT_ALIGN_SIZE < MMUPAGE_SIZE
++#error "CONFIG_DATA_SHIFT must be >= MMUPAGE_SHIFT"
+ #endif
+ 
+ ENTRY(_stext)
+diff --git a/arch/s390/include/asm/sclp.h b/arch/s390/include/asm/sclp.h
+index 0f184dbdbe5e..e53b585e8337 100644
+--- a/arch/s390/include/asm/sclp.h
++++ b/arch/s390/include/asm/sclp.h
+@@ -7,14 +7,15 @@
+ #define _ASM_S390_SCLP_H
+ 
+ #include <linux/types.h>
++#include <vdso/page.h>
+ 
+ #define SCLP_CHP_INFO_MASK_SIZE		32
+-#define EARLY_SCCB_SIZE		PAGE_SIZE
++#define EARLY_SCCB_SIZE		MMUPAGE_SIZE
+ #define SCLP_MAX_CORES		512
+ /* 144 + 16 * SCLP_MAX_CORES + 2 * (SCLP_MAX_CORES - 1) */
+-#define EXT_SCCB_READ_SCP	(3 * PAGE_SIZE)
++#define EXT_SCCB_READ_SCP	(3 * MMUPAGE_SIZE)
+ /* 24 + 16 * SCLP_MAX_CORES */
+-#define EXT_SCCB_READ_CPU	(3 * PAGE_SIZE)
++#define EXT_SCCB_READ_CPU	(3 * MMUPAGE_SIZE)
+ 
+ #define SCLP_ERRNOTIFY_AQ_RESET			0
+ #define SCLP_ERRNOTIFY_AQ_REPAIR		1
+diff --git a/arch/s390/include/asm/thread_info.h b/arch/s390/include/asm/thread_info.h
+index 6a548a819400..635b1b53aa5e 100644
+--- a/arch/s390/include/asm/thread_info.h
++++ b/arch/s390/include/asm/thread_info.h
+@@ -19,8 +19,8 @@
+ #else
+ #define THREAD_SIZE_ORDER 2
+ #endif
+-#define BOOT_STACK_SIZE (PAGE_SIZE << 2)
+-#define THREAD_SIZE (PAGE_SIZE << THREAD_SIZE_ORDER)
++#define BOOT_STACK_SIZE (MMUPAGE_SIZE << 2)
++#define THREAD_SIZE (MMUPAGE_SIZE << THREAD_SIZE_ORDER)
+ 
+ #define STACK_INIT_OFFSET (THREAD_SIZE - STACK_FRAME_OVERHEAD - __PT_SIZE)
+ 
+diff --git a/arch/s390/kernel/relocate_kernel.S b/arch/s390/kernel/relocate_kernel.S
+index 0ae297c82afd..1c0102eef103 100644
+--- a/arch/s390/kernel/relocate_kernel.S
++++ b/arch/s390/kernel/relocate_kernel.S
+@@ -22,26 +22,26 @@
+  * %r8 holds the source address
+  * %r9 = PAGE_SIZE
+  *
+- * 0xf000 is a page_mask
++ * (PAGE_MASK & 0xffff) is the low-halfword page mask for nill
+  */
+ 
+ 	.text
+ SYM_CODE_START(relocate_kernel)
+ 	basr	%r13,0		# base address
+ .base:
+-	lghi	%r7,PAGE_SIZE	# load PAGE_SIZE in r7
+-	lghi	%r9,PAGE_SIZE	# load PAGE_SIZE in r9
++	lgfi	%r7,PAGE_SIZE	# load PAGE_SIZE in r7
++	lgfi	%r9,PAGE_SIZE	# load PAGE_SIZE in r9
+ 	lg	%r5,0(%r2)	# read another word for indirection page
+ 	aghi	%r2,8		# increment pointer
+ 	tml	%r5,0x1		# is it a destination page?
+ 	je	.indir_check	# NO, goto "indir_check"
+ 	lgr	%r6,%r5		# r6 = r5
+-	nill	%r6,0xf000	# mask it out and...
++	nill	%r6,(PAGE_MASK & 0xffff)	# mask it out and...
+ 	j	.base		# ...next iteration
+ .indir_check:
+ 	tml	%r5,0x2		# is it a indirection page?
+ 	je	.done_test	# NO, goto "done_test"
+-	nill	%r5,0xf000	# YES, mask out,
++	nill	%r5,(PAGE_MASK & 0xffff)	# YES, mask out,
+ 	lgr	%r2,%r5		# move it into the right register,
+ 	j	.base		# and read next...
+ .done_test:
+@@ -52,7 +52,7 @@ SYM_CODE_START(relocate_kernel)
+ 	tml	%r5,0x8		# it should be a source indicator...
+ 	je	.base		# NO, ignore it...
+ 	lgr	%r8,%r5		# r8 = r5
+-	nill	%r8,0xf000	# masking
++	nill	%r8,(PAGE_MASK & 0xffff)	# masking
+ 0:	mvcle	%r6,%r8,0x0	# copy PAGE_SIZE bytes from r8 to r6 - pad with 0
+ 	jo	0b
+ 	j	.base
+diff --git a/arch/sparc/include/asm/page_64.h b/arch/sparc/include/asm/page_64.h
+index fd4dc85fb38b..b6091b0a5272 100644
+--- a/arch/sparc/include/asm/page_64.h
++++ b/arch/sparc/include/asm/page_64.h
+@@ -9,7 +9,7 @@
+ /* Flushing for D-cache alias handling is only needed if
+  * the page size is smaller than 16K.
+  */
+-#if PAGE_SHIFT < 14
++#if MMUPAGE_SHIFT < 14
+ #define DCACHE_ALIASING_POSSIBLE
+ #endif
+ 
+diff --git a/arch/sparc/include/asm/pgtable_64.h b/arch/sparc/include/asm/pgtable_64.h
+index 74ede706fb32..e9342348d58d 100644
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@ -45,13 +45,16 @@
+ #define VMALLOC_START		_AC(0x0000000100000000,UL)
+ #define VMEMMAP_BASE		VMALLOC_END
+ 
+-/* PMD_SHIFT determines the size of the area a second-level page
+- * table can map
++/* Page table pages are MMUPAGE_SIZE (hardware page), each entry is 8 bytes.
++ * With PGCL, PAGE_SHIFT > MMUPAGE_SHIFT, but page table geometry must use
++ * MMUPAGE_SHIFT since PT pages are hardware-page-sized.
++ *
++ * PMD_SHIFT determines the size of the area a second-level page table can map.
+  */
+-#define PMD_SHIFT	(PAGE_SHIFT + (PAGE_SHIFT-3))
++#define PMD_SHIFT	(MMUPAGE_SHIFT + (MMUPAGE_SHIFT-3))
+ #define PMD_SIZE	(_AC(1,UL) << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE-1))
+-#define PMD_BITS	(PAGE_SHIFT - 3)
++#define PMD_BITS	(MMUPAGE_SHIFT - 3)
+ 
+ /* PUD_SHIFT determines the size of the area a third-level page
+  * table can map
+@@ -59,13 +62,13 @@
+ #define PUD_SHIFT	(PMD_SHIFT + PMD_BITS)
+ #define PUD_SIZE	(_AC(1,UL) << PUD_SHIFT)
+ #define PUD_MASK	(~(PUD_SIZE-1))
+-#define PUD_BITS	(PAGE_SHIFT - 3)
++#define PUD_BITS	(MMUPAGE_SHIFT - 3)
+ 
+ /* PGDIR_SHIFT determines what a fourth-level page table entry can map */
+ #define PGDIR_SHIFT	(PUD_SHIFT + PUD_BITS)
+ #define PGDIR_SIZE	(_AC(1,UL) << PGDIR_SHIFT)
+ #define PGDIR_MASK	(~(PGDIR_SIZE-1))
+-#define PGDIR_BITS	(PAGE_SHIFT - 3)
++#define PGDIR_BITS	(MMUPAGE_SHIFT - 3)
+ 
+ #if (MAX_PHYS_ADDRESS_BITS > PGDIR_SHIFT + PGDIR_BITS)
+ #error MAX_PHYS_ADDRESS_BITS exceeds what kernel page tables can support
+@@ -91,7 +94,7 @@ extern unsigned long VMALLOC_END;
+ bool kern_addr_valid(unsigned long addr);
+ 
+ /* Entries per page directory level. */
+-#define PTRS_PER_PTE	(1UL << (PAGE_SHIFT-3))
++#define PTRS_PER_PTE	(1UL << (MMUPAGE_SHIFT-3))
+ #define PTRS_PER_PMD	(1UL << PMD_BITS)
+ #define PTRS_PER_PUD	(1UL << PUD_BITS)
+ #define PTRS_PER_PGD	(1UL << PGDIR_BITS)
+diff --git a/arch/sparc/include/asm/tsb.h b/arch/sparc/include/asm/tsb.h
+index 239be259e166..849d7ac5ab28 100644
+--- a/arch/sparc/include/asm/tsb.h
++++ b/arch/sparc/include/asm/tsb.h
+@@ -157,12 +157,12 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	sethi		%hi(swapper_pg_dir), REG1; \
+ 	or		REG1, %lo(swapper_pg_dir), REG1; \
+ 	sllx		VADDR, 64 - (PGDIR_SHIFT + PGDIR_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldx		[REG1 + REG2], REG1; \
+ 	brz,pn		REG1, FAIL_LABEL; \
+ 	 sllx		VADDR, 64 - (PUD_SHIFT + PUD_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	brz,pn		REG1, FAIL_LABEL; \
+@@ -174,7 +174,7 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	bne,pt		%xcc, 697f; \
+ 	 sllx		REG2, 1, REG2; \
+ 	sllx		VADDR, 64 - (PMD_SHIFT + PMD_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	sethi		%uhi(_PAGE_PMD_HUGE), REG2; \
+@@ -189,7 +189,7 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	ba,pt		%xcc, 699f; \
+ 	 or		REG1, REG2, REG1; \
+ 698:	sllx		VADDR, 64 - PMD_SHIFT, REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	brgez,pn	REG1, FAIL_LABEL; \
+@@ -270,23 +270,23 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	 */
+ #define USER_PGTABLE_WALK_TL1(VADDR, PHYS_PGD, REG1, REG2, FAIL_LABEL)	\
+ 	sllx		VADDR, 64 - (PGDIR_SHIFT + PGDIR_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[PHYS_PGD + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	brz,pn		REG1, FAIL_LABEL; \
+ 	 sllx		VADDR, 64 - (PUD_SHIFT + PUD_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	USER_PGTABLE_CHECK_PUD_HUGE(VADDR, REG1, REG2, FAIL_LABEL, 800f) \
+ 	brz,pn		REG1, FAIL_LABEL; \
+ 	 sllx		VADDR, 64 - (PMD_SHIFT + PMD_BITS), REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	ldxa		[REG1 + REG2] ASI_PHYS_USE_EC, REG1; \
+ 	USER_PGTABLE_CHECK_PMD_HUGE(VADDR, REG1, REG2, FAIL_LABEL, 800f) \
+ 	sllx		VADDR, 64 - PMD_SHIFT, REG2; \
+-	srlx		REG2, 64 - PAGE_SHIFT, REG2; \
++	srlx		REG2, 64 - MMUPAGE_SHIFT, REG2; \
+ 	andn		REG2, 0x7, REG2; \
+ 	add		REG1, REG2, REG1; \
+ 	ldxa		[REG1] ASI_PHYS_USE_EC, REG1; \
+@@ -345,7 +345,7 @@ extern struct tsb_phys_patch_entry __tsb_phys_patch, __tsb_phys_patch_end;
+ 	.previous; \
+ 	sllx		REG1, 32, REG1; \
+ 	or		REG1, REG2, REG1; \
+-	srlx		VADDR, PAGE_SHIFT, REG2; \
++	srlx		VADDR, MMUPAGE_SHIFT, REG2; \
+ 	and		REG2, (KERNEL_TSB_NENTRIES - 1), REG2; \
+ 	sllx		REG2, 4, REG2; \
+ 	add		REG1, REG2, REG2; \
+diff --git a/arch/sparc/lib/copy_page.S b/arch/sparc/lib/copy_page.S
+index 7a041f3ebc58..dbe3834a41c2 100644
+--- a/arch/sparc/lib/copy_page.S
++++ b/arch/sparc/lib/copy_page.S
+@@ -27,12 +27,20 @@
+ 
+ #define	DCACHE_SIZE	(PAGE_SIZE * 2)
+ 
+-#if (PAGE_SHIFT == 13)
++/*
++ * PAGE_SIZE_REM = PAGE_SIZE mod 0xC0 (192).  The copy loop processes
++ * 3 x 64-byte blocks per iteration; the remainder is handled in the
++ * epilogue.  Values that yield 0x80 use a 2-block epilogue; 0x100
++ * uses a 4-block epilogue.
++ */
++#if (PAGE_SIZE % 192) == 128
+ #define PAGE_SIZE_REM	0x80
+-#elif (PAGE_SHIFT == 16)
++#elif (PAGE_SIZE % 192) == 64
++/* PAGE_SHIFT==16 (64K): 65536 mod 192 = 64, but the original code
++ * used 0x100 with a 4-block epilogue.  Preserve that. */
+ #define PAGE_SIZE_REM	0x100
+ #else
+-#error Wrong PAGE_SHIFT specified
++#error PAGE_SIZE not supported by copy_page loop structure
+ #endif
+ 
+ #define TOUCH(reg0, reg1, reg2, reg3, reg4, reg5, reg6, reg7)	\
+@@ -201,7 +209,7 @@ cheetah_copy_page_insn:
+ 	cmp		%o2, PAGE_SIZE_REM
+ 	bne,pt		%xcc, 1b
+ 	 add		%o0, 0x40, %o0
+-#if (PAGE_SHIFT == 16)
++#if (PAGE_SIZE_REM == 0x100)
+ 	TOUCH(f0, f2, f4, f6, f8, f10, f12, f14)
+ 	ldda		[%o1] ASI_BLK_P, %f32
+ 	stda		%f48, [%o0] %asi
+diff --git a/arch/sparc/mm/ultra.S b/arch/sparc/mm/ultra.S
+index 1544cd0cf46c..f1d89b68093a 100644
+--- a/arch/sparc/mm/ultra.S
++++ b/arch/sparc/mm/ultra.S
+@@ -204,8 +204,8 @@ __flush_icache_page:	/* %o0 = phys_page */
+ 
+ #ifdef DCACHE_ALIASING_POSSIBLE
+ 
+-#if (PAGE_SHIFT != 13)
+-#error only page shift of 13 is supported by dcache flush
++#if (MMUPAGE_SHIFT != 13)
++#error only MMU page shift of 13 is supported by dcache flush
+ #endif
+ 
+ #define DTAG_MASK 0x3
+diff --git a/drivers/s390/char/sclp.h b/drivers/s390/char/sclp.h
+index b31a680e0871..2c75643933a7 100644
+--- a/drivers/s390/char/sclp.h
++++ b/drivers/s390/char/sclp.h
+@@ -144,11 +144,11 @@ struct read_cpu_info_sccb {
+ 	u16	nr_standby;
+ 	u16	offset_standby;
+ 	/*
+-	 * Without ext sccb, struct size is PAGE_SIZE.
++	 * Without ext sccb, struct size is MMUPAGE_SIZE.
+ 	 * With ext sccb, struct size is EXT_SCCB_READ_CPU.
+ 	 */
+ 	u8	reserved[];
+-} __attribute__((packed, aligned(PAGE_SIZE)));
++} __attribute__((packed, aligned(MMUPAGE_SIZE)));
+ 
+ struct read_info_sccb {
+ 	struct	sccb_header header;	/* 0-7 */
+@@ -193,7 +193,7 @@ struct read_info_sccb {
+ 	u8	byte_138;		/* 138 */
+ 	u8	byte_139;		/* 139 */
+ 	u8	_pad_140[EXT_SCCB_READ_SCP - 140];
+-} __packed __aligned(PAGE_SIZE);
++} __packed __aligned(MMUPAGE_SIZE);
+ 
+ struct read_storage_sccb {
+ 	struct sccb_header header;
+diff --git a/drivers/s390/char/sclp_cmd.c b/drivers/s390/char/sclp_cmd.c
+index 1dc93d945be6..15b81f5d241c 100644
+--- a/drivers/s390/char/sclp_cmd.c
++++ b/drivers/s390/char/sclp_cmd.c
+@@ -101,7 +101,7 @@ int _sclp_get_core_info(struct sclp_core_info *info)
+ 	if (!SCLP_HAS_CPU_INFO)
+ 		return -EOPNOTSUPP;
+ 
+-	length = test_facility(140) ? EXT_SCCB_READ_CPU : PAGE_SIZE;
++	length = test_facility(140) ? EXT_SCCB_READ_CPU : MMUPAGE_SIZE;
+ 	sccb = (void *)__get_free_pages(GFP_KERNEL | GFP_DMA | __GFP_ZERO, get_order(length));
+ 	if (!sccb)
+ 		return -ENOMEM;
+diff --git a/drivers/s390/char/sclp_early.c b/drivers/s390/char/sclp_early.c
+index 6bf501ad8ff0..10d97f76511c 100644
+--- a/drivers/s390/char/sclp_early.c
++++ b/drivers/s390/char/sclp_early.c
+@@ -126,7 +126,7 @@ void __init sclp_early_get_ipl_info(struct sclp_ipl_info *info)
+ int __init sclp_early_get_core_info(struct sclp_core_info *info)
+ {
+ 	struct read_cpu_info_sccb *sccb;
+-	int length = test_facility(140) ? EXT_SCCB_READ_CPU : PAGE_SIZE;
++	int length = test_facility(140) ? EXT_SCCB_READ_CPU : MMUPAGE_SIZE;
+ 	int rc = 0;
+ 
+ 	if (!SCLP_HAS_CPU_INFO)
+diff --git a/drivers/s390/char/sclp_early_core.c b/drivers/s390/char/sclp_early_core.c
+index 55e50d428aab..4ad4fa79ab9c 100644
+--- a/drivers/s390/char/sclp_early_core.c
++++ b/drivers/s390/char/sclp_early_core.c
+@@ -278,7 +278,7 @@ void sclp_emergency_printk(const char *str)
+ int __init sclp_early_read_info(void)
+ {
+ 	int i;
+-	int length = test_facility(140) ? EXT_SCCB_READ_SCP : PAGE_SIZE;
++	int length = test_facility(140) ? EXT_SCCB_READ_SCP : MMUPAGE_SIZE;
+ 	struct read_info_sccb *sccb = (struct read_info_sccb *)sclp_early_sccb;
+ 	sclp_cmdw_t commands[] = {SCLP_CMDW_READ_SCP_INFO_FORCED,
+ 				  SCLP_CMDW_READ_SCP_INFO};
+-- 
+2.54.0
+

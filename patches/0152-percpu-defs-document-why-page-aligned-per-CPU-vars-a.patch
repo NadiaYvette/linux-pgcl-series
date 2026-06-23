@@ -1,0 +1,41 @@
+From 7513b23209db48496610180e6a739376681525c3 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 14 Jun 2026 18:14:56 +0200
+Subject: [PATCH 152/174] percpu-defs: document why page-aligned per-CPU vars
+ are MMUPAGE-aligned under PGCL
+
+DECLARE/DEFINE_PER_CPU_PAGE_ALIGNED align to MMUPAGE_SIZE (hardware page), not
+the kernel PAGE_SIZE, which differ under page clustering.  Every page-aligned
+per-CPU variable in the tree needs only hardware-page alignment (cpu_entry_area-
+mapped HW structures, or vmapped guard-paged stacks); none needs cluster-page
+alignment.  Document the rationale so the MMUPAGE choice is intentional, not a
+silent redefinition of "page aligned".
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ include/linux/percpu-defs.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/include/linux/percpu-defs.h b/include/linux/percpu-defs.h
+index 7ff047572e2b..029916a90254 100644
+--- a/include/linux/percpu-defs.h
++++ b/include/linux/percpu-defs.h
+@@ -155,6 +155,15 @@
+ 
+ /*
+  * Declaration/definition used for per-CPU variables that must be page aligned.
++ *
++ * Aligned to MMUPAGE_SIZE (the hardware page), not the kernel PAGE_SIZE: under
++ * page clustering (PAGE_MMUSHIFT > 0) the two differ, and every page-aligned
++ * per-CPU variable in the tree needs only hardware-page alignment -- they are
++ * hardware structures mapped into the cpu_entry_area at hardware-page
++ * granularity (DS area, TSS, GDT, entry/exception/doublefault stacks) or
++ * vmapped, guard-paged stacks.  None requires kernel-cluster-page alignment, so
++ * aligning to the (large) PAGE_SIZE would only waste memory.  Identity at
++ * PAGE_MMUSHIFT == 0 (MMUPAGE_SIZE == PAGE_SIZE).
+  */
+ #define DECLARE_PER_CPU_PAGE_ALIGNED(type, name)			\
+ 	DECLARE_PER_CPU_SECTION(type, name, "..page_aligned")		\
+-- 
+2.54.0
+

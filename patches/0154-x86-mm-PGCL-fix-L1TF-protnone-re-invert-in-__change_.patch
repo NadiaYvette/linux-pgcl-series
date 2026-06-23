@@ -1,0 +1,88 @@
+From 079b4e3e838fb4d275a780204c4b4398922d0739 Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Wed, 17 Jun 2026 09:21:24 +0200
+Subject: [PATCH 154/174] x86/mm: PGCL: fix L1TF protnone re-invert in
+ __change_page_attr 4K-leaf loop
+
+PGCL's per-sub-page loop in __change_page_attr() (arch/x86/mm/pat/set_memory.c)
+hand-rolled the new leaf PTE as:
+
+    phys = pte_val(sub_old);
+    phys ^= protnone_mask(phys);          /* un-invert old encoding */
+    phys &= PTE_PFN_MASK;
+    new_pte = __pte(phys | pgprot_val(new_prot));
+
+It un-inverts the old encoding but never RE-inverts for the new prot, unlike
+pfn_pte(), which does `pfn ^= protnone_mask(pgprot_val(pgprot))`. Under the x86
+L1TF mitigation a not-present PTE stores its physical address INVERTED; the
+missing re-invert breaks the present<->not-present transition in two steps on
+the set_direct_map_invalid() -> set_direct_map_default() path (vfree / module
+init-section free, do_free_init):
+
+  1. make-not-present: old=present (no un-invert), new=not-present but the
+     re-invert is omitted -> writes a not-present PTE holding the REAL
+     (non-inverted) pfn, violating the L1TF invariant.
+  2. restore-present: old is now not-present -> protnone_mask()==~0 ->
+     "un-inverts" a value that was never inverted -> actually INVERTS it ->
+     a present PTE with pfn == ~pfn. The inverted high bits exceed MAXPHYADDR,
+     so when that page is later allocated and post_alloc_hook()/
+     kernel_init_pages() zeroes it through its direct-map alias, the CPU takes
+     a reserved-bit page fault (#PF error_code 0x0b) at kernel_init_pages.
+
+This is the laptop "corrupt free page" crash that defeated boot for many
+sessions. It is a Newton-limit violation: the loop runs once even at
+CONFIG_PAGE_MMUSHIFT==0 with a body differing from mainline, so PAGE_MMUSHIFT=0
+crashes while mainline-base boots.
+
+Proven three ways:
+  - empirical: in all 8 captured oopses the faulting PTE's pfn is exactly
+    ~(the page's own pfn) (40-bit) -- the L1TF-inverted encoding;
+  - source: the missing re-invert shown above;
+  - Newton: non-identity at shift 0.
+page_owner of the corrupt PTE-table page named the exact trigger
+(set_direct_map_invalid -> __change_page_attr ... vfree -> do_free_init).
+
+Fix: mirror pte_pfn()+pfn_pte() exactly -- un-invert old, re-invert for the new
+prot, then mask after both XORs. Identity at PAGE_MMUSHIFT==0.
+
+Hardware-confirmed: PAGE_MMUSHIFT=0 with this fix boots through mm and early
+userspace to full system init (systemd "Startup finished") with zero
+reserved-bit faults, where the unfixed kernel died at kernel_init_pages in
+early userspace on every boot.
+
+The sibling hand-rolled builders (split_set_pte, populate_pte) build from a real
+paddr, so they can only produce the not-present-non-inverted case (a latent L1TF
+hole), never present+inverted; they want the same protnone treatment as a
+follow-up but are not this crash.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ arch/x86/mm/pat/set_memory.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/arch/x86/mm/pat/set_memory.c b/arch/x86/mm/pat/set_memory.c
+index d4c5711c2df8..252542ff7bc6 100644
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@ -1926,7 +1926,18 @@ static int __change_page_attr(struct cpa_data *cpa, int primary)
+ 			{
+ 				phys_addr_t phys = pte_val(sub_old);
+ 
++				/*
++				 * #106: mirror pte_pfn()+pfn_pte() L1TF handling.
++				 * Un-invert the old (maybe not-present) encoding,
++				 * then RE-invert for the new prot, masking only
++				 * after both XORs.  Missing the re-invert made
++				 * set_direct_map_invalid write a non-inverted
++				 * not-present PTE, which set_direct_map_default then
++				 * doubly-inverted into a present PTE with pfn==~pfn
++				 * (reserved-bit fault).  Non-identity at MMUSHIFT==0.
++				 */
+ 				phys ^= protnone_mask(phys);
++				phys ^= protnone_mask(pgprot_val(new_prot));
+ 				phys &= PTE_PFN_MASK;
+ 				new_pte = __pte(phys | pgprot_val(new_prot));
+ 			}
+-- 
+2.54.0
+

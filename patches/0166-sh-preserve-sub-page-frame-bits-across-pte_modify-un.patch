@@ -1,0 +1,60 @@
+From 60c0fe4ffbf71b94da29a25e1c40f8bad1a5df3a Mon Sep 17 00:00:00 2001
+From: Nadia Yvette Chambers <nadia.yvette.chambers@ik.me>
+Date: Thu, 18 Jun 2026 19:20:01 +0200
+Subject: [PATCH 166/174] sh: preserve sub-page frame bits across pte_modify()
+ under PGCL
+
+PTE_MASK, the mask of physical-frame bits kept across a protection change
+(_PAGE_CHG_MASK -> pte_modify()), was defined as PAGE_MASK.  Under page
+clustering a PAGE spans PAGE_MMUCOUNT MMU pages and each sub-PTE's frame
+number carries its sub-page offset in bits [PAGE_SHIFT-1 : MMUPAGE_SHIFT].
+PAGE_MASK clears exactly those bits, so any pte_modify() -- most visibly
+mprotect() -- collapsed every affected sub-PTE onto the cluster base: the
+sub-PTEs kept their (cluster) high bits but lost the sub-page offset and so
+all aliased sub-page 0.
+
+The reproducer (pgcl-test mprotect_subpage) mmaps four MMU pages inside one
+cluster, stores a distinct byte at the start of each, mprotect()s the middle
+two to PROT_READ, then reads them back: instead of their own values it read
+sub-page 0's, i.e. "data mismatch after mprotect" (no fault -- the mapping
+silently pointed at the wrong frame).
+
+Define PTE_MASK as MMUPAGE_MASK so pte_modify() preserves the full MMU-page
+frame number, sub-page offset included.  PTE_MASK has a single user
+(_PAGE_CHG_MASK) and collapses to PAGE_MASK at PAGE_MMUSHIFT=0, so mainline
+behaviour is unchanged.
+
+Verified on qemu-system-sh4 -M r2d at PAGE_MMUSHIFT=4: mprotect_subpage now
+PASSES, with the rest of pgcl-test still passing.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UkhHXA2PvPb3uwymHGbYh8
+---
+ arch/sh/include/asm/page.h | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/arch/sh/include/asm/page.h b/arch/sh/include/asm/page.h
+index def4205491ec..e138d06feae7 100644
+--- a/arch/sh/include/asm/page.h
++++ b/arch/sh/include/asm/page.h
+@@ -10,7 +10,16 @@
+ 
+ #include <vdso/page.h>
+ 
+-#define PTE_MASK	PAGE_MASK
++/*
++ * Mask of the physical-frame bits in a PTE.  These are MMU-page granular,
++ * not PAGE granular: under page clustering a PAGE spans PAGE_MMUCOUNT MMU
++ * pages and a sub-PTE's frame number carries the sub-page offset in bits
++ * [PAGE_SHIFT-1 : MMUPAGE_SHIFT].  Using PAGE_MASK here would drop that
++ * offset across a pte_modify() (e.g. mprotect), collapsing every sub-PTE
++ * in a cluster onto the cluster base.  Collapses to PAGE_MASK at
++ * PAGE_MMUSHIFT=0.
++ */
++#define PTE_MASK	MMUPAGE_MASK
+ 
+ #if defined(CONFIG_HUGETLB_PAGE_SIZE_64K)
+ #define HPAGE_SHIFT	16
+-- 
+2.54.0
+

@@ -1,0 +1,172 @@
+From 706c53f47362e9417e29fc8bdbb988f165253214 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Fri, 1 May 2026 03:37:52 +0200
+Subject: [PATCH 080/174] =?UTF-8?q?arch:=20PGCL=20=E2=80=94=20auto-cap=20A?=
+ =?UTF-8?q?RCH=5FFORCE=5FMAX=5FORDER=20for=20high=20PAGE=5FMMUSHIFT?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Six architectures (arm64, loongarch, mips, riscv, s390, sparc) need a
+PGCL-aware default for ARCH_FORCE_MAX_ORDER so that the buddy
+allocator's invariant
+  MAX_PAGE_ORDER + PAGE_SHIFT <= SECTION_SIZE_BITS
+holds when PAGE_MMUSHIFT raises PAGE_SHIFT well above the per-arch
+base.  Without this the build aborts at:
+  include/linux/mmzone.h: error: #error Allocator MAX_PAGE_ORDER exceeds SECTION_SIZE
+on x86_64 / arm64 / riscv / s390 (SECTION_SIZE_BITS=27) and
+loongarch (=29) once PAGE_MMUSHIFT reaches 6, and on sparc (=30)
+once it reaches 4.
+
+Pattern applied:
+
+  config ARCH_FORCE_MAX_ORDER
+          int [...]
+          default "4" if PAGE_MMUSHIFT >= 6
+          default "6" if PAGE_MMUSHIFT >= 4
+          default "8" if PAGE_MMUSHIFT >= 2
+          [existing arch-specific defaults]
+
+For arches that previously exposed the value as a user-promptable int
+(loongarch, mips, sparc), `range` clauses are added so that
+`make olddefconfig` clamps a stale-but-valid value carried over from a
+smaller-PGCL .config rather than silently keeping it (Kconfig's
+"keep existing user value if still in-range" rule).
+
+riscv and s390 didn't define ARCH_FORCE_MAX_ORDER at all, falling
+back to the upstream default of 10 in mmzone.h.  Add an arch-local
+config so the PGCL ladder applies.
+
+Companion to 3e7034d73aa6 ("x86, fs/fat: PGCL=6 build fixes — auto-cap
+MAX_PAGE_ORDER, heap bhs[]").  Paired together, x86_64 / aarch64 /
+ppc64 PGCL=6 build to a working bzImage; the remaining four arches
+need verification on top of these Kconfig fixes.
+---
+ arch/arm64/Kconfig     |  5 +++++
+ arch/loongarch/Kconfig |  9 +++++++++
+ arch/mips/Kconfig      |  9 +++++++++
+ arch/riscv/Kconfig     |  9 +++++++++
+ arch/s390/Kconfig      |  9 +++++++++
+ arch/sparc/Kconfig     | 10 ++++++++++
+ 6 files changed, 51 insertions(+)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index fe60738e5943..f7ba8b7d8494 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1638,6 +1638,11 @@ config XEN
+ # 64K |       29          |      16      |       13             |         13              |
+ config ARCH_FORCE_MAX_ORDER
+ 	int
++	# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++	# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS.
++	default "4" if PAGE_MMUSHIFT >= 6
++	default "6" if PAGE_MMUSHIFT >= 4
++	default "8" if PAGE_MMUSHIFT >= 2
+ 	default "13" if ARM64_64K_PAGES
+ 	default "11" if ARM64_16K_PAGES
+ 	default "10"
+diff --git a/arch/loongarch/Kconfig b/arch/loongarch/Kconfig
+index 606597da46b8..41a7031aed8d 100644
+--- a/arch/loongarch/Kconfig
++++ b/arch/loongarch/Kconfig
+@@ -566,6 +566,15 @@ config NODES_SHIFT
+ 
+ config ARCH_FORCE_MAX_ORDER
+ 	int "Maximum zone order"
++	# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++	# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=29).
++	# `range` clauses force `make olddefconfig` to clamp a stale value.
++	range 1 4 if PAGE_MMUSHIFT >= 6
++	range 1 6 if PAGE_MMUSHIFT >= 4
++	range 1 8 if PAGE_MMUSHIFT >= 2
++	default "4" if PAGE_MMUSHIFT >= 6
++	default "6" if PAGE_MMUSHIFT >= 4
++	default "8" if PAGE_MMUSHIFT >= 2
+ 	default "13" if PAGE_SIZE_64KB
+ 	default "11" if PAGE_SIZE_16KB
+ 	default "10"
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 4364f3dba688..7df23f1d0f03 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -2126,6 +2126,15 @@ config ZBOOT_LOAD_ADDRESS
+ 
+ config ARCH_FORCE_MAX_ORDER
+ 	int "Maximum zone order"
++	# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++	# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=28-29).
++	# `range` clauses force `make olddefconfig` to clamp a stale value.
++	range 1 4 if PAGE_MMUSHIFT >= 6
++	range 1 6 if PAGE_MMUSHIFT >= 4
++	range 1 8 if PAGE_MMUSHIFT >= 2
++	default "4" if PAGE_MMUSHIFT >= 6
++	default "6" if PAGE_MMUSHIFT >= 4
++	default "8" if PAGE_MMUSHIFT >= 2
+ 	default "13" if MIPS_HUGE_TLB_SUPPORT && PAGE_SIZE_64KB
+ 	default "12" if MIPS_HUGE_TLB_SUPPORT && PAGE_SIZE_32KB
+ 	default "11" if MIPS_HUGE_TLB_SUPPORT && PAGE_SIZE_16KB
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index c5754942cf85..18a4cd30246b 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -312,6 +312,15 @@ config ARCH_SPARSEMEM_ENABLE
+ config ARCH_SELECT_MEMORY_MODEL
+ 	def_bool ARCH_SPARSEMEM_ENABLE
+ 
++# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=27).
++config ARCH_FORCE_MAX_ORDER
++	int
++	default "4" if PAGE_MMUSHIFT >= 6
++	default "6" if PAGE_MMUSHIFT >= 4
++	default "8" if PAGE_MMUSHIFT >= 2
++	default "10"
++
+ config ARCH_SUPPORTS_UPROBES
+ 	def_bool y
+ 
+diff --git a/arch/s390/Kconfig b/arch/s390/Kconfig
+index 9921a3772bf7..311f31219f18 100644
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -714,6 +714,15 @@ config ARCH_SPARSEMEM_ENABLE
+ config ARCH_SPARSEMEM_DEFAULT
+ 	def_bool y
+ 
++# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=27).
++config ARCH_FORCE_MAX_ORDER
++	int
++	default "4" if PAGE_MMUSHIFT >= 6
++	default "6" if PAGE_MMUSHIFT >= 4
++	default "8" if PAGE_MMUSHIFT >= 2
++	default "10"
++
+ config ILLEGAL_POINTER_VALUE
+ 	hex
+ 	default 0xdead000000000000
+diff --git a/arch/sparc/Kconfig b/arch/sparc/Kconfig
+index a6b787efc2c4..1927bf501059 100644
+--- a/arch/sparc/Kconfig
++++ b/arch/sparc/Kconfig
+@@ -279,6 +279,16 @@ config ARCH_SPARSEMEM_DEFAULT
+ 
+ config ARCH_FORCE_MAX_ORDER
+ 	int "Order of maximal physically contiguous allocations"
++	# PGCL widens PAGE_SIZE by 2^PAGE_MMUSHIFT; cap MAX_PAGE_ORDER so
++	# PAGE_SHIFT + MAX_PAGE_ORDER stays under SECTION_SIZE_BITS (=30).
++	# `range` clauses force `make olddefconfig` to clamp a stale value
++	# from a smaller-PGCL .config when the user later raises PAGE_MMUSHIFT.
++	range 1 4 if PAGE_MMUSHIFT >= 6
++	range 1 6 if PAGE_MMUSHIFT >= 4
++	range 1 8 if PAGE_MMUSHIFT >= 2
++	default "4" if PAGE_MMUSHIFT >= 6
++	default "6" if PAGE_MMUSHIFT >= 4
++	default "8" if PAGE_MMUSHIFT >= 2
+ 	default "12"
+ 	help
+ 	  The kernel page allocator limits the size of maximal physically
+-- 
+2.54.0
+

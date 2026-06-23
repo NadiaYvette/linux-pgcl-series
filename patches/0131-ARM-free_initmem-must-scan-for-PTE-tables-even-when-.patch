@@ -1,0 +1,67 @@
+From 70d19bb42cd5f2a4065d897a077d32a4a275c2dd Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 31 May 2026 16:51:28 +0200
+Subject: [PATCH 131/174] ARM: free_initmem must scan for PTE tables even when
+ PAGE_MMUSHIFT == 0
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The PTE-table protection loop in free_initmem was gated on
+PAGE_MMUSHIFT > 0, leaving plain mainline / PGCL=0 builds calling
+free_initmem_default(-1) directly.  But the early memblock allocator
+places PTE tables for kernel mappings (e.g. the vectors page at
+0xffff0000) inside the init section irrespective of PGCL — at
+PAGE_MMUSHIFT == 0 those tables were silently freed back to the buddy
+allocator, corrupting later page table walks.  The kernel then hung
+right after kernel_init_freeable returned (initcall_debug shows the
+last initcall completing, then no further output before the timeout —
+no Run /init, no Freeing unused kernel image).
+
+Promote the scan to run unconditionally and update the explanatory
+comment accordingly.  PGCL=2/4/6 already used this path and worked;
+mainline + PAGE_MMUSHIFT=0 now do too.
+
+Boot-tested on QEMU virt / cortex-a15 multi_v7_defconfig: PM: genpd
+unused -> Freeing unused kernel image (initmem) memory: 2044K -> Run
+/init -> PGCL Boot Test -> pgcl-test 19/0, pgcl-stress 12/0, LTP
+running.  Without the patch the same kernel hangs after the last
+late_initcall (of_platform_sync_state_init) and the 10-minute matrix
+timeout fires.
+---
+ arch/arm/mm/init.c | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm/mm/init.c b/arch/arm/mm/init.c
+index 70e65d867497..3f701d782b2d 100644
+--- a/arch/arm/mm/init.c
++++ b/arch/arm/mm/init.c
+@@ -425,14 +425,18 @@ void free_initmem(void)
+ 	fix_kernmem_perms();
+ 
+ 	if (!machine_is_integrator() && !machine_is_cintegrator()) {
+-		if (!PAGE_MMUSHIFT) {
+-			poison_init_mem(__init_begin,
+-					__init_end - __init_begin);
+-			free_initmem_default(-1);
+-		} else {
++		{
+ 			/*
+-			 * PGCL: scan page table entries to find PTE tables.
+-			 * Skip any init page containing a PTE table.
++			 * Scan page table entries to find PTE tables that
++			 * landed in the init section, and skip any init page
++			 * that contains one.  This applies even when
++			 * PAGE_MMUSHIFT == 0: the early memblock allocator
++			 * routinely places PTE tables for kernel mappings
++			 * such as the vectors page (0xffff0000) inside the
++			 * init section, and free_initmem_default() would
++			 * otherwise free them, corrupting later page table
++			 * walks and hanging userspace startup right after
++			 * init_freeable returns.
+ 			 *
+ 			 * LPAE: 4 PGD entries × 512 PMD entries (64-bit each).
+ 			 *   PMD TABLE entry: bits[39:12] = PTE table phys addr.
+-- 
+2.54.0
+

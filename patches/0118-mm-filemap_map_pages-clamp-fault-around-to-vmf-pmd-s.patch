@@ -1,0 +1,198 @@
+From ed73212d1b65396df13d3174df97f7b25a014d80 Mon Sep 17 00:00:00 2001
+From: Nadia Chambers <nadia.yvette.chambers@ik.me>
+Date: Sun, 17 May 2026 23:43:48 +0200
+Subject: [PATCH 118/174] mm: filemap_map_pages clamp fault-around to
+ vmf->pmd's PMD range
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+filemap_map_pages is called with start_pgoff/end_pgoff defining a
+fault-around range around vmf->address.  It computes the starting
+virtual address from start_pgoff via pgoff_to_vma_addr, obtains a PTE
+pointer with pte_offset_map_lock(mm, vmf->pmd, addr), then iterates
+folios within the cached range, advancing ptep arithmetically by
+PAGE_MMUCOUNT per PAGE-unit step.
+
+Under PGCL (PAGE_MMUSHIFT > 0) one PAGE-cache slot covers
+PAGE_MMUCOUNT MMU pages, and a fault-around range can cross PMD
+boundaries even when vmf->address itself sits in a single PMD.  If
+start_pgoff's addr is in a different PMD than vmf->address:
+
+  - pte_offset_map_lock(vmf->pmd, addr) walks vmf->pmd's PTE table
+    and indexes it with pte_index(addr).  pte_index ignores PMD
+    bits, so for addr in PMD #1 the returned ptep points to entries
+    510, 511, ... of vmf->pmd's table (== PMD #2's table).
+  - filemap_set_ptes_cluster then writes set_ptes into ptep+i,
+    corrupting PMD #2's table at offsets that correspond to virtual
+    addresses outside the VMA (PMD #2_start + 510*MMUPAGE_SIZE etc.).
+  - exit_mmap's unmap_vmas zaps PTEs by VMA range and never sees
+    those phantom entries.
+  - free_pgtables then frees PMD #2's PTE table via __pte_free_tlb
+    with the populated phantom entries still in it.
+  - The underlying file folio's mapcount stays inflated forever.
+    At folio evict (shmem_undo_range → filemap_remove_folio →
+    filemap_unaccount_folio) folio_mapped() is still true and:
+
+      BUG: Bad page cache in process guard-regions  pfn:NNNN
+
+    fires, with mapcount equal to the number of orphaned phantom
+    PTEs (typically 1..PAGE_MMUCOUNT per leaked folio).
+
+The cluster loop in filemap_set_ptes_cluster has the same hazard at
+finer granularity: PAGE_MMUCOUNT sub-PTEs starting at a sub-page
+offset near the end of one PMD spill into the next PMD.  ptep+i for
+i=PAGE_MMUCOUNT-1 walks off the end of one PTE table page into
+adjacent memory (lucky if it lands in the next PMD's table, silent
+data corruption otherwise).
+
+Fix in three parts, all in mm/filemap.c:
+
+  1. At the top of filemap_map_pages, clamp start_cache forward to
+     the first PAGE-index whose addr is in the same PMD as
+     vmf->address.  Folios whose addr is in a different PMD will
+     fault on demand later via their own PMDs.  This is the root
+     fix — without it the wrong-PMD ptep can be returned in the
+     first place.
+
+  2. In filemap_map_pages's main loop, check next_addr & PMD_MASK
+     against start_pmd_addr before each iteration and break out if
+     the next folio would cross a PMD boundary.  Defensive — the
+     start_cache clamp covers most cases but the loop step could
+     still cross a PMD without re-clamping.
+
+  3. In filemap_set_ptes_cluster's per-slot loop, check sub_addr &
+     PMD_MASK against start_pmd and break out if a sub-PTE would
+     cross.  Defensive against the addr-near-PMD-end case where the
+     cluster naturally spans two PMDs; remaining sub-PTEs fault on
+     demand.
+
+Verified: aarch64 PGCL=2 SMP=4 mm selftests guard-regions —
+'BUG: Bad page cache' events 40 → 0 over multiple consecutive runs,
+guard-regions test now PASSes.  Previously affected configs (also
+reproducing the same family per project notes): ppc64 PGCL=2,
+loongarch64 PGCL=6.
+
+At PAGE_MMUSHIFT == 0 the clamps are no-ops: addr & PMD_MASK ==
+vmf->address & PMD_MASK is the standard fault-around invariant, and
+filemap_set_ptes_cluster is compiled out entirely.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ mm/filemap.c | 61 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index fb1d5499a98f..f9e6604ffa05 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -3785,10 +3785,23 @@ static int filemap_set_ptes_cluster(struct vm_fault *vmf,
+ 	if (pte_write(base) && folio_test_dirty(folio))
+ 		base = pte_mkdirty(base);
+ 
++	{
++	unsigned long start_pmd = addr & PMD_MASK;
+ 	for (i = 0; i < PAGE_MMUCOUNT; i++) {
+ 		unsigned long sub_addr = addr + (unsigned long)i * MMUPAGE_SIZE;
+ 		pte_t entry;
+ 
++		/*
++		 * The cluster must not cross a PMD boundary: ptep was
++		 * obtained from one pte_offset_map_lock on a single PMD
++		 * and indexes that PMD's PTE table only.  If sub_addr
++		 * lands in the next PMD, ptep + i would walk off the end
++		 * of the current PTE table page.  Stop here; the caller
++		 * faults the remainder on demand from the next PMD.
++		 */
++		if ((sub_addr & PMD_MASK) != start_pmd)
++			break;
++
+ 		/* Clamp to VMA bounds: skip sub-pages outside the VMA */
+ 		if (sub_addr < vma->vm_start || sub_addr >= vma->vm_end)
+ 			continue;
+@@ -3809,6 +3822,7 @@ static int filemap_set_ptes_cluster(struct vm_fault *vmf,
+ 			folio_add_file_rmap_ptes(folio, page, 1, vma);
+ 		update_mmu_cache_range(vmf, vma, addr, ptep, PAGE_MMUCOUNT);
+ 	}
++	}
+ 
+ 	return nr_set;
+ }
+@@ -4048,6 +4062,35 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
+ 	 * vm_pgoff (MMUPAGE units) and page cache indices (PAGE units).
+ 	 */
+ 	addr = pgoff_to_vma_addr(vma, start_cache);
++
++	/*
++	 * vmf->pmd was set up for vmf->address.  pte_offset_map_lock only
++	 * walks that PMD's PTE table.  If start_cache's addr is in a
++	 * different PMD than vmf->address, pte_offset_map_lock would index
++	 * vmf->pmd's table with the wrong pte_index() and silently write
++	 * into PTEs that don't belong to addr's PMD.  Clamp start_cache
++	 * forward to the first PAGE that's in the same PMD as vmf->address.
++	 */
++	{
++		unsigned long vmf_pmd_start = vmf->address & PMD_MASK;
++		while (start_cache < end_cache && (addr & PMD_MASK) != vmf_pmd_start) {
++			start_cache++;
++			xas_set(&xas, start_cache);
++			folio_unlock(folio);
++			folio_put(folio);
++			folio = next_uptodate_folio(&xas, mapping, end_cache);
++			if (!folio)
++				goto out;
++			last_pgoff = start_cache;
++			addr = pgoff_to_vma_addr(vma, start_cache);
++		}
++		if ((addr & PMD_MASK) != vmf_pmd_start) {
++			folio_unlock(folio);
++			folio_put(folio);
++			goto out;
++		}
++	}
++
+ 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
+ 	if (!vmf->pte) {
+ 		folio_unlock(folio);
+@@ -4056,14 +4099,29 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
+ 	}
+ 
+ 	folio_type = mm_counter_file(folio);
++	{
++	unsigned long start_pmd_addr = addr & PMD_MASK;
+ 	do {
+ 		unsigned long end;
++		unsigned long next_addr;
+ 
+ 		/*
+ 		 * Advance addr and PTE pointer to the current xarray
+ 		 * position.  Each PAGE-unit step = PAGE_MMUCOUNT PTEs.
++		 *
++		 * Stop if the iteration would cross a PMD boundary: vmf->pte
++		 * was obtained from one pte_offset_map_lock and indexes one
++		 * PTE table only.  ptep += pages*PAGE_MMUCOUNT runs off the
++		 * end of that table at the PMD boundary.  The remaining
++		 * folios will fault on demand from their own PMDs.
+ 		 */
+-		addr += (xas.xa_index - last_pgoff) << PAGE_SHIFT;
++		next_addr = addr + ((xas.xa_index - last_pgoff) << PAGE_SHIFT);
++		if ((next_addr & PMD_MASK) != start_pmd_addr) {
++			folio_unlock(folio);
++			folio_put(folio);
++			break;
++		}
++		addr = next_addr;
+ 		vmf->pte += (xas.xa_index - last_pgoff) << PAGE_MMUSHIFT;
+ 		last_pgoff = xas.xa_index;
+ 		end = folio_next_index(folio) - 1;
+@@ -4079,6 +4137,7 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
+ 
+ 		folio_unlock(folio);
+ 	} while ((folio = next_uptodate_folio(&xas, mapping, end_cache)) != NULL);
++	}
+ 	add_mm_counter(vma->vm_mm, folio_type, rss);
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+ 	trace_mm_filemap_map_pages(mapping, start_cache, end_cache);
+-- 
+2.54.0
+
